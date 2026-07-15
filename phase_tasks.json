@@ -1,0 +1,50 @@
+{
+  "lifelong_learning_phase1": [
+    "AdjustToasterOvenTemperature", "AdjustWaterTemperature", "CloseBlenderLid",
+    "CloseCabinet", "CloseDishwasher", "CloseDrawer", "CloseElectricKettleLid",
+    "CloseFridge", "CloseFridgeDrawer", "CloseMicrowave", "CloseOven",
+    "CloseStandMixerHead", "CloseToasterOvenDoor", "CoffeeServeMug", "CoffeeSetupMug",
+    "NavigateKitchen", "OpenBlenderLid", "OpenCabinet", "OpenDishwasher", "OpenDrawer",
+    "OpenElectricKettleLid", "OpenFridge", "OpenFridgeDrawer", "OpenMicrowave",
+    "OpenOven", "OpenStandMixerHead", "OpenToasterOvenDoor",
+    "PickPlaceCabinetToCounter", "PickPlaceCounterToBlender",
+    "PickPlaceCounterToCabinet", "PickPlaceCounterToDrawer",
+    "PickPlaceCounterToMicrowave", "PickPlaceCounterToOven",
+    "PickPlaceCounterToSink", "PickPlaceCounterToStandMixer",
+    "PickPlaceCounterToStove", "PickPlaceCounterToToasterOven",
+    "PickPlaceDrawerToCounter", "PickPlaceFridgeDrawerToShelf",
+    "PickPlaceFridgeShelfToDrawer", "PickPlaceMicrowaveToCounter",
+    "PickPlaceSinkToCounter", "PickPlaceStoveToCounter",
+    "PickPlaceToasterOvenToCounter", "PickPlaceToasterToCounter", "PreheatOven",
+    "SlideDishwasherRack", "SlideOvenRack", "SlideToasterOvenRack",
+    "StartCoffeeMachine", "TurnOffMicrowave", "TurnOffSinkFaucet", "TurnOffStove",
+    "TurnOnBlender", "TurnOnElectricKettle", "TurnOnMicrowave", "TurnOnSinkFaucet",
+    "TurnOnStove", "TurnOnToaster", "TurnOnToasterOven", "TurnSinkSpout",
+    "MakeIcedCoffee", "CheesyBread", "LowerHeat", "PackDessert"
+  ],
+  "lifelong_learning_phase2": [
+    "KettleBoiling", "PrepareCoffee", "ClearCuttingBoard", "RinseSinkBasin",
+    "LoadDishwasher", "WashLettuce", "StrainerSetup", "PrepareToast",
+    "ChooseMeasuringCup", "OrganizeCleaningSupplies", "StackBowlsCabinet",
+    "RecycleStackedYogurt", "AddMarshmallow", "ScrubCuttingBoard",
+    "TurnOffSimmeredSauceHeat", "SetUpCuttingStation", "VeggieDipPrep",
+    "PreSoakPan", "OrganizeCondiments", "PrepForSanitizing"
+  ],
+  "lifelong_learning_phase3": [
+    "PlaceEqualIceCubes", "RetrieveIceTray", "RestockBowls", "WashFish",
+    "PrepFridgeForCleaning", "MicrowaveThawing", "MealPrepStaging",
+    "AddLemonToFish", "SimmeringSauce", "StirVegetables", "ClearSink",
+    "DeliverStraw", "ServeSteak", "StoreLeftoversInBowl", "GetToastedBread",
+    "ToastBagel", "AfterwashSorting", "BlendIngredients",
+    "MicrowaveCorrectMeal", "ArrangeBreadBowl"
+  ],
+  "lifelong_learning_phase4": [
+    "ArrangeBuffetDessert", "CoolBakedCake", "ClearReceptaclesForCleaning",
+    "MixedFruitPlatter", "LoadFridgeByType", "FreezeBottledWaters",
+    "PackIdenticalLunches", "PlateStoreDinner", "ScalePortioning",
+    "GatherMarinadeIngredients", "PrepareSausageCheese", "AlignSilverware",
+    "SetBowlsForSoup", "SteamInMicrowave", "ArrangeUtensilsByType",
+    "BeverageSorting", "ClearSinkArea", "HotDogSetup",
+    "PrepareDrinkStation", "CleanBoard"
+  ]
+}

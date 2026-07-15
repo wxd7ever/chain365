@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+
+
+ROBOCASA_DIR = Path(__file__).resolve().parents[1] / "robocasa"
+sys.path.insert(0, str(ROBOCASA_DIR))
+
+from pi05_rollout import execute_pi05_atomic_task_policy  # noqa: E402
+
+
+def observation():
+    return {
+        "robot0_agentview_left_image": np.zeros((8, 8, 3), dtype=np.uint8),
+        "robot0_eye_in_hand_image": np.zeros((8, 8, 3), dtype=np.uint8),
+        "robot0_agentview_right_image": np.zeros((8, 8, 3), dtype=np.uint8),
+        "robot0_base_to_eef_pos": np.zeros(3),
+        "robot0_base_to_eef_quat": np.zeros(4),
+        "robot0_base_pos": np.zeros(3),
+        "robot0_base_quat": np.zeros(4),
+        "robot0_gripper_qpos": np.zeros(2),
+    }
+
+
+class FakeEnv:
+    action_dimension = 12
+
+    def __init__(self):
+        self.actions = []
+        self.reset_calls = 0
+
+    def get_observation(self):
+        return observation()
+
+    def reset(self):
+        self.reset_calls += 1
+        raise AssertionError("atomic rollout must not reset the environment")
+
+    def step(self, action):
+        self.actions.append(np.asarray(action).copy())
+        return observation(), 1.0, False, {}
+
+
+class FakeClient:
+    def __init__(self):
+        self.payloads = []
+        self.reset_calls = 0
+
+    def reset(self):
+        self.reset_calls += 1
+
+    def infer(self, payload):
+        self.payloads.append(payload)
+        actions = np.zeros((10, 12), dtype=np.float32)
+        actions[:, 7:10] = 0.5
+        return {"actions": actions}
+
+
+class FakeVerifier:
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, **kwargs):
+        self.calls += 1
+        success = self.calls >= 2
+        return {
+            "status": "success" if success else "uncertain",
+            "goal_satisfied": success,
+            "failure_code": None,
+            "retryable": not success,
+            "state_evidence": [{"step": kwargs["step_index"]}],
+        }
+
+
+def test_atomic_rollout_reuses_env_client_and_stops_on_verifier(tmp_path):
+    env = FakeEnv()
+    client = FakeClient()
+    success, logs = execute_pi05_atomic_task_policy(
+        env=env,
+        client=client,
+        atomic_task_call={
+            "subgoal_id": "g1",
+            "atomic_task": "OpenMicrowave",
+            "policy_prompt": "Open the microwave door.",
+            "arguments": {"fixture_id": "microwave_1"},
+            "termination_condition": {"predicate": "open", "subject": "microwave_1"},
+        },
+        verifier=FakeVerifier(),
+        log_dir=tmp_path,
+        episode_id=0,
+        horizon=20,
+        replan_steps=5,
+        verify_interval=2,
+        min_steps_before_verify=0,
+        render=False,
+        base_action_mode="residual",
+        base_residual_limit=0.15,
+    )
+    assert success is True
+    assert env.reset_calls == 0
+    assert client.reset_calls == 1
+    assert client.payloads[0]["prompt"] == "Open the microwave door."
+    assert len(env.actions) == 4
+    assert np.allclose(env.actions[0][7:10], 0.15)
+    assert logs["Atomic_Task_Call"]["subgoal_id"] == "g1"
+    assert logs["Final_Verification"]["status"] == "success"
+    assert logs["Prompt"] == "Open the microwave door."

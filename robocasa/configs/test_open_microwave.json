@@ -1,0 +1,17 @@
+{
+  "atomic_task_call": {
+    "subgoal_id": "g1",
+    "atomic_task": "OpenMicrowave",
+    "policy_prompt": "Open the microwave door.",
+    "arguments": {
+      "fixture_id": "microwave_1",
+      "fixture_name": "microwave",
+      "target_state": "open"
+    },
+    "termination_condition": {
+      "predicate": "open",
+      "subject": "microwave_1",
+      "desired_value": true
+    }
+  }
+}
