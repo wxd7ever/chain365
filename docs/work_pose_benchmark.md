@@ -78,7 +78,8 @@ Pick/Place 成功率：
       robocasa.scripts.work_pose.eval_work_pose_refinement \
       --condition baseline \
       --pi05_host 172.16.36.10 \
-      --pi05_port 8000
+      --pi05_port 8000 \
+      --pi05_horizon 600
 
 ## 4. 跑多视角站位优化
 
@@ -97,7 +98,8 @@ Pick/Place 成功率：
         robot0_agentview_right \
         robot0_eye_in_hand \
       --pi05_host 172.16.36.10 \
-      --pi05_port 8000
+      --pi05_port 8000 \
+      --pi05_horizon 600
 
 旧版官方 model.xml.gz 没有顶部和前方相机时，恢复代码会把相机注入机器人底盘
 或手腕对应 body，不修改原始数据文件。

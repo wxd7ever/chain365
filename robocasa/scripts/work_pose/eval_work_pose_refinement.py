@@ -97,7 +97,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pi05_infer_timeout_s", type=float, default=120.0)
     parser.add_argument("--pi05_max_retries", type=int, default=1)
     parser.add_argument("--pi05_resize_size", type=int, default=224)
-    parser.add_argument("--pi05_horizon", type=int, default=240)
+    parser.add_argument(
+        "--pi05_horizon",
+        type=int,
+        default=600,
+        help="Maximum steps for each PickObject or PlaceObject rollout.",
+    )
     parser.add_argument("--pi05_replan_steps", type=int, default=5)
     parser.add_argument("--pi05_verify_interval", type=int, default=5)
     parser.add_argument("--pi05_min_steps_before_verify", type=int, default=5)
