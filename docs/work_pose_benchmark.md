@@ -132,3 +132,66 @@ pose_error_before、pose_error_after_refinement 和 success 分别衡量优化�
 评测命令添加：
 
     --operation place --difficulty mild --limit 1
+
+## 6. 连续运行前 5 个完整 episode
+
+单阶段评测会为每个 Pick/Place 独立恢复状态，不能代表完整任务成功率。完整流程
+评测只在 episode 开始时恢复一次状态，之后连续执行：
+
+1. Pick 蔬菜；
+2. Place 蔬菜到碗；
+3. Pick 碗；
+4. 使用数据集专家站位完成持物导航；
+5. Place 碗到微波炉；
+6. CloseMicrowave；
+7. TurnOnMicrowave。
+
+首先重新提取前 5 个 episode。该命令会重写 expert/index.json：
+
+    /opt/conda/envs/robocasa/bin/python -m \
+      robocasa.scripts.work_pose.extract_expert_work_poses \
+      --episode_start 0 \
+      --episode_count 5
+
+然后为 5 × 4 个 Pick/Place 阶段各生成一个 mild 扰动状态。不要添加 --limit 1：
+
+    MUJOCO_GL=egl /opt/conda/envs/robocasa/bin/python -m \
+      robocasa.scripts.work_pose.generate_degraded_work_poses \
+      --difficulties mild \
+      --samples_per_stage 1 \
+      --max_candidate_attempts 5
+
+清单应显示 requested_samples=20、num_valid=20。任何 episode 缺少阶段 0、1、2
+或 4 时，完整流程入口会直接报错，不会用其他 episode 的样本补齐。
+
+运行 5 个 baseline 完整 episode：
+
+    MUJOCO_GL=egl /opt/conda/envs/robocasa/bin/python -m \
+      robocasa.scripts.work_pose.eval_work_pose_full_episode \
+      --condition baseline \
+      --difficulty mild \
+      --episode_start 0 \
+      --episode_count 5 \
+      --pi05_host 172.16.36.10 \
+      --pi05_port 8000 \
+      --pi05_horizon 600 \
+      --video
+
+运行相同 5 个 episode 的多视角 refiner：
+
+    MUJOCO_GL=egl /opt/conda/envs/robocasa/bin/python -m \
+      robocasa.scripts.work_pose.eval_work_pose_full_episode \
+      --condition refiner \
+      --difficulty mild \
+      --episode_start 0 \
+      --episode_count 5 \
+      --local_pose_base_url http://172.16.11.115:11434/v1 \
+      --local_pose_model qwen2.5vl:3b \
+      --pi05_host 172.16.36.10 \
+      --pi05_port 8000 \
+      --pi05_horizon 600 \
+      --video
+
+每个 episode 任一操作或数据集站位移动失败后都会停止该 episode，并在
+episode_result.json 的 stopped_at 中记录阶段。summary.json 同时给出完整任务
+成功率和每个原子阶段的成功率。
