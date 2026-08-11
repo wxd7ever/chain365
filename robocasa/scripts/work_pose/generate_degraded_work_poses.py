@@ -61,6 +61,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--samples_per_stage", type=int, default=3)
     parser.add_argument(
+        "--max_candidate_attempts",
+        type=int,
+        default=5,
+        help=(
+            "Maximum random pose candidates tried for each requested physical "
+            "sample. Unreachable or dropped-object candidates are rejected."
+        ),
+    )
+    parser.add_argument(
         "--operation", choices=("all", "pick", "place"), default="all"
     )
     parser.add_argument("--seed", type=int, default=20260811)
@@ -75,8 +84,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--limit", type=int)
     args = parser.parse_args()
-    if args.samples_per_stage <= 0 or args.camera_size <= 0:
-        parser.error("samples_per_stage and camera_size must be positive")
+    if (
+        args.samples_per_stage <= 0
+        or args.max_candidate_attempts <= 0
+        or args.camera_size <= 0
+    ):
+        parser.error(
+            "samples_per_stage, max_candidate_attempts, and camera_size must be positive"
+        )
     if args.max_move_steps <= 0:
         parser.error("--max_move_steps must be positive")
     if args.limit is not None and args.limit <= 0:
@@ -162,7 +177,7 @@ def _materialize(
         "initial_pose_error": pose_error(
             target_degraded_pose, resolved_expert_pose
         ),
-        }
+    }
 
     guard = None
     if expected_holding:
@@ -219,16 +234,17 @@ def main() -> int:
     expert_index_path = args.expert_index.expanduser().resolve()
     expert_index = json.loads(expert_index_path.read_text())
     records = list(expert_index["records"])
+    candidate_multiplier = 1 if args.specs_only else args.max_candidate_attempts
     samples = generate_pose_perturbations(
         records,
         difficulties=args.difficulties,
-        samples_per_stage=args.samples_per_stage,
+        samples_per_stage=args.samples_per_stage * candidate_multiplier,
         seed=args.seed,
     )
     output = args.output.expanduser().resolve()
     if args.operation != "all":
         samples = [s for s in samples if s["operation"] == args.operation]
-    if args.limit is not None:
+    if args.limit is not None and args.specs_only:
         samples = samples[: args.limit]
     output.mkdir(parents=True, exist_ok=True)
     camera_names = tuple(
@@ -236,6 +252,18 @@ def main() -> int:
     )
     env = None
     results: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    accepted_by_group: dict[tuple[int, str], int] = {}
+    selected_record_indices = {
+        int(sample["record_index"]) for sample in samples
+    }
+    requested_samples = (
+        args.limit
+        if args.limit is not None
+        else len(selected_record_indices)
+        * len(args.difficulties)
+        * args.samples_per_stage
+    )
     try:
         if not args.specs_only:
             env = create_dataset_environment(
@@ -244,6 +272,16 @@ def main() -> int:
                 camera_size=args.camera_size,
             )
         for index, sample in enumerate(samples, start=1):
+            group = (int(sample["record_index"]), str(sample["difficulty"]))
+            if not args.specs_only:
+                if len(results) >= requested_samples:
+                    break
+                if (
+                    args.limit is None
+                    and accepted_by_group.get(group, 0)
+                    >= args.samples_per_stage
+                ):
+                    continue
             print(
                 f"[WorkPose] {index}/{len(samples)} {sample['sample_id']} "
                 f"operation={sample['operation']}"
@@ -270,7 +308,12 @@ def main() -> int:
                     "error": str(exc),
                     "traceback": traceback.format_exc(),
                 }
-            results.append(value)
+            if value.get("valid") is True or args.specs_only:
+                results.append(value)
+                if value.get("valid") is True:
+                    accepted_by_group[group] = accepted_by_group.get(group, 0) + 1
+            else:
+                rejected.append(value)
     finally:
         if env is not None:
             env.close()
@@ -283,17 +326,25 @@ def main() -> int:
         "seed": args.seed,
         "difficulties": list(args.difficulties),
         "samples_per_stage": args.samples_per_stage,
+        "max_candidate_attempts": args.max_candidate_attempts,
         "materialized": not args.specs_only,
+        "requested_samples": requested_samples,
         "num_samples": len(results),
         "num_valid": sum(value.get("valid") is True for value in results),
+        "num_rejected": len(rejected),
         "samples": results,
+        "rejected": rejected,
     }
     write_json(output / "perturbations.json", manifest)
     print(
         f"[WorkPose] samples={len(results)} valid={manifest['num_valid']} "
         f"manifest={output / 'perturbations.json'}"
     )
-    return 0 if args.specs_only or manifest["num_valid"] else 2
+    return (
+        0
+        if args.specs_only or manifest["num_valid"] >= requested_samples
+        else 2
+    )
 
 
 if __name__ == "__main__":
