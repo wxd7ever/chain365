@@ -123,6 +123,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_station_move_steps", type=int, default=360)
     parser.add_argument("--station_translation_tolerance_m", type=float, default=0.03)
     parser.add_argument("--station_yaw_tolerance_deg", type=float, default=4.0)
+    parser.add_argument("--held_max_translation_command", type=float, default=0.20)
+    parser.add_argument("--held_max_rotation_command", type=float, default=0.15)
     parser.add_argument("--video", action="store_true")
     args = parser.parse_args()
     if args.condition == "refiner" and not args.local_pose_base_url:
@@ -138,6 +140,8 @@ def parse_args() -> argparse.Namespace:
         args.local_pose_max_decisions,
         args.local_pose_action_steps,
         args.max_station_move_steps,
+        args.held_max_translation_command,
+        args.held_max_rotation_command,
     )
     if any(value <= 0 for value in positive):
         parser.error("episode, policy, camera, and movement limits must be positive")
@@ -332,6 +336,12 @@ def move_to_stage(
         max_steps=args.max_station_move_steps,
         translation_tolerance_m=args.station_translation_tolerance_m,
         yaw_tolerance_deg=args.station_yaw_tolerance_deg,
+        max_translation_command=(
+            args.held_max_translation_command if expected_holding_object else 1.0
+        ),
+        max_rotation_command=(
+            args.held_max_rotation_command if expected_holding_object else 0.50
+        ),
     )
     holding_after = (
         holding_state(env, expected_holding_object)

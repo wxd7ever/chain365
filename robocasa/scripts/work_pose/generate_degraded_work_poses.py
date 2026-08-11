@@ -74,9 +74,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=20260811)
     parser.add_argument("--camera_size", type=int, default=256)
-    parser.add_argument("--max_move_steps", type=int, default=240)
-    parser.add_argument("--translation_tolerance_m", type=float, default=0.025)
+    parser.add_argument("--max_move_steps", type=int, default=360)
+    parser.add_argument("--translation_tolerance_m", type=float, default=0.03)
     parser.add_argument("--yaw_tolerance_deg", type=float, default=3.0)
+    parser.add_argument(
+        "--held_max_translation_command",
+        type=float,
+        default=0.20,
+        help="Gentler base command limit while transporting a held object.",
+    )
+    parser.add_argument(
+        "--held_max_rotation_command",
+        type=float,
+        default=0.15,
+        help="Gentler yaw command limit while transporting a held object.",
+    )
     parser.add_argument(
         "--specs_only",
         action="store_true",
@@ -92,8 +104,12 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "samples_per_stage, max_candidate_attempts, and camera_size must be positive"
         )
-    if args.max_move_steps <= 0:
-        parser.error("--max_move_steps must be positive")
+    if (
+        args.max_move_steps <= 0
+        or args.held_max_translation_command <= 0
+        or args.held_max_rotation_command <= 0
+    ):
+        parser.error("movement steps and held-object command limits must be positive")
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
     return args
@@ -195,6 +211,12 @@ def _materialize(
         max_steps=args.max_move_steps,
         translation_tolerance_m=args.translation_tolerance_m,
         yaw_tolerance_deg=args.yaw_tolerance_deg,
+        max_translation_command=(
+            args.held_max_translation_command if expected_holding else 1.0
+        ),
+        max_rotation_command=(
+            args.held_max_rotation_command if expected_holding else 0.50
+        ),
     )
     holding_after = holding_state(env, expert_record["object_id"])
     valid = bool(
