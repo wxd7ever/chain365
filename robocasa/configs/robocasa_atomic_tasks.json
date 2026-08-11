@@ -32,6 +32,8 @@
     "OpenStandMixerHead",
     "OpenToasterOvenDoor",
     "PackDessert",
+    "PickObject",
+    "PlaceObject",
     "PickPlaceCabinetToCounter",
     "PickPlaceCounterToBlender",
     "PickPlaceCounterToCabinet",

@@ -16,6 +16,13 @@ _DATASET_REGISTRY_PATH = (
     Path(__file__).resolve().parent / "utils" / "dataset_registry.py"
 )
 
+# Policy-only skills used by the work-pose benchmark. They intentionally do
+# not pretend to be official RoboCasa environments: both calls are executed by
+# the shared language-conditioned pi0.5 policy inside a restored composite-task
+# episode. Keeping them here lets the scheduler, verifier, and prompt builder
+# validate the calls without modifying the upstream dataset registry.
+VIRTUAL_ATOMIC_TASKS = frozenset({"PickObject", "PlaceObject"})
+
 
 @dataclass(frozen=True)
 class AtomicTaskCall:
@@ -144,7 +151,7 @@ def load_available_atomic_tasks(config_path: str | Path | None = None) -> set[st
         tasks = _tasks_from_config(Path(config_path))
         if not tasks:
             raise RuntimeError(f"No atomic tasks found in {config_path}")
-        return tasks
+        return tasks | set(VIRTUAL_ATOMIC_TASKS)
     for loader in (
         _tasks_from_loaded_metadata,
         _tasks_from_dataset_source,
@@ -153,7 +160,7 @@ def load_available_atomic_tasks(config_path: str | Path | None = None) -> set[st
     ):
         tasks = loader()
         if tasks:
-            return tasks
+            return tasks | set(VIRTUAL_ATOMIC_TASKS)
     raise RuntimeError(
         "Could not discover RoboCasa atomic tasks from dataset metadata, "
         "the task registry, or configs/robocasa_atomic_tasks.json"

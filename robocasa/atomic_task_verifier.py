@@ -459,7 +459,11 @@ def _object_relation(
         if predicate == "holding":
             relation_api = "check_obj_grasped"
             value = _require_boolean_state(
-                object_utils.check_obj_grasped(raw_env, subject_alias), relation_api
+                object_utils.check_obj_grasped(
+                    raw_env,
+                    subject_alias,
+                    threshold=0.035 if receptacle_threshold is None else receptacle_threshold,
+                ), relation_api
             )
         elif predicate in {"inside", "inserted", "on"} and object_kind == "object":
             kwargs = (
@@ -1260,7 +1264,7 @@ class RuntimeAtomicTaskVerifier:
             only_2d = condition.get("only_2d", False)
             if not isinstance(only_2d, bool):
                 raise ValueError("eef_outside_fixture only_2d must be boolean")
-        elif predicate in {"inside", "inserted", "on"} and "threshold" in condition:
+        elif predicate in {"inside", "inserted", "on", "holding"} and "threshold" in condition:
             raw_threshold = condition["threshold"]
             if isinstance(raw_threshold, bool):
                 raise ValueError("relation threshold must be a positive number")

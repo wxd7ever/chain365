@@ -30,6 +30,8 @@
   "OpenStandMixerHead": ["Open the stand mixer head."],
   "OpenToasterOvenDoor": ["Open the toaster oven door."],
   "PackDessert": ["Add the {object_name} to the tupperware that contains the {destination_name}."],
+  "PickObject": ["Pick up the {object_name} from the {source_name} and keep holding it."],
+  "PlaceObject": ["Place the held {object_name} {destination_preposition} the {destination_name}, release it, and move the gripper away."],
   "PickPlaceCabinetToCounter": ["Pick the {object_name} from the cabinet and place it on the counter."],
   "PickPlaceCounterToBlender": ["Pick the {object_name} from the counter and place it in the blender."],
   "PickPlaceCounterToCabinet": ["Pick the {object_name} from the counter and place it in the cabinet."],

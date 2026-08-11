@@ -170,7 +170,9 @@ def _check_holding(raw_env: Any, object_alias: str) -> bool | None:
     try:
         from robocasa.utils import object_utils
 
-        return bool(object_utils.check_obj_grasped(raw_env, object_alias))
+        return bool(
+            object_utils.check_obj_grasped(raw_env, object_alias, threshold=0.05)
+        )
     except (
         AssertionError,
         AttributeError,

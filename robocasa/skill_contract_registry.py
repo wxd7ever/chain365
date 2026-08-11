@@ -95,7 +95,13 @@ def _task_family(atomic_task: str) -> str:
     }
     if atomic_task == "NavigateKitchen":
         return "navigation"
-    if atomic_task.startswith("PickPlace") or atomic_task in transfer_tasks:
+    if atomic_task == "PickObject":
+        return "object_pick"
+    if (
+        atomic_task == "PlaceObject"
+        or atomic_task.startswith("PickPlace")
+        or atomic_task in transfer_tasks
+    ):
         return "object_transfer"
     if atomic_task.startswith(("Open", "Close", "Slide", "Lower")):
         return "fixture_articulation"
@@ -126,6 +132,38 @@ def _family_definition(atomic_task: str) -> SkillContract:
                 "retryable": True,
                 "recovery": "RetrySkill",
             }
+        )
+    elif family == "object_pick":
+        preconditions.extend(
+            (
+                {
+                    "name": "pick_object_exists",
+                    "check": "goal_subject_resolves_to_object",
+                    "on_failure": "Replan",
+                },
+                {
+                    "name": "gripper_available",
+                    "check": "gripper_is_empty_or_holds_goal_object",
+                    "on_failure": "ReleaseAndRetract",
+                },
+            )
+        )
+        handoff.append({"rule": "keep_goal_object_held_for_next_skill"})
+        failures.extend(
+            (
+                {
+                    "code": "OBJECT_NOT_GRASPED",
+                    "trigger": "the requested object is not held stably",
+                    "retryable": True,
+                    "recovery": "RetrySkill",
+                },
+                {
+                    "code": "OBJECT_DROPPED",
+                    "trigger": "a confirmed grasp is lost before handoff",
+                    "retryable": True,
+                    "recovery": "RetrySkill",
+                },
+            )
         )
     elif family == "object_transfer":
         preconditions.extend(
