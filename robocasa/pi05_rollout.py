@@ -355,6 +355,9 @@ def execute_pi05_atomic_task_policy(
     video_skip: int = 2,
     base_action_mode: str = "residual",
     base_residual_limit: float = 0.15,
+    held_object_guard: bool = True,
+    held_object_hold_confirmation_steps: int = 2,
+    held_object_drop_confirmation_steps: int = 2,
 ) -> tuple[bool, dict[str, Any]]:
     """Execute one atomic subgoal without resetting the RoboCasa environment.
 
@@ -369,9 +372,11 @@ def execute_pi05_atomic_task_policy(
             AtomicTaskCall,
             validate_atomic_task_call,
         )
+        from .held_object_guard import build_held_object_guard
     except ImportError:
         from atomic_task_prompt_builder import build_atomic_task_prompt
         from atomic_task_schemas import AtomicTaskCall, validate_atomic_task_call
+        from held_object_guard import build_held_object_guard
 
     call = (
         atomic_task_call
@@ -392,6 +397,10 @@ def execute_pi05_atomic_task_policy(
         )
     if video_skip <= 0:
         raise ValueError(f"video_skip must be positive, got {video_skip}")
+    if held_object_hold_confirmation_steps <= 0:
+        raise ValueError("held_object_hold_confirmation_steps must be positive")
+    if held_object_drop_confirmation_steps <= 0:
+        raise ValueError("held_object_drop_confirmation_steps must be positive")
     if not callable(getattr(client, "infer", None)):
         raise TypeError("client must provide infer(observation) -> mapping")
     if not callable(verifier):
@@ -407,6 +416,14 @@ def execute_pi05_atomic_task_policy(
     observation = _current_observation(env)
     if hasattr(client, "reset"):
         client.reset()
+    object_guard = build_held_object_guard(
+        env=env,
+        atomic_task_call=call,
+        enabled=held_object_guard,
+        hold_confirmation_steps=held_object_hold_confirmation_steps,
+        drop_confirmation_steps=held_object_drop_confirmation_steps,
+    )
+    object_guard.start()
 
     action_plan: deque[np.ndarray] = deque()
     rewards: list[float] = []
@@ -473,6 +490,7 @@ def execute_pi05_atomic_task_policy(
         action = _apply_base_action_mode(
             raw_action, base_action_mode, base_residual_limit
         )
+        action = object_guard.apply_action(action, step_index=step_index + 1)
         observation, reward, done, info = _step_env(env, action)
         rewards.append(reward)
         completed_steps = step_index + 1
@@ -481,6 +499,14 @@ def execute_pi05_atomic_task_policy(
             frame = _capture_video_frame(env, observation)
             if frame is not None:
                 video_frames.append(frame)
+
+        guard_failure = object_guard.observe(step_index=completed_steps)
+        if guard_failure is not None:
+            final_verification = _validate_verifier_result(guard_failure)
+            verification_history.append(final_verification)
+            last_verified_step = completed_steps
+            terminal_failure = False
+            break
 
         should_verify = completed_steps >= min_steps_before_verify and (
             completed_steps % verify_interval == 0 or done
@@ -547,6 +573,7 @@ def execute_pi05_atomic_task_policy(
         "Base_Residual_Limit": float(base_residual_limit),
         "Input_Image_Size": int(resize_size),
         "Action_Interface_Validated": action_contract_validated,
+        "Held_Object_Guard": object_guard.to_dict(),
         "Action_Raw_Min": float(action_min) if rewards else None,
         "Action_Raw_Max": float(action_max) if rewards else None,
         "Server_Infer_Ms": _timing_summary(server_infer_ms),

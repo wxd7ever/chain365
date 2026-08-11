@@ -32,6 +32,9 @@ class RemoteAtomicTaskPolicyAdapter:
         min_steps_before_verify: int = 10,
         base_action_mode: str = "residual",
         base_residual_limit: float = 0.15,
+        held_object_guard: bool = True,
+        held_object_hold_confirmation_steps: int = 2,
+        held_object_drop_confirmation_steps: int = 2,
         render: bool = True,
         video_skip: int = 2,
     ):
@@ -39,6 +42,10 @@ class RemoteAtomicTaskPolicyAdapter:
             raise TypeError("client must provide infer(observation) -> mapping")
         if not callable(verifier):
             raise TypeError("verifier must be callable")
+        if held_object_hold_confirmation_steps <= 0:
+            raise ValueError("held_object_hold_confirmation_steps must be positive")
+        if held_object_drop_confirmation_steps <= 0:
+            raise ValueError("held_object_drop_confirmation_steps must be positive")
         self.client = client
         self.verifier = verifier
         self.log_dir = Path(log_dir)
@@ -50,6 +57,13 @@ class RemoteAtomicTaskPolicyAdapter:
         self.min_steps_before_verify = min_steps_before_verify
         self.base_action_mode = base_action_mode
         self.base_residual_limit = base_residual_limit
+        self.held_object_guard = bool(held_object_guard)
+        self.held_object_hold_confirmation_steps = int(
+            held_object_hold_confirmation_steps
+        )
+        self.held_object_drop_confirmation_steps = int(
+            held_object_drop_confirmation_steps
+        )
         self.render = render
         self.video_skip = video_skip
 
@@ -103,6 +117,13 @@ class RemoteAtomicTaskPolicyAdapter:
             video_skip=self.video_skip,
             base_action_mode=self.base_action_mode,
             base_residual_limit=self.base_residual_limit,
+            held_object_guard=self.held_object_guard,
+            held_object_hold_confirmation_steps=(
+                self.held_object_hold_confirmation_steps
+            ),
+            held_object_drop_confirmation_steps=(
+                self.held_object_drop_confirmation_steps
+            ),
         )
         rollout_logs["Configured_Horizon"] = int(configured_horizon)
         rollout_logs["Horizon_Source"] = horizon_source

@@ -101,6 +101,15 @@ CAM_CONFIGS = dict(
             camera_attribs=dict(fovy="60"),
             parent_body="mobilebase0_support",
         ),
+        # High, base-mounted view for closed-loop local work-pose refinement.
+        # MuJoCo fixed cameras look along their local -Z axis, so the identity
+        # quaternion produces a vertical top-down view in the support frame.
+        robot0_topview=dict(
+            pos=[-0.10, 0.0, 1.55],
+            quat=[1.0, 0.0, 0.0, 0.0],
+            camera_attribs=dict(fovy="75"),
+            parent_body="mobilebase0_support",
+        ),
         robot0_eye_in_hand=dict(
             pos=[0.05, 0, 0],
             quat=[0, 0.707107, 0.707107, 0],
@@ -149,6 +158,12 @@ COTRAIN_CAM_CONFIGS = dict(
                 -0.5905545353889465,
             ],
             camera_attribs=dict(fovy="60"),
+            parent_body="mobilebase0_support",
+        ),
+        robot0_topview=dict(
+            pos=[-0.10, 0.0, 1.55],
+            quat=[1.0, 0.0, 0.0, 0.0],
+            camera_attribs=dict(fovy="75"),
             parent_body="mobilebase0_support",
         ),
         robot0_eye_in_hand=dict(

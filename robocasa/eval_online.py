@@ -41,7 +41,7 @@ PNIB_INSTRUCTION_PREFIX = (
 )
 CLOSE_SINGLE_DOOR_MICROWAVE_LAYOUTS = {1, 4, 9}
 CLOSE_SINGLE_DOOR_CABINET_LAYOUTS = {7, 8}
-DEFAULT_PI05_HOST = "172.16.36.10"
+DEFAULT_PI05_HOST = "172.16.11.115"
 DEFAULT_PI05_PORT = 8000
 DEFAULT_PI05_SERVER_COMMIT = "5a6beda9ff99da30b4e1b59320f6a32971d7c397"
 DEFAULT_PI05_POLICY_CONFIG = "pi05_pretrain_human300"
@@ -132,6 +132,17 @@ def parse_args():
         default="residual",
     )
     parser.add_argument("--pi05_base_residual_limit", type=float, default=0.15)
+    parser.add_argument(
+        "--pi05_disable_held_object_guard",
+        action="store_true",
+        help="Disable grasp latching and early OBJECT_DROPPED detection.",
+    )
+    parser.add_argument(
+        "--pi05_held_object_hold_confirmation_steps", type=int, default=2
+    )
+    parser.add_argument(
+        "--pi05_held_object_drop_confirmation_steps", type=int, default=2
+    )
     parser.add_argument(
         "--skip_navigation",
         action="store_true",
@@ -241,7 +252,14 @@ def parse_args():
         "Default keeps the original Mobipi behavior; pi05 always consumes only the newest frame.",
     )
     args = parser.parse_args()
-    for name in ("pi05_camera_size", "pi05_resize_size", "pi05_replan_steps", "pi05_video_skip"):
+    for name in (
+        "pi05_camera_size",
+        "pi05_resize_size",
+        "pi05_replan_steps",
+        "pi05_held_object_hold_confirmation_steps",
+        "pi05_held_object_drop_confirmation_steps",
+        "pi05_video_skip",
+    ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name} must be positive")
     if args.pi05_horizon is not None and args.pi05_horizon <= 0:
@@ -343,7 +361,7 @@ def execute_atomic_task_from_json(
     )
     call = AtomicTaskCall.from_mapping(scheduler_query["atomic_task_call"])
     prepared, _ = prepare_execution_plan(
-        [call], _current_scene_context(env, args)
+        [call], _current_scene_context(env, args), defer_navigation=False
     )
     if len(prepared) != 1:
         raise ValueError("one scheduler call must prepare to exactly one atomic task")
@@ -365,6 +383,13 @@ def execute_atomic_task_from_json(
         min_steps_before_verify=args.pi05_min_steps_before_verify,
         base_action_mode=args.pi05_base_action_mode,
         base_residual_limit=args.pi05_base_residual_limit,
+        held_object_guard=not args.pi05_disable_held_object_guard,
+        held_object_hold_confirmation_steps=(
+            args.pi05_held_object_hold_confirmation_steps
+        ),
+        held_object_drop_confirmation_steps=(
+            args.pi05_held_object_drop_confirmation_steps
+        ),
         render=not args.no_pi05_video,
         video_skip=args.pi05_video_skip,
     )
@@ -468,6 +493,7 @@ def execute_long_horizon_task(
 
     from atomic_task_policy_adapter import RemoteAtomicTaskPolicyAdapter
     from atomic_task_verifier import RuntimeAtomicTaskVerifier
+    from grounding import RoboCasaGrounder
     from orchestrator import RoboCasaOrchestrator
     from robust_vlm_task_planner import prepare_execution_plan
     from vlm_task_planner import OpenAICompatibleVLMPlanner, load_vlm_task_plan
@@ -526,10 +552,20 @@ def execute_long_horizon_task(
         min_steps_before_verify=args.pi05_min_steps_before_verify,
         base_action_mode=args.pi05_base_action_mode,
         base_residual_limit=args.pi05_base_residual_limit,
+        held_object_guard=not args.pi05_disable_held_object_guard,
+        held_object_hold_confirmation_steps=(
+            args.pi05_held_object_hold_confirmation_steps
+        ),
+        held_object_drop_confirmation_steps=(
+            args.pi05_held_object_drop_confirmation_steps
+        ),
         render=not args.no_pi05_video,
         video_skip=args.pi05_video_skip,
     )
-    orchestrator = RoboCasaOrchestrator(atomic_task_policy_adapter=adapter)
+    orchestrator = RoboCasaOrchestrator(
+        atomic_task_policy_adapter=adapter,
+        grounder=RoboCasaGrounder(scene_context=scene_context),
+    )
     result = orchestrator.run_task_plan(
         env=env,
         task_plan=calls,

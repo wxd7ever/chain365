@@ -19,7 +19,114 @@ except ImportError:
 def _controlled_decomposition(
     task: str, scene_context: Mapping[str, Any]
 ) -> tuple[list[AtomicTaskCall], dict[str, Any]] | None:
-    if str(scene_context.get("env_name", "")) != "PlaceEqualIceCubes":
+    env_name = str(scene_context.get("env_name", ""))
+    if env_name == "RetrieveIceTray":
+        object_aliases = {
+            str(entity.get("alias"))
+            for entity in scene_context.get("objects", [])
+            if isinstance(entity, Mapping) and entity.get("alias")
+        }
+        fixture_aliases = {
+            str(entity.get("alias"))
+            for entity in scene_context.get("fixtures", [])
+            if isinstance(entity, Mapping) and entity.get("alias")
+        }
+        fixture_refs = scene_context.get("fixture_refs", {})
+        if not isinstance(fixture_refs, Mapping):
+            fixture_refs = {}
+        tray_alias = "ice_cube_tray"
+        fridge_alias = str(fixture_refs.get("fridge", ""))
+        dining_counter_alias = str(fixture_refs.get("dining_counter", ""))
+        missing = []
+        if tray_alias not in object_aliases:
+            missing.append("object:ice_cube_tray")
+        if fridge_alias not in fixture_aliases:
+            missing.append("fixture_ref:fridge")
+        if dining_counter_alias not in fixture_aliases:
+            missing.append("fixture_ref:dining_counter")
+        if missing:
+            raise ValueError(
+                "RetrieveIceTray controlled decomposition is missing scene roles: "
+                f"{missing}"
+            )
+        calls = [
+            AtomicTaskCall.from_mapping(
+                {
+                    "subgoal_id": "open_freezer",
+                    "atomic_task": "OpenFridge",
+                    "policy_prompt": "Open the freezer door of the fridge.",
+                    "arguments": {
+                        "fixture_id": fridge_alias,
+                        "fixture_name": "fridge",
+                        "door_name": "freezer door",
+                    },
+                    "termination_condition": {
+                        "predicate": "open",
+                        "subject": fridge_alias,
+                        "desired_value": True,
+                    },
+                    "metadata": {"controlled_decomposition": "RetrieveIceTray"},
+                }
+            ),
+            AtomicTaskCall.from_mapping(
+                {
+                    "subgoal_id": "grasp_ice_tray",
+                    "atomic_task": "PickPlaceFridgeShelfToDrawer",
+                    "policy_prompt": (
+                        "Pick up the ice cube tray from the open freezer and keep "
+                        "holding it. Do not place it yet."
+                    ),
+                    "arguments": {
+                        "object_id": tray_alias,
+                        "object_name": "ice cube tray",
+                        "source_id": fridge_alias,
+                    },
+                    "termination_condition": {
+                        "predicate": "holding",
+                        "subject": tray_alias,
+                        "desired_value": True,
+                    },
+                    "metadata": {
+                        "controlled_decomposition": "RetrieveIceTray",
+                        "policy_proxy": "fridge_source_grasp",
+                        "stop_after": "holding_goal_satisfied",
+                    },
+                }
+            ),
+            AtomicTaskCall.from_mapping(
+                {
+                    "subgoal_id": "place_tray_on_dining_counter",
+                    "atomic_task": "PickPlaceCabinetToCounter",
+                    "policy_prompt": (
+                        "Place the ice cube tray you are holding on the dining "
+                        "counter, release it, and move the gripper away."
+                    ),
+                    "arguments": {
+                        "object_id": tray_alias,
+                        "object_name": "ice cube tray",
+                        "destination_id": dining_counter_alias,
+                        "destination_name": "dining counter",
+                    },
+                    "termination_condition": {
+                        "predicate": "on",
+                        "subject": tray_alias,
+                        "object": dining_counter_alias,
+                        "desired_value": True,
+                    },
+                    "metadata": {
+                        "controlled_decomposition": "RetrieveIceTray",
+                        "policy_proxy": "held_object_to_counter",
+                    },
+                }
+            ),
+        ]
+        return calls, {
+            "source": "controlled_decomposition",
+            "rule": "RetrieveIceTray_to_open_grasp_place_runtime_navigation",
+            "long_horizon_task": task,
+            "num_atomic_task_calls": len(calls),
+        }
+    if env_name != "PlaceEqualIceCubes":
         return None
     object_aliases = {
         str(entity.get("alias"))
@@ -128,6 +235,27 @@ def _validate_execution_plan(
             if isinstance(call.termination_condition, list)
             else [call.termination_condition]
         )
+        if call.atomic_task == "NavigateKitchen":
+            navigation_conditions = [
+                condition
+                for condition in conditions
+                if str(condition.get("predicate", "")) == "navigation_pose"
+            ]
+            if len(navigation_conditions) != 1:
+                raise ValueError(
+                    f"{call.subgoal_id} NavigateKitchen requires exactly one "
+                    "navigation_pose condition"
+                )
+            navigation_condition = navigation_conditions[0]
+            target_alias = str(navigation_condition.get("subject", ""))
+            if fixture_aliases and target_alias not in fixture_aliases:
+                raise ValueError(
+                    f"{call.subgoal_id} navigation target must be a fixture alias"
+                )
+            if call.arguments.get("fixture_id") != target_alias:
+                raise ValueError(
+                    f"{call.subgoal_id} fixture_id must match navigation subject"
+                )
         for condition in conditions:
             missing = [
                 key
@@ -139,20 +267,6 @@ def _validate_execution_plan(
                     f"{call.subgoal_id} termination_condition is missing {missing}"
                 )
             predicate = str(condition["predicate"])
-            if call.atomic_task == "NavigateKitchen":
-                target_alias = str(condition["subject"])
-                if predicate != "navigation_pose":
-                    raise ValueError(
-                        f"{call.subgoal_id} NavigateKitchen requires navigation_pose"
-                    )
-                if fixture_aliases and target_alias not in fixture_aliases:
-                    raise ValueError(
-                        f"{call.subgoal_id} navigation target must be a fixture alias"
-                    )
-                if call.arguments.get("fixture_id") != target_alias:
-                    raise ValueError(
-                        f"{call.subgoal_id} fixture_id must match navigation subject"
-                    )
             if predicate in relation_predicates and not condition.get("object"):
                 raise ValueError(
                     f"{call.subgoal_id} relation predicate {predicate!r} requires object"
@@ -268,10 +382,54 @@ def _normalize_execution_plan(
         for entity in scene_context.get("fixtures", [])
         if isinstance(entity, Mapping) and entity.get("alias")
     }
+    object_natural_names = {
+        str(entity["alias"]): str(entity.get("natural_name") or entity["alias"])
+        for entity in scene_context.get("objects", [])
+        if isinstance(entity, Mapping) and entity.get("alias")
+    }
+    initial_state = scene_context.get("robot_initial_state", {})
+    if not isinstance(initial_state, Mapping):
+        initial_state = {}
+    initial_fixture_alias = str(initial_state.get("fixture", ""))
+    initial_object_alias = str(initial_state.get("object", ""))
+
+    def call_mentions_object(candidate: AtomicTaskCall, object_alias: str) -> bool:
+        """Conservatively identify the object operated on after navigation."""
+
+        if not object_alias:
+            return False
+        value = candidate.to_dict()
+        conditions = value["termination_condition"]
+        condition_items = conditions if isinstance(conditions, list) else [conditions]
+        if any(
+            str(condition.get(field, "")) == object_alias
+            for condition in condition_items
+            for field in ("subject", "object")
+        ):
+            return True
+        if any(
+            resolve_scene_identifier(identifier) == object_alias
+            for identifier in value.get("arguments", {}).values()
+        ):
+            return True
+        prompt = "_".join(
+            part
+            for part in "".join(
+                char.lower() if char.isalnum() else " "
+                for char in str(value.get("policy_prompt", ""))
+            ).split()
+            if part
+        )
+        names = {
+            object_alias.lower(),
+            object_natural_names.get(object_alias, "").lower().replace(" ", "_"),
+        }
+        return any(name and name in prompt for name in names)
+
     microwave_alias = alias_lookup.get("microwave", "microwave")
     microwave_opened = False
     used_ids = {call.subgoal_id for call in calls}
-    for call in calls:
+    for call_index, call in enumerate(calls):
         value = call.to_dict()
         conditions = value["termination_condition"]
         condition_items = conditions if isinstance(conditions, list) else [conditions]
@@ -413,11 +571,31 @@ def _normalize_execution_plan(
                 arguments["fixture_name"] = fixture_natural_names.get(
                     target_alias, target_key.replace("_", " ")
                 )
-                for condition in condition_items:
-                    predicate = str(condition.get("predicate", "")).lower()
-                    if predicate in {"at", "near", "navigation", "navigation_pose"}:
-                        condition["predicate"] = "navigation_pose"
-                    condition["subject"] = target_alias
+                navigation_condition = next(
+                    (
+                        condition
+                        for condition in condition_items
+                        if str(condition.get("predicate", "")).lower()
+                        in {"at", "near", "navigation", "navigation_pose"}
+                    ),
+                    condition_items[0],
+                )
+                predicate = str(
+                    navigation_condition.get("predicate", "")
+                ).lower()
+                # The atomic task determines the primary navigation goal semantics.
+                # Auxiliary invariants such as holding(object) remain unchanged.
+                if predicate != "navigation_pose":
+                    navigation_condition["predicate"] = "navigation_pose"
+                    changes.append(
+                        {
+                            "type": "normalize_navigation_predicate",
+                            "subgoal_id": call.subgoal_id,
+                            "from": predicate,
+                            "value": "navigation_pose",
+                        }
+                    )
+                navigation_condition["subject"] = target_alias
                 changes.append(
                     {
                         "type": "resolve_navigation_target",
@@ -426,6 +604,23 @@ def _normalize_execution_plan(
                     }
                 )
         call = AtomicTaskCall.from_mapping(value)
+        if (
+            call_index == 0
+            and len(calls) > 1
+            and call.atomic_task == "NavigateKitchen"
+            and call.arguments.get("fixture_id") == initial_fixture_alias
+            and call_mentions_object(calls[1], initial_object_alias)
+        ):
+            changes.append(
+                {
+                    "type": "skip_redundant_initial_navigation",
+                    "skipped_subgoal_id": call.subgoal_id,
+                    "fixture": initial_fixture_alias,
+                    "object": initial_object_alias,
+                    "reason": "robot_initialized_at_fixture_for_next_object",
+                }
+            )
+            continue
 
         if call.atomic_task in {"OpenMicrowave", "PickPlaceCounterToMicrowave"}:
             microwave_opened = True
@@ -482,11 +677,33 @@ def _normalize_execution_plan(
 def prepare_execution_plan(
     calls: Sequence[AtomicTaskCall],
     scene_context: Mapping[str, Any] | None = None,
+    *,
+    defer_navigation: bool = True,
 ) -> tuple[list[AtomicTaskCall], list[dict[str, Any]]]:
-    """Normalize, contract-enrich, and validate planner or scheduler calls."""
+    """Normalize calls and hand planner navigation decisions to the scheduler."""
 
     context = dict(scene_context or {})
     prepared, changes = _normalize_execution_plan(calls, context)
+    if defer_navigation:
+        operation_calls: list[AtomicTaskCall] = []
+        for call in prepared:
+            if call.atomic_task == "NavigateKitchen":
+                changes.append(
+                    {
+                        "type": "defer_navigation_to_scheduler",
+                        "skipped_subgoal_id": call.subgoal_id,
+                        "target_fixture": call.arguments.get("fixture_id"),
+                        "reason": "scheduler_will_ground_each_operation_at_runtime",
+                    }
+                )
+                continue
+            operation_calls.append(call)
+        prepared = operation_calls
+        if not prepared:
+            raise ValueError(
+                "planner produced no operation skills after deferring navigation; "
+                "the task plan must contain at least one non-navigation atomic task"
+            )
     _validate_execution_plan(prepared, context)
     return prepared, changes
 
@@ -510,9 +727,8 @@ class RobustOpenAICompatibleVLMPlanner(OpenAICompatibleVLMPlanner):
             "- Each condition object MUST contain predicate, subject, and desired_value. "
             "Use object for a destination relation such as inside/on.\n"
             "- arguments MUST be a JSON object even when empty.\n"
-            "- NavigateKitchen MUST set arguments.fixture_name to the target fixture and "
-            "use {predicate:navigation_pose, subject:<target fixture alias>, "
-            "desired_value:true} as its termination condition.\n"
+            "- NEVER output NavigateKitchen or navigation_pose. The scheduler performs "
+            "runtime grounding and inserts navigation only when needed.\n"
             "- Inspect fixture state in Scene context. Do not open an already-open fixture "
             "or close an already-closed fixture.\n"
             "- A microwave must be closed before TurnOnMicrowave. When an object has just "
@@ -522,9 +738,7 @@ class RobustOpenAICompatibleVLMPlanner(OpenAICompatibleVLMPlanner):
             '{"predicate":"inside","subject":"obj","object":"microwave",'
             '"desired_value":true}; '
             '{"predicate":"closed","subject":"microwave","desired_value":true}; '
-            '{"predicate":"powered","subject":"microwave","desired_value":true}; '
-            '{"predicate":"navigation_pose","subject":"sink",'
-            '"desired_value":true}.\n'
+            '{"predicate":"powered","subject":"microwave","desired_value":true}.\n'
         )
 
     def plan(

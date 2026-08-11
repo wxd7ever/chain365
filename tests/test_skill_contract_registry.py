@@ -64,6 +64,11 @@ def test_object_transfer_contract_adds_safe_handoff_and_is_idempotent():
     assert contract["handoff"]["conditions"] == enriched.termination_condition[1:]
     assert contract["failure"]
     assert contract["recovery"]
+    failures = {item["code"]: item for item in contract["failure"]}
+    recoveries = {item["name"]: item for item in contract["recovery"]}
+    assert failures["OBJECT_DROPPED"]["retryable"] is True
+    assert failures["OBJECT_DROPPED"]["recovery"] == "RegraspObject"
+    assert "RegraspObject" in recoveries
     assert contract["verification"]["required_consecutive_successes"] == 2
     assert changes[0]["type"] == "apply_skill_contract"
 
@@ -109,4 +114,3 @@ def test_iced_coffee_contract_releases_any_matching_cube_then_retracts_from_cup(
     }
     assert enriched.termination_condition[2]["predicate"] == "gripper_far"
     assert enriched.termination_condition[2]["subject"] == "glass_cup1"
-

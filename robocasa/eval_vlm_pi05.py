@@ -15,6 +15,7 @@ import numpy as np
 try:
     from .atomic_task_policy_adapter import RemoteAtomicTaskPolicyAdapter
     from .atomic_task_verifier import RuntimeAtomicTaskVerifier
+    from .grounding import RoboCasaGrounder
     from .io_utils import make_run_dir, save_obs_image, write_json
     from .openpi_client import OpenPIWebsocketClient
     from .orchestrator import RoboCasaOrchestrator
@@ -28,6 +29,7 @@ try:
 except ImportError:  # Support ``python robocasa/eval_vlm_pi05.py``.
     from atomic_task_policy_adapter import RemoteAtomicTaskPolicyAdapter
     from atomic_task_verifier import RuntimeAtomicTaskVerifier
+    from grounding import RoboCasaGrounder
     from io_utils import make_run_dir, save_obs_image, write_json
     from openpi_client import OpenPIWebsocketClient
     from orchestrator import RoboCasaOrchestrator
@@ -101,6 +103,17 @@ def parse_args() -> argparse.Namespace:
         default="residual",
     )
     parser.add_argument("--pi05_base_residual_limit", type=float, default=0.15)
+    parser.add_argument(
+        "--pi05_disable_held_object_guard",
+        action="store_true",
+        help="Disable grasp latching and early OBJECT_DROPPED detection.",
+    )
+    parser.add_argument(
+        "--pi05_held_object_hold_confirmation_steps", type=int, default=2
+    )
+    parser.add_argument(
+        "--pi05_held_object_drop_confirmation_steps", type=int, default=2
+    )
     parser.add_argument("--pi05_video_skip", type=int, default=2)
     parser.add_argument("--no_video", action="store_true")
     parser.add_argument("--continue_on_unsuccessful", action="store_true")
@@ -117,6 +130,8 @@ def parse_args() -> argparse.Namespace:
         "pi05_replan_steps",
         "pi05_atomic_task_horizon",
         "pi05_verify_interval",
+        "pi05_held_object_hold_confirmation_steps",
+        "pi05_held_object_drop_confirmation_steps",
         "pi05_video_skip",
     )
     for name in positive:
@@ -177,8 +192,10 @@ def _entity_state(entity: Any, task_env: Any) -> Mapping[str, Any] | None:
 
 def _scene_context(env: Any, args: argparse.Namespace) -> dict[str, Any]:
     task_env = env.env
+    task_fixtures = getattr(task_env, "fixtures", {})
+    task_objects = getattr(task_env, "objects", {})
     fixtures = []
-    for alias, fixture in getattr(task_env, "fixtures", {}).items():
+    for alias, fixture in task_fixtures.items():
         fixtures.append(
             {
                 "alias": str(alias),
@@ -189,7 +206,7 @@ def _scene_context(env: Any, args: argparse.Namespace) -> dict[str, Any]:
             }
         )
     objects = []
-    for alias, obj in getattr(task_env, "objects", {}).items():
+    for alias, obj in task_objects.items():
         natural_name = str(getattr(obj, "name", alias))
         get_obj_lang = getattr(task_env, "get_obj_lang", None)
         if callable(get_obj_lang):
@@ -206,12 +223,54 @@ def _scene_context(env: Any, args: argparse.Namespace) -> dict[str, Any]:
             }
         )
     episode_meta = task_env.get_ep_meta() if hasattr(task_env, "get_ep_meta") else {}
+    fixture_refs = {}
+    raw_fixture_refs = episode_meta.get("fixture_refs", {})
+    if isinstance(raw_fixture_refs, Mapping):
+        aliases_by_name = {
+            str(getattr(fixture, "name", alias)): str(alias)
+            for alias, fixture in task_fixtures.items()
+        }
+        for role, identifier in raw_fixture_refs.items():
+            identifier = str(identifier)
+            alias = (
+                identifier
+                if identifier in getattr(task_env, "fixtures", {})
+                else aliases_by_name.get(identifier)
+            )
+            if alias is not None:
+                fixture_refs[str(role)] = alias
+
+    # RoboCasa can deliberately initialize the base beside an object. Exposing that
+    # handoff prevents the planner from inserting a redundant navigation call to the
+    # center of the same (potentially long) counter.
+    robot_initial_state: dict[str, str] = {}
+    initial_ref = getattr(task_env, "init_robot_base_ref", None)
+    if initial_ref is not None:
+        try:
+            initial_fixture = task_env.get_fixture(initial_ref)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            initial_fixture = initial_ref
+        for alias, fixture in task_fixtures.items():
+            if fixture is initial_fixture or getattr(fixture, "name", None) == getattr(
+                initial_fixture, "name", initial_fixture
+            ):
+                robot_initial_state["fixture"] = str(alias)
+                break
+    for cfg in getattr(task_env, "object_cfgs", []) or []:
+        if not isinstance(cfg, Mapping) or cfg.get("init_robot_here") is not True:
+            continue
+        object_name = str(cfg.get("name", ""))
+        if object_name in task_objects:
+            robot_initial_state["object"] = object_name
+        break
     return {
         "env_name": args.env_name,
         "layout_id": args.layout_id,
         "style_id": args.style_id,
         "long_horizon_task": args.long_horizon_task,
         "base_episode_instruction": episode_meta.get("lang"),
+        "fixture_refs": fixture_refs,
+        "robot_initial_state": robot_initial_state,
         "fixtures": fixtures,
         "objects": objects,
     }
@@ -323,9 +382,23 @@ def main() -> int:
             {"uri": client.uri, "server_metadata": client.server_metadata},
         )
         print(f"[Pi05] Connected to {client.uri}")
+        alias_resolver_client = planner
+        if alias_resolver_client is None:
+            # Saved plans stay offline unless an identifier cannot be grounded locally.
+            alias_resolver_client = RobustOpenAICompatibleVLMPlanner(
+                base_url=args.vlm_base_url,
+                model=args.vlm_model,
+                api_key=args.vlm_api_key,
+                timeout_s=args.vlm_timeout_s,
+                include_images=False,
+                max_validation_retries=args.vlm_validation_retries,
+            )
+        entity_alias_resolver = alias_resolver_client.resolve_entity_alias
         adapter = RemoteAtomicTaskPolicyAdapter(
             client=client,
-            verifier=RuntimeAtomicTaskVerifier(),
+            verifier=RuntimeAtomicTaskVerifier(
+                entity_alias_resolver=entity_alias_resolver
+            ),
             log_dir=run_dir,
             resize_size=args.pi05_resize_size,
             replan_steps=args.pi05_replan_steps,
@@ -335,11 +408,22 @@ def main() -> int:
             min_steps_before_verify=args.pi05_min_steps_before_verify,
             base_action_mode=args.pi05_base_action_mode,
             base_residual_limit=args.pi05_base_residual_limit,
+            held_object_guard=not args.pi05_disable_held_object_guard,
+            held_object_hold_confirmation_steps=(
+                args.pi05_held_object_hold_confirmation_steps
+            ),
+            held_object_drop_confirmation_steps=(
+                args.pi05_held_object_drop_confirmation_steps
+            ),
             render=not args.no_video,
             video_skip=args.pi05_video_skip,
         )
         result = RoboCasaOrchestrator(
-            atomic_task_policy_adapter=adapter
+            atomic_task_policy_adapter=adapter,
+            grounder=RoboCasaGrounder(
+                scene_context=context,
+                entity_alias_resolver=entity_alias_resolver,
+            ),
         ).run_task_plan(
             env=env,
             task_plan=calls,

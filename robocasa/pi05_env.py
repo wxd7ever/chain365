@@ -13,6 +13,16 @@ POLICY_CAMERA_NAMES = (
     "robot0_eye_in_hand",
 )
 
+# These cameras are intentionally separate from POLICY_CAMERA_NAMES. The remote
+# pi0.5 checkpoint was trained with exactly the three policy views above, while
+# local work-pose refinement may render additional cameras on demand.
+LOCAL_POSE_CAMERA_NAMES = (
+    "robot0_topview",
+    "robot0_frontview",
+    "robot0_agentview_left",
+    "robot0_agentview_right",
+)
+
 
 def _process_observation(observation: Mapping[str, Any]) -> dict[str, Any]:
     """Flip raw MuJoCo camera images into the policy's upright HWC convention."""
@@ -82,6 +92,44 @@ class RawRoboCasaPi05Env:
             camera_name="robot0_agentview_left",
         )
         return np.ascontiguousarray(frame[::-1])
+
+    def render_camera(
+        self,
+        camera_name: str,
+        *,
+        height: int = 256,
+        width: int = 256,
+    ) -> np.ndarray:
+        """Render one named MuJoCo camera without changing policy observations."""
+
+        if not isinstance(camera_name, str) or not camera_name.strip():
+            raise ValueError("camera_name must be a non-empty string")
+        if height <= 0 or width <= 0:
+            raise ValueError("camera render dimensions must be positive")
+        frame = self.env.sim.render(
+            height=int(height),
+            width=int(width),
+            camera_name=camera_name.strip(),
+        )
+        return np.ascontiguousarray(np.asarray(frame)[::-1])
+
+    def render_camera_views(
+        self,
+        camera_names: tuple[str, ...] | list[str],
+        *,
+        height: int = 256,
+        width: int = 256,
+    ) -> dict[str, np.ndarray]:
+        """Render a deterministic, labelled set of local-refinement views."""
+
+        if not camera_names:
+            raise ValueError("camera_names must not be empty")
+        return {
+            str(camera_name): self.render_camera(
+                str(camera_name), height=height, width=width
+            )
+            for camera_name in camera_names
+        }
 
     def close(self) -> None:
         self.env.close()

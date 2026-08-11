@@ -152,6 +152,15 @@ def _family_definition(atomic_task: str) -> SkillContract:
         failures.extend(
             (
                 {
+                    "code": "OBJECT_DROPPED",
+                    "trigger": (
+                        "a confirmed grasp is lost before the destination relation "
+                        "is satisfied"
+                    ),
+                    "retryable": True,
+                    "recovery": "RegraspObject",
+                },
+                {
                     "code": "OBJECT_NOT_RELEASED",
                     "trigger": "goal relation is true but the gripper still holds the object",
                     "retryable": True,
@@ -172,6 +181,10 @@ def _family_definition(atomic_task: str) -> SkillContract:
             )
         )
         recoveries[0:0] = [
+            {
+                "name": "RegraspObject",
+                "action": "retry_the_transfer_from_current_state_to_regrasp_object",
+            },
             {
                 "name": "ReleaseAndRetract",
                 "action": "open_gripper_then_move_eef_away_from_the_goal_object",
@@ -406,4 +419,3 @@ def apply_skill_contract(
             }
         )
     return AtomicTaskCall.from_mapping(value), changes
-

@@ -182,6 +182,106 @@ def test_normalizer_resolves_navigation_target_and_predicate():
     _validate_execution_plan(normalized, context)
 
 
+def test_prepare_plan_defers_vlm_navigation_to_scheduler():
+    calls = [
+        AtomicTaskCall.from_mapping(
+            {
+                "subgoal_id": "nav_sink",
+                "atomic_task": "NavigateKitchen",
+                "policy_prompt": "Navigate to the sink.",
+                "arguments": {"fixture_name": "sink"},
+                "termination_condition": {
+                    "predicate": "navigation_pose",
+                    "subject": "sink_main_group",
+                    "desired_value": True,
+                },
+            }
+        ),
+        AtomicTaskCall.from_mapping(
+            {
+                "subgoal_id": "turn_on_sink",
+                "atomic_task": "TurnOnSinkFaucet",
+                "policy_prompt": "Turn on the sink faucet.",
+                "arguments": {"fixture_id": "sink_main_group"},
+                "termination_condition": {
+                    "predicate": "powered",
+                    "subject": "sink_main_group",
+                    "desired_value": True,
+                },
+            }
+        ),
+    ]
+    context = {
+        "fixtures": [
+            {
+                "alias": "sink_main_group",
+                "natural_name": "sink",
+                "type": "Sink",
+            }
+        ],
+        "objects": [],
+    }
+
+    prepared, changes = prepare_execution_plan(calls, context)
+
+    assert [call.atomic_task for call in prepared] == ["TurnOnSinkFaucet"]
+    assert any(
+        change["type"] == "defer_navigation_to_scheduler"
+        and change["skipped_subgoal_id"] == "nav_sink"
+        for change in changes
+    )
+
+
+def test_normalizer_overrides_relation_predicate_for_navigation_task():
+    """A resolved NavigateKitchen target always has navigation-pose semantics."""
+
+    calls = [
+        AtomicTaskCall.from_mapping(
+            {
+                "subgoal_id": "1",
+                "atomic_task": "NavigateKitchen",
+                "policy_prompt": "Navigate to the sink.",
+                "arguments": {},
+                "termination_condition": {
+                    "predicate": "inside",
+                    "subject": "sink_main_group",
+                    "desired_value": True,
+                },
+            }
+        )
+    ]
+    context = {
+        "fixtures": [
+            {
+                "alias": "sink_main_group",
+                "name": "sink_main_group",
+                "natural_name": "sink",
+                "type": "Sink",
+            }
+        ],
+        "objects": [],
+    }
+
+    normalized, changes = _normalize_execution_plan(calls, context)
+
+    call = normalized[0]
+    assert call.arguments == {
+        "fixture_name": "sink",
+        "fixture_id": "sink_main_group",
+    }
+    assert call.termination_condition == {
+        "predicate": "navigation_pose",
+        "subject": "sink_main_group",
+        "desired_value": True,
+    }
+    assert any(
+        change["type"] == "normalize_navigation_predicate"
+        and change["from"] == "inside"
+        for change in changes
+    )
+    _validate_execution_plan(normalized, context)
+
+
 def test_validation_rejects_unrequested_fixture_family():
     calls = [
         AtomicTaskCall.from_mapping(
@@ -284,3 +384,114 @@ def test_controlled_place_equal_ice_cubes_decomposes_to_four_counted_calls():
         [change for change in changes if change["type"] == "apply_skill_contract"]
     ) == 4
 
+
+
+def test_controlled_retrieve_ice_tray_uses_scene_roles_and_preserves_grasp():
+    context = {
+        "env_name": "RetrieveIceTray",
+        "long_horizon_task": (
+            "Open the freezer door, pick up the ice cube tray from the freezer, "
+            "and place it on the dining counter."
+        ),
+        "fixture_refs": {
+            "fridge": "fridgesidebyside_right_group_1",
+            "dining_counter": "island_island_group_1",
+        },
+        "fixtures": [
+            {"alias": "fridgesidebyside_right_group_1"},
+            {"alias": "island_island_group_1"},
+        ],
+        "objects": [{"alias": "ice_cube_tray"}],
+    }
+
+    controlled = _controlled_decomposition(context["long_horizon_task"], context)
+
+    assert controlled is not None
+    calls, provenance = controlled
+    assert [call.atomic_task for call in calls] == [
+        "OpenFridge",
+        "PickPlaceFridgeShelfToDrawer",
+        "PickPlaceCabinetToCounter",
+    ]
+    assert calls[1].termination_condition["predicate"] == "holding"
+    assert calls[2].termination_condition["object"] == "island_island_group_1"
+    assert provenance["rule"] == (
+        "RetrieveIceTray_to_open_grasp_place_runtime_navigation"
+    )
+
+    prepared, changes = prepare_execution_plan(calls, context)
+    assert [call.atomic_task for call in prepared] == [
+        "OpenFridge",
+        "PickPlaceFridgeShelfToDrawer",
+        "PickPlaceCabinetToCounter",
+    ]
+    placement_conditions = prepared[2].termination_condition
+    assert [condition["predicate"] for condition in placement_conditions] == [
+        "on",
+        "released",
+        "gripper_far",
+        "eef_outside_fixture",
+    ]
+    assert prepared[1].metadata["policy_proxy"] == "fridge_source_grasp"
+    assert prepared[2].metadata["policy_proxy"] == "held_object_to_counter"
+    assert len(
+        [change for change in changes if change["type"] == "apply_skill_contract"]
+    ) == 3
+
+
+def test_normalizer_skips_navigation_to_initialized_object():
+    calls = [
+        AtomicTaskCall.from_mapping(
+            {
+                "subgoal_id": "nav_counter",
+                "atomic_task": "NavigateKitchen",
+                "policy_prompt": (
+                    "Navigate to the counter where the blender jug is located."
+                ),
+                "arguments": {"fixture_name": "counter"},
+                "termination_condition": {
+                    "predicate": "navigation_pose",
+                    "subject": "counter_main_group",
+                    "desired_value": True,
+                },
+            }
+        ),
+        AtomicTaskCall.from_mapping(
+            {
+                "subgoal_id": "place_jug",
+                "atomic_task": "PickPlaceCounterToSink",
+                "policy_prompt": "Pick the blender jug and place it in the sink.",
+                "arguments": {"object_name": "blender jug"},
+                "termination_condition": {
+                    "predicate": "inside",
+                    "subject": "blender_jug",
+                    "object": "sink_main_group",
+                    "desired_value": True,
+                },
+            }
+        ),
+    ]
+    context = {
+        "robot_initial_state": {
+            "fixture": "counter_main_group",
+            "object": "blender_jug",
+        },
+        "fixtures": [
+            {"alias": "counter_main_group", "natural_name": "counter"},
+            {"alias": "sink_main_group", "natural_name": "sink"},
+        ],
+        "objects": [
+            {"alias": "blender_jug", "natural_name": "blender jug"},
+        ],
+    }
+
+    normalized, changes = prepare_execution_plan(calls, context)
+
+    assert [call.atomic_task for call in normalized] == ["PickPlaceCounterToSink"]
+    skipped = next(
+        change
+        for change in changes
+        if change["type"] == "skip_redundant_initial_navigation"
+    )
+    assert skipped["fixture"] == "counter_main_group"
+    assert skipped["object"] == "blender_jug"

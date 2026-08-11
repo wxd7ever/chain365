@@ -140,6 +140,94 @@ class OpenAICompatibleVLMPlanner:
     def endpoint(self) -> str:
         return f"{self.base_url}/chat/completions"
 
+    def resolve_entity_alias(
+        self,
+        *,
+        identifier: str,
+        field: str,
+        candidates: Sequence[Mapping[str, Any]],
+        condition: Mapping[str, Any],
+        atomic_task_call: Mapping[str, Any],
+    ) -> str | None:
+        """Ask the VLM to select one candidate, without trusting invented aliases."""
+
+        compact_call = {
+            key: atomic_task_call.get(key)
+            for key in ("atomic_task", "policy_prompt", "arguments")
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You ground a RoboCasa entity reference to an exact simulator "
+                        "alias. Select only an alias copied verbatim from candidates. "
+                        "If the information is insufficient or ambiguous, return null. "
+                        "Return JSON only as {\"alias\": <string-or-null>}."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "identifier": identifier,
+                            "field": field,
+                            "condition": dict(condition),
+                            "atomic_task_call": compact_call,
+                            "candidates": list(candidates),
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "temperature": 0,
+            "stream": False,
+            "response_format": {"type": "json_object"},
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = urllib.request.Request(
+            self.endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+                response_data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"VLM alias resolver HTTP {exc.code} from {self.endpoint}: {detail}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                f"Could not reach VLM alias resolver {self.endpoint}: {exc.reason}"
+            ) from exc
+        if not isinstance(response_data, Mapping):
+            raise RuntimeError("VLM alias resolver returned non-object JSON")
+        response_text = _extract_response_text(response_data)
+        text = _JSON_FENCE.sub("", response_text.strip())
+        try:
+            resolved = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"VLM alias resolver did not return valid JSON: {exc}"
+            ) from exc
+        if not isinstance(resolved, Mapping) or set(resolved) != {"alias"}:
+            raise RuntimeError(
+                "VLM alias resolver response must contain exactly an alias field"
+            )
+        alias = resolved["alias"]
+        if alias is None:
+            return None
+        if not isinstance(alias, str) or not alias.strip():
+            raise RuntimeError("VLM alias resolver alias must be a string or null")
+        return alias.strip()
+
+
     def _system_prompt(self) -> str:
         catalog = _planner_catalog()
         return (
@@ -155,11 +243,11 @@ class OpenAICompatibleVLMPlanner:
             "entity aliases, use those aliases exactly for subject/object while using "
             "natural names in policy_prompt. Supported predicates are "
             "open, closed, powered, inside, on, holding, inserted, pressed, turned, and "
-            "fixture_state, and navigation_pose. For relations use subject for the movable "
-            "object and object for the destination. Use NavigateKitchen for an explicitly "
-            "requested navigation step or a transition to a different work station. Put "
-            "the target fixture in arguments.fixture_name and use navigation_pose with "
-            "that fixture as the termination subject. Do not reset the scene.\n"
+            "fixture_state. For relations use subject for the movable object and object "
+            "for the destination. NEVER emit NavigateKitchen or navigation_pose. Plan "
+            "only manipulation / fixture-operation skills. The runtime scheduler grounds "
+            "each operation target against the current scene and inserts NavigateKitchen "
+            "only when the robot is not already at that target. Do not reset the scene.\n"
             f"Atomic task catalog (task: episode-language template):\n"
             f"{json.dumps(catalog, ensure_ascii=False, indent=2)}"
         )

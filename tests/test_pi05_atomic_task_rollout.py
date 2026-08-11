@@ -10,6 +10,7 @@ ROBOCASA_DIR = Path(__file__).resolve().parents[1] / "robocasa"
 sys.path.insert(0, str(ROBOCASA_DIR))
 
 from pi05_rollout import execute_pi05_atomic_task_policy  # noqa: E402
+import held_object_guard  # noqa: E402
 
 
 def observation():
@@ -108,3 +109,60 @@ def test_atomic_rollout_reuses_env_client_and_stops_on_verifier(tmp_path):
     assert logs["Atomic_Task_Call"]["subgoal_id"] == "g1"
     assert logs["Final_Verification"]["status"] == "success"
     assert logs["Prompt"] == "Open the microwave door."
+    assert logs["Held_Object_Guard"]["enabled"] is False
+
+
+def test_guard_failure_stops_rollout_and_returns_retryable_drop(monkeypatch, tmp_path):
+    class DroppingGuard:
+        def start(self):
+            pass
+
+        def apply_action(self, action, *, step_index):
+            return action
+
+        def observe(self, *, step_index):
+            if step_index < 2:
+                return None
+            return {
+                "status": "failed",
+                "goal_satisfied": False,
+                "failure_code": "OBJECT_DROPPED",
+                "retryable": True,
+                "state_evidence": [{"step_index": step_index}],
+            }
+
+        def to_dict(self):
+            return {"enabled": True, "dropped_step": 2}
+
+    monkeypatch.setattr(
+        held_object_guard,
+        "build_held_object_guard",
+        lambda **kwargs: DroppingGuard(),
+    )
+    env = FakeEnv()
+    success, logs = execute_pi05_atomic_task_policy(
+        env=env,
+        client=FakeClient(),
+        atomic_task_call={
+            "subgoal_id": "g1",
+            "atomic_task": "OpenMicrowave",
+            "policy_prompt": "Open the microwave door.",
+            "arguments": {"fixture_id": "microwave_1"},
+            "termination_condition": {"predicate": "open", "subject": "microwave_1"},
+        },
+        verifier=FakeVerifier(),
+        log_dir=tmp_path,
+        episode_id=0,
+        horizon=20,
+        replan_steps=5,
+        verify_interval=5,
+        min_steps_before_verify=0,
+        render=False,
+    )
+
+    assert success is False
+    assert len(env.actions) == 2
+    assert logs["Horizon"] == 2
+    assert logs["Final_Verification"]["failure_code"] == "OBJECT_DROPPED"
+    assert logs["Final_Verification"]["retryable"] is True
+    assert logs["Held_Object_Guard"]["dropped_step"] == 2
