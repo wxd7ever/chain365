@@ -183,8 +183,10 @@ def _family_definition(atomic_task: str) -> SkillContract:
         handoff.extend(
             (
                 {"rule": "released_goal_object"},
-                {"rule": "gripper_far_from_goal_object", "threshold": 0.25},
-                {"rule": "eef_outside_destination_fixture", "margin": 0.02},
+                {
+                    "rule": "eef_outside_destination_receptacle",
+                    "margin": 0.02,
+                },
             )
         )
         failures.extend(
@@ -305,11 +307,6 @@ def _resolved_handoff_conditions(
 
     if contract.family != "object_transfer":
         return []
-    fixture_aliases = {
-        str(entity.get("alias"))
-        for entity in scene_context.get("fixtures", [])
-        if isinstance(entity, Mapping) and entity.get("alias")
-    }
     relation_predicates = {"inside", "inserted", "on", "object_fixture_relation"}
     relation = next(
         (
@@ -326,25 +323,17 @@ def _resolved_handoff_conditions(
             relation.get("object", relation.get("destination", ""))
         ).strip()
         if subject:
-            handoff.extend(
-                (
-                    {
-                        "predicate": "released",
-                        "subject": subject,
-                        "desired_value": True,
-                    },
-                    {
-                        "predicate": "gripper_far",
-                        "subject": subject,
-                        "threshold": 0.25,
-                        "desired_value": True,
-                    },
-                )
-            )
-        if destination and destination in fixture_aliases:
             handoff.append(
                 {
-                    "predicate": "eef_outside_fixture",
+                    "predicate": "released",
+                    "subject": subject,
+                    "desired_value": True,
+                }
+            )
+        if destination:
+            handoff.append(
+                {
+                    "predicate": "eef_outside_receptacle",
                     "subject": destination,
                     "margin": 0.02,
                     "desired_value": True,
@@ -414,6 +403,47 @@ def apply_skill_contract(
         else _as_conditions(value["termination_condition"])
     )
     all_conditions = _as_conditions(value["termination_condition"])
+    removed: list[dict[str, Any]] = []
+    if contract.family == "object_transfer":
+        relation_predicates = {
+            "inside",
+            "inserted",
+            "on",
+            "object_fixture_relation",
+        }
+        has_relation = any(
+            str(condition.get("predicate", "")).lower()
+            in relation_predicates
+            for condition in goal_conditions
+        )
+        if has_relation:
+            handoff_predicates = {
+                "released",
+                "gripper_far",
+                "eef_outside_fixture",
+                "eef_outside_receptacle",
+            }
+            primary_goal_conditions = [
+                condition
+                for condition in goal_conditions
+                if str(condition.get("predicate", "")).lower()
+                not in handoff_predicates
+            ]
+            if primary_goal_conditions:
+                goal_conditions = primary_goal_conditions
+            legacy_predicates = {"gripper_far", "eef_outside_fixture"}
+            removed = [
+                condition
+                for condition in all_conditions
+                if str(condition.get("predicate", "")).lower()
+                in legacy_predicates
+            ]
+            all_conditions = [
+                condition
+                for condition in all_conditions
+                if str(condition.get("predicate", "")).lower()
+                not in legacy_predicates
+            ]
     handoff_conditions = _resolved_handoff_conditions(
         contract, goal_conditions, dict(scene_context or {})
     )
@@ -443,7 +473,7 @@ def apply_skill_contract(
         },
     }
     changes = []
-    if added or not isinstance(existing_contract, Mapping):
+    if added or removed or not isinstance(existing_contract, Mapping):
         changes.append(
             {
                 "type": "apply_skill_contract",
@@ -451,6 +481,9 @@ def apply_skill_contract(
                 "atomic_task": call.atomic_task,
                 "family": contract.family,
                 "added_handoff_predicates": [item["predicate"] for item in added],
+                "removed_handoff_predicates": [
+                    item["predicate"] for item in removed
+                ],
                 "required_consecutive_successes": (
                     contract.required_consecutive_successes
                 ),

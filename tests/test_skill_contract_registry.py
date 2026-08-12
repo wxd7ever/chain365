@@ -55,8 +55,7 @@ def test_object_transfer_contract_adds_safe_handoff_and_is_idempotent():
     assert [item["predicate"] for item in enriched.termination_condition] == [
         "inside",
         "released",
-        "gripper_far",
-        "eef_outside_fixture",
+        "eef_outside_receptacle",
     ]
     contract = enriched.metadata["skill_contract"]
     assert contract["precondition"]
@@ -75,6 +74,60 @@ def test_object_transfer_contract_adds_safe_handoff_and_is_idempotent():
     enriched_again, repeated_changes = apply_skill_contract(enriched, context)
     assert enriched_again.termination_condition == enriched.termination_condition
     assert repeated_changes == []
+
+
+def test_legacy_transfer_handoff_is_migrated_to_receptacle_boundary():
+    legacy = AtomicTaskCall.from_mapping(
+        {
+            "subgoal_id": "legacy_place",
+            "atomic_task": "PlaceObject",
+            "policy_prompt": "Place the potato in the bowl.",
+            "arguments": {"object_id": "vegetable", "destination_id": "bowl"},
+            "termination_condition": [
+                {
+                    "predicate": "inside",
+                    "subject": "vegetable",
+                    "object": "bowl",
+                    "desired_value": True,
+                },
+                {
+                    "predicate": "released",
+                    "subject": "vegetable",
+                    "desired_value": True,
+                },
+                {
+                    "predicate": "gripper_far",
+                    "subject": "vegetable",
+                    "threshold": 0.25,
+                    "desired_value": True,
+                },
+                {
+                    "predicate": "eef_outside_fixture",
+                    "subject": "bowl",
+                    "margin": 0.02,
+                    "desired_value": True,
+                },
+            ],
+        }
+    )
+
+    migrated, changes = apply_skill_contract(
+        legacy,
+        {"fixtures": [], "objects": [{"alias": "vegetable"}, {"alias": "bowl"}]},
+    )
+
+    assert [item["predicate"] for item in migrated.termination_condition] == [
+        "inside",
+        "released",
+        "eef_outside_receptacle",
+    ]
+    assert changes[0]["removed_handoff_predicates"] == [
+        "gripper_far",
+        "eef_outside_fixture",
+    ]
+    assert migrated.metadata["skill_contract"]["goal"]["conditions"] == [
+        legacy.termination_condition[0]
+    ]
 
 
 def test_iced_coffee_contract_releases_any_matching_cube_then_retracts_from_cup():

@@ -18,6 +18,7 @@ except ImportError:  # Direct execution from the robocasa script directory.
 _VALID_PREDICATES = {
     "closed",
     "eef_outside_fixture",
+    "eef_outside_receptacle",
     "fixture_state",
     "gripper_far",
     "holding",
@@ -765,27 +766,29 @@ def _eef_site_position(raw_env: Any) -> np.ndarray:
     return np.asarray(raw_env.sim.data.site_xpos[site_id], dtype=float)
 
 
-def _point_inside_fixture_with_margin(
-    point: np.ndarray, fixture: Any, margin: float, only_2d: bool
+def _point_inside_oriented_box_with_margin(
+    point: np.ndarray,
+    boundary_points: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    margin: float,
+    only_2d: bool,
 ) -> bool:
-    """Equivalent to object_utils.point_in_fixture with a metric safety margin."""
+    """Check a point against the p0/px/py/pz representation of an OBB."""
 
     p0, px, py, pz = (
-        np.asarray(value, dtype=float)
-        for value in fixture.get_ext_sites(relative=False)
+        np.asarray(value, dtype=float) for value in boundary_points
     )
     if not all(
         value.shape == (3,) and np.isfinite(value).all()
         for value in (point, p0, px, py, pz)
     ):
-        raise ValueError("EEF and fixture bounding-box coordinates must be finite 3D points")
+        raise ValueError("EEF and boundary-box coordinates must be finite 3D points")
     axes = (px - p0, py - p0, pz - p0)
     endpoints = (px, py, pz)
     checks = []
     for axis, endpoint in zip(axes, endpoints):
         axis_length = float(np.linalg.norm(axis))
         if axis_length <= 0:
-            raise ValueError("fixture exterior bounding box has a zero-length axis")
+            raise ValueError("entity bounding box has a zero-length axis")
         projection = float(np.dot(axis, point))
         checks.append(
             float(np.dot(axis, p0)) - margin * axis_length
@@ -793,6 +796,20 @@ def _point_inside_fixture_with_margin(
             <= float(np.dot(axis, endpoint)) + margin * axis_length
         )
     return bool(all(checks[:2] if only_2d else checks))
+
+
+def _point_inside_fixture_with_margin(
+    point: np.ndarray, fixture: Any, margin: float, only_2d: bool
+) -> bool:
+    """Equivalent to object_utils.point_in_fixture with a metric safety margin."""
+
+    points = tuple(
+        np.asarray(value, dtype=float)
+        for value in fixture.get_ext_sites(relative=False)
+    )
+    return _point_inside_oriented_box_with_margin(
+        point, points, margin, only_2d
+    )
 
 
 def _eef_outside_fixture(
@@ -827,6 +844,75 @@ def _eef_outside_fixture(
             "value": value,
         }
     ]
+
+def _eef_outside_receptacle(
+    chain: list[Any], subject: str, margin: float, only_2d: bool
+) -> tuple[bool | None, list[dict[str, Any]]]:
+    entity, alias = _resolve_entity(chain, subject)
+    raw_env = _task_env(chain)
+    entity_kind = _entity_kind(raw_env, alias)
+    if entity is None or entity_kind not in {"object", "fixture"}:
+        return None, [
+            {
+                "source": "eef_outside_receptacle",
+                "subject": subject,
+                "resolved_receptacle": False,
+            }
+        ]
+    try:
+        point = _eef_site_position(raw_env)
+        if entity_kind == "fixture":
+            inside = _point_inside_fixture_with_margin(
+                point, entity, margin, only_2d
+            )
+        else:
+            from robosuite.utils import transform_utils
+
+            body_id = raw_env.obj_body_id[alias]
+            position = np.asarray(raw_env.sim.data.body_xpos[body_id], dtype=float)
+            quaternion = transform_utils.convert_quat(
+                np.asarray(raw_env.sim.data.body_xquat[body_id], dtype=float),
+                to="xyzw",
+            )
+            points = tuple(
+                np.asarray(value, dtype=float)
+                for value in entity.get_bbox_points(
+                    trans=position, rot=quaternion
+                )[:4]
+            )
+            inside = _point_inside_oriented_box_with_margin(
+                point, points, margin, only_2d
+            )
+    except (
+        AssertionError,
+        AttributeError,
+        IndexError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        return None, [
+            {
+                "source": "eef_outside_receptacle",
+                "entity": alias,
+                "entity_kind": entity_kind,
+                "error": str(exc),
+            }
+        ]
+    value = not inside
+    return value, [
+        {
+            "source": "eef_outside_receptacle",
+            "entity": alias,
+            "entity_kind": entity_kind,
+            "eef_position": point.tolist(),
+            "margin": margin,
+            "only_2d": only_2d,
+            "inside_expanded_receptacle": inside,
+            "value": value,
+        }
+    ]
+
 
 def _navigation_pose(
     chain: list[Any], subject: str, reference_object: str | None = None
@@ -1245,25 +1331,25 @@ class RuntimeAtomicTaskVerifier:
                 ) from exc
             if not np.isfinite(threshold) or threshold <= 0:
                 raise ValueError("gripper_far threshold must be a positive number")
-        elif predicate == "eef_outside_fixture":
+        elif predicate in {"eef_outside_fixture", "eef_outside_receptacle"}:
             raw_margin = condition.get("margin", 0.0)
             if isinstance(raw_margin, bool):
                 raise ValueError(
-                    "eef_outside_fixture margin must be a non-negative number"
+                    f"{predicate} margin must be a non-negative number"
                 )
             try:
                 margin = float(raw_margin)
             except (TypeError, ValueError) as exc:
                 raise ValueError(
-                    "eef_outside_fixture margin must be a non-negative number"
+                    f"{predicate} margin must be a non-negative number"
                 ) from exc
             if not np.isfinite(margin) or margin < 0:
                 raise ValueError(
-                    "eef_outside_fixture margin must be a non-negative number"
+                    f"{predicate} margin must be a non-negative number"
                 )
             only_2d = condition.get("only_2d", False)
             if not isinstance(only_2d, bool):
-                raise ValueError("eef_outside_fixture only_2d must be boolean")
+                raise ValueError(f"{predicate} only_2d must be boolean")
         elif predicate in {"inside", "inserted", "on", "holding"} and "threshold" in condition:
             raw_threshold = condition["threshold"]
             if isinstance(raw_threshold, bool):
@@ -1290,6 +1376,11 @@ class RuntimeAtomicTaskVerifier:
             evidence.extend(predicate_evidence)
         elif predicate == "eef_outside_fixture":
             value, predicate_evidence = _eef_outside_fixture(
+                chain, subject, margin, only_2d
+            )
+            evidence.extend(predicate_evidence)
+        elif predicate == "eef_outside_receptacle":
+            value, predicate_evidence = _eef_outside_receptacle(
                 chain, subject, margin, only_2d
             )
             evidence.extend(predicate_evidence)

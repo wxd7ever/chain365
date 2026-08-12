@@ -358,6 +358,7 @@ def execute_pi05_atomic_task_policy(
     held_object_guard: bool = True,
     held_object_hold_confirmation_steps: int = 2,
     held_object_drop_confirmation_steps: int = 2,
+    success_handoff_steps: int = 0,
 ) -> tuple[bool, dict[str, Any]]:
     """Execute one atomic subgoal without resetting the RoboCasa environment.
 
@@ -401,6 +402,8 @@ def execute_pi05_atomic_task_policy(
         raise ValueError("held_object_hold_confirmation_steps must be positive")
     if held_object_drop_confirmation_steps <= 0:
         raise ValueError("held_object_drop_confirmation_steps must be positive")
+    if success_handoff_steps < 0:
+        raise ValueError("success_handoff_steps must be non-negative")
     if not callable(getattr(client, "infer", None)):
         raise TypeError("client must provide infer(observation) -> mapping")
     if not callable(verifier):
@@ -440,8 +443,11 @@ def execute_pi05_atomic_task_policy(
     info: Mapping[str, Any] = {}
     last_verified_step: int | None = None
     final_verification: dict[str, Any] | None = None
+    first_success_step: int | None = None
+    handoff_target_step: int | None = None
+    maximum_total_steps = horizon + success_handoff_steps
 
-    for step_index in range(horizon):
+    for step_index in range(maximum_total_steps):
         if not action_plan:
             payload = build_pi05_observation(
                 observation, prompt, resize_size=resize_size
@@ -524,12 +530,20 @@ def execute_pi05_atomic_task_policy(
             verification_history.append(final_verification)
             last_verified_step = completed_steps
             if final_verification["status"] == "success":
-                atomic_task_success = True
-                break
+                if first_success_step is None:
+                    first_success_step = completed_steps
+                    handoff_target_step = (
+                        completed_steps + success_handoff_steps
+                    )
+                if completed_steps >= handoff_target_step:
+                    atomic_task_success = True
+                    break
             if final_verification["status"] == "failed":
                 terminal_failure = not bool(final_verification.get("retryable", False))
                 break
         if done:
+            break
+        if first_success_step is None and completed_steps >= horizon:
             break
 
     completed_steps = len(rewards)
@@ -545,7 +559,10 @@ def execute_pi05_atomic_task_policy(
         )
         verification_history.append(final_verification)
         if final_verification["status"] == "success":
-            atomic_task_success = True
+            if first_success_step is None:
+                first_success_step = completed_steps
+                handoff_target_step = completed_steps + success_handoff_steps
+            atomic_task_success = completed_steps >= handoff_target_step
         elif final_verification["status"] == "failed":
             terminal_failure = not bool(final_verification.get("retryable", False))
 
@@ -566,6 +583,21 @@ def execute_pi05_atomic_task_policy(
         "Verification_History": verification_history,
         "Return": float(np.sum(rewards)),
         "Horizon": completed_steps,
+        "Configured_Pre_Success_Horizon": int(horizon),
+        "Success_Handoff_Steps": int(success_handoff_steps),
+        "First_Success_Step": first_success_step,
+        "Handoff_Target_Step": handoff_target_step,
+        "Post_Success_Steps_Executed": (
+            max(0, completed_steps - first_success_step)
+            if first_success_step is not None
+            else 0
+        ),
+        "Handoff_Completed": bool(
+            first_success_step is not None
+            and handoff_target_step is not None
+            and completed_steps >= handoff_target_step
+            and atomic_task_success
+        ),
         "Num_Policy_Queries": len(action_chunk_lengths),
         "Action_Chunk_Lengths": action_chunk_lengths,
         "Replan_Steps": int(replan_steps),

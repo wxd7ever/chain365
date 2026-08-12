@@ -73,7 +73,7 @@ def test_normalizer_resolves_aliases_defaults_condition_and_inserts_close():
     assert first_conditions[0]["object"] == "microwave_main_group"
     assert first_conditions[0]["desired_value"] is True
     assert [item["predicate"] for item in first_conditions] == [
-        "inside", "released", "gripper_far", "eef_outside_fixture"
+        "inside", "released", "eef_outside_receptacle"
     ]
     assert normalized[0].metadata["skill_contract"]["family"] == "object_transfer"
     assert normalized[1].termination_condition["subject"] == "microwave_main_group"
@@ -429,8 +429,7 @@ def test_controlled_retrieve_ice_tray_uses_scene_roles_and_preserves_grasp():
     assert [condition["predicate"] for condition in placement_conditions] == [
         "on",
         "released",
-        "gripper_far",
-        "eef_outside_fixture",
+        "eef_outside_receptacle",
     ]
     assert prepared[1].metadata["policy_proxy"] == "fridge_source_grasp"
     assert prepared[2].metadata["policy_proxy"] == "held_object_to_counter"

@@ -195,6 +195,39 @@ class HandoffEnv:
         self.sim = type("HandoffSim", (), {"data": data})()
 
 
+class ReceptacleObject:
+    @staticmethod
+    def get_bbox_points(trans=None, rot=None):
+        return [
+            np.asarray([0.0, 0.0, 0.0]),
+            np.asarray([1.0, 0.0, 0.0]),
+            np.asarray([0.0, 1.0, 0.0]),
+            np.asarray([0.0, 0.0, 1.0]),
+            np.asarray([1.0, 1.0, 1.0]),
+            np.asarray([0.0, 1.0, 1.0]),
+            np.asarray([1.0, 0.0, 1.0]),
+            np.asarray([1.0, 1.0, 0.0]),
+        ]
+
+
+class ReceptacleEnv:
+    def __init__(self, eef_position):
+        self.fixtures = {}
+        self.objects = {"bowl": ReceptacleObject()}
+        self.obj_body_id = {"bowl": 0}
+        self.robots = [type("Robot", (), {"eef_site_id": {"right": 0}})()]
+        data = type(
+            "ReceptacleData",
+            (),
+            {
+                "site_xpos": np.asarray([eef_position], dtype=float),
+                "body_xpos": np.asarray([[0.0, 0.0, 0.0]], dtype=float),
+                "body_xquat": np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=float),
+            },
+        )()
+        self.sim = type("ReceptacleSim", (), {"data": data})()
+
+
 def handoff_call(subgoal_id, condition, *, metadata=None):
     return {
         "subgoal_id": subgoal_id,
@@ -316,6 +349,42 @@ def test_eef_outside_fixture_respects_expanded_safety_margin():
     )
     assert result["status"] == "success"
     assert result["state_evidence"][-1]["inside_expanded_fixture"] is False
+
+
+def test_eef_outside_object_receptacle_respects_world_boundary_and_margin():
+    env = ReceptacleEnv(eef_position=(1.01, 0.5, 0.5))
+    call = handoff_call(
+        "eef_clear_bowl",
+        {
+            "predicate": "eef_outside_receptacle",
+            "subject": "bowl",
+            "margin": 0.02,
+            "desired_value": True,
+        },
+    )
+    verifier = RuntimeAtomicTaskVerifier()
+
+    result = verifier(
+        env=env,
+        atomic_task_call=call,
+        observation={},
+        step_index=10,
+        info={},
+    )
+    assert result["status"] == "uncertain"
+    assert result["state_evidence"][-1]["entity_kind"] == "object"
+    assert result["state_evidence"][-1]["inside_expanded_receptacle"] is True
+
+    env.sim.data.site_xpos[0] = np.asarray([1.03, 0.5, 0.5])
+    result = verifier(
+        env=env,
+        atomic_task_call=call,
+        observation={},
+        step_index=15,
+        info={},
+    )
+    assert result["status"] == "success"
+    assert result["state_evidence"][-1]["inside_expanded_receptacle"] is False
 
 
 def test_contract_requires_consecutive_success_and_resets_after_instability():

@@ -4,8 +4,11 @@ import json
 import math
 import xml.etree.ElementTree as ET
 
+import numpy as np
 import pandas as pd
 import pytest
+
+import robocasa.work_pose_dataset as work_pose_dataset
 
 from robocasa.atomic_task_schemas import (
     AtomicTaskCall,
@@ -18,10 +21,15 @@ from robocasa.work_pose_dataset import (
     AnnotationSegment,
     annotation_segments,
     apply_local_pose_delta,
+    eef_pose_error,
+    eef_pose_from_state,
     ensure_model_cameras,
     generate_pose_perturbations,
+    move_base_to_pose,
+    move_eef_to_pose,
     pose_error,
     steam_operation_spec,
+    terminal_eef_pose,
     yaw_quaternion_xyzw,
 )
 
@@ -101,7 +109,11 @@ def test_steam_annotations_map_to_four_policy_only_skills(
             value["predicate"]
             for value in result["atomic_task_call"]["termination_condition"]
         }
-        assert {"inside", "released", "gripper_far"} <= predicates
+        assert predicates == {
+            "inside",
+            "released",
+            "eef_outside_receptacle",
+        }
 
 
 def test_local_pose_delta_and_error_use_robot_frame():
@@ -225,4 +237,145 @@ def test_virtual_pick_place_skills_are_valid_and_have_distinct_contracts(tmp_pat
         for condition in enriched_place.termination_condition
     ]
     assert enriched_place.metadata["skill_contract"]["family"] == "object_transfer"
-    assert predicates == ["inside", "released", "gripper_far"]
+    assert predicates == ["inside", "released", "eef_outside_receptacle"]
+
+
+def test_move_base_to_pose_slow_start_records_diagnostics_and_video(monkeypatch):
+    class FakeEnv:
+        def __init__(self):
+            self.position = np.array([0.0, 0.0, 0.7])
+            self.actions = []
+
+        def get_observation(self):
+            return {
+                "robot0_base_pos": self.position.copy(),
+                "robot0_base_quat": np.array([0.0, 0.0, 0.0, 1.0]),
+            }
+
+        def step(self, action):
+            self.actions.append(np.asarray(action).copy())
+            self.position[0] += float(action[7]) * 0.001
+            return self.get_observation(), 0.0, False, {}
+
+        def render_camera(self, camera_name, *, height, width):
+            assert camera_name == "robot0_agentview_left"
+            return np.zeros((height, width, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(
+        work_pose_dataset,
+        "object_eef_diagnostics",
+        lambda env, object_id: {
+            "holding": True,
+            "object_eef_distance_m": 0.04,
+        },
+    )
+    env = FakeEnv()
+    result = move_base_to_pose(
+        env,
+        {
+            "position": [1.0, 0.0, 0.7],
+            "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "yaw_rad": 0.0,
+        },
+        max_steps=3,
+        settle_steps=0,
+        max_translation_command=0.20,
+        slow_start_steps=2,
+        slow_start_translation_command=0.08,
+        diagnostic_object_id="bowl",
+        capture_video=True,
+        video_stride=1,
+        video_height=8,
+        video_width=8,
+    )
+
+    assert [entry["translation_command_limit"] for entry in result["trace"]] == [
+        0.08,
+        0.08,
+        0.20,
+    ]
+    assert abs(env.actions[0][7]) == pytest.approx(0.08)
+    assert abs(env.actions[1][7]) == pytest.approx(0.08)
+    assert abs(env.actions[2][7]) == pytest.approx(0.20)
+    assert all(
+        entry["object_eef_distance_m"] == 0.04 for entry in result["trace"]
+    )
+    assert len(result["video_frames"]) == 5
+
+def test_terminal_eef_pose_uses_official_end_window_and_quaternion_sign_alignment():
+    observations = np.zeros((4, 16), dtype=np.float64)
+    observations[:, 7:10] = [
+        [0.40, -0.10, 0.70],
+        [0.50, -0.10, 0.80],
+        [0.52, -0.08, 0.82],
+        [0.54, -0.06, 0.84],
+    ]
+    observations[:, 10:14] = [
+        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, -1.0],
+        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, -1.0],
+    ]
+    segment = AnnotationSegment(
+        subtask_idx=0,
+        start_frame=0,
+        end_frame=3,
+        subtask="pick",
+        source_atomic_task="PickPlaceSinkToCounter",
+        stage="pick",
+    )
+
+    pose = terminal_eef_pose(observations, segment, window=3)
+
+    assert pose["position"] == pytest.approx([0.54, -0.06, 0.84])
+    assert pose["aggregation"] == "terminal_frame"
+    assert abs(pose["quaternion_xyzw"][3]) == pytest.approx(1.0)
+    assert pose["window_start"] == 1
+    assert pose["window_end"] == 3
+    decoded = eef_pose_from_state(observations[-1])
+    assert eef_pose_error(decoded, pose)["orientation_deg"] == pytest.approx(0.0)
+
+
+def test_move_eef_to_expert_pose_freezes_base_and_converges():
+    class FakeEnv:
+        def __init__(self):
+            self.position = np.zeros(3, dtype=np.float64)
+            self.quaternion = np.array([0.0, 0.0, 0.0, 1.0])
+            self.actions = []
+
+        def get_observation(self):
+            return {
+                "robot0_base_to_eef_pos": self.position.copy(),
+                "robot0_base_to_eef_quat": self.quaternion.copy(),
+            }
+
+        def step(self, action):
+            action = np.asarray(action, dtype=np.float64)
+            self.actions.append(action.copy())
+            self.position += action[:3] * 0.05
+            return self.get_observation(), 0.0, False, {}
+
+    env = FakeEnv()
+    result = move_eef_to_pose(
+        env,
+        {
+            "position": [0.05, -0.02, 0.03],
+            "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "frame": "robot_base",
+        },
+        max_steps=40,
+        translation_tolerance_m=0.003,
+        orientation_tolerance_deg=1.0,
+        max_translation_command=0.20,
+        max_rotation_command=0.10,
+        stable_steps=3,
+        settle_steps=2,
+        gripper_action=0.5,
+    )
+
+    assert result["success"] is True
+    assert result["final_error"]["translation_m"] <= 0.003
+    assert env.actions
+    assert all(np.allclose(action[7:10], 0.0) for action in env.actions)
+    assert all(action[11] == pytest.approx(1.0) for action in env.actions)
+    assert all(action[6] == pytest.approx(0.5) for action in env.actions)

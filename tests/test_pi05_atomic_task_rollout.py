@@ -112,6 +112,42 @@ def test_atomic_rollout_reuses_env_client_and_stops_on_verifier(tmp_path):
     assert logs["Held_Object_Guard"]["enabled"] is False
 
 
+def test_success_handoff_continues_policy_with_extra_budget(tmp_path):
+    env = FakeEnv()
+    success, logs = execute_pi05_atomic_task_policy(
+        env=env,
+        client=FakeClient(),
+        atomic_task_call={
+            "subgoal_id": "g1",
+            "atomic_task": "OpenMicrowave",
+            "policy_prompt": "Open the microwave door and retract.",
+            "arguments": {"fixture_id": "microwave_1"},
+            "termination_condition": {
+                "predicate": "open",
+                "subject": "microwave_1",
+            },
+        },
+        verifier=FakeVerifier(),
+        log_dir=tmp_path,
+        episode_id=0,
+        horizon=4,
+        replan_steps=5,
+        verify_interval=2,
+        min_steps_before_verify=0,
+        render=False,
+        success_handoff_steps=3,
+    )
+
+    assert success is True
+    assert len(env.actions) == 7
+    assert logs["Configured_Pre_Success_Horizon"] == 4
+    assert logs["First_Success_Step"] == 4
+    assert logs["Handoff_Target_Step"] == 7
+    assert logs["Post_Success_Steps_Executed"] == 3
+    assert logs["Handoff_Completed"] is True
+    assert logs["Final_Verification"]["status"] == "success"
+
+
 def test_guard_failure_stops_rollout_and_returns_retryable_drop(monkeypatch, tmp_path):
     class DroppingGuard:
         def start(self):

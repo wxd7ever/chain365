@@ -152,6 +152,11 @@ pose_error_before、pose_error_after_refinement 和 success 分别衡量优化�
       robocasa.scripts.work_pose.extract_expert_work_poses \
       --episode_start 0 \
       --episode_count 5
+默认 VLA 收尾只使用提取出的专家底盘操作站位，不使用结束 EEF 位姿。提取器仍会
+保存 expert_handoff_poses，供显式的 legacy
+`--operation_completion_mode expert` 对照实验使用；普通 baseline/refiner
+运行无需消费这些 EEF 位姿。
+
 
 然后为 5 × 4 个 Pick/Place 阶段各生成一个 mild 扰动状态。不要添加 --limit 1：
 
@@ -175,6 +180,7 @@ pose_error_before、pose_error_after_refinement 和 success 分别衡量优化�
       --pi05_host 172.16.36.10 \
       --pi05_port 8000 \
       --pi05_horizon 600 \
+      --pi05_task_retries 2 \
       --video
 
 运行相同 5 个 episode 的多视角 refiner：
@@ -190,8 +196,22 @@ pose_error_before、pose_error_after_refinement 和 success 分别衡量优化�
       --pi05_host 172.16.36.10 \
       --pi05_port 8000 \
       --pi05_horizon 600 \
+      --pi05_task_retries 2 \
       --video
 
-每个 episode 任一操作或数据集站位移动失败后都会停止该 episode，并在
-episode_result.json 的 stopped_at 中记录阶段。summary.json 同时给出完整任务
-成功率和每个原子阶段的成功率。
+`--pi05_task_retries 2` 表示每个 Pick、Place 或 fixture 操作最多执行 3 次
+（首次执行加 2 次 retry）。只有 verifier 标记为 `retryable` 的策略失败才会
+重新执行操作，并且从当前环境状态继续，不恢复 episode、不重复站位导航。
+
+默认使用 `--operation_completion_mode vla`。Pick/Place 和 fixture Prompt 都会
+明确要求 VLA 在完成操作后抬升或撤离到稳定姿态；Verifier 首次检测成功后，pi0.5
+继续执行 50 步（`--pi05_success_handoff_steps 50`），而不是切换到专家 EEF
+控制器。Pick 还必须同时满足持物和 EEF 离开来源 fixture，Place 继续要求 released
+和 EEF 离开目标 receptacle。收尾期间 Held Object Guard 仍然有效，发生掉落会按
+retryable 策略失败处理。若需要复现旧方案，可显式添加
+`--operation_completion_mode expert`，该模式会关闭 VLA continuation 并读取
+expert_handoff_poses。
+
+操作在 retry 用尽或遇到不可重试失败后，或者数据集站位移动失败后，episode 才会
+停止，并在 episode_result.json 的 stopped_at 中记录阶段。每个操作结果还会记录
+num_attempts 和 attempt_results，episode 汇总记录 num_atomic_attempts。

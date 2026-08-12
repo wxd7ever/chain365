@@ -35,6 +35,7 @@ class RemoteAtomicTaskPolicyAdapter:
         held_object_guard: bool = True,
         held_object_hold_confirmation_steps: int = 2,
         held_object_drop_confirmation_steps: int = 2,
+        success_handoff_steps: int = 30,
         render: bool = True,
         video_skip: int = 2,
     ):
@@ -46,6 +47,8 @@ class RemoteAtomicTaskPolicyAdapter:
             raise ValueError("held_object_hold_confirmation_steps must be positive")
         if held_object_drop_confirmation_steps <= 0:
             raise ValueError("held_object_drop_confirmation_steps must be positive")
+        if success_handoff_steps < 0:
+            raise ValueError("success_handoff_steps must be non-negative")
         self.client = client
         self.verifier = verifier
         self.log_dir = Path(log_dir)
@@ -64,6 +67,7 @@ class RemoteAtomicTaskPolicyAdapter:
         self.held_object_drop_confirmation_steps = int(
             held_object_drop_confirmation_steps
         )
+        self.success_handoff_steps = int(success_handoff_steps)
         self.render = render
         self.video_skip = video_skip
 
@@ -124,6 +128,7 @@ class RemoteAtomicTaskPolicyAdapter:
             held_object_drop_confirmation_steps=(
                 self.held_object_drop_confirmation_steps
             ),
+            success_handoff_steps=self.success_handoff_steps,
         )
         rollout_logs["Configured_Horizon"] = int(configured_horizon)
         rollout_logs["Horizon_Source"] = horizon_source

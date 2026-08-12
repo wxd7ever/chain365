@@ -48,6 +48,7 @@ def test_adapter_builds_prompt_calls_rollout_and_returns_module_result(monkeypat
     assert captured["held_object_guard"] is True
     assert captured["held_object_hold_confirmation_steps"] == 2
     assert captured["held_object_drop_confirmation_steps"] == 2
+    assert captured["success_handoff_steps"] == 30
     assert result["module"] == "ATOMIC_TASK_POLICY"
     assert result["atomic_task"] == "OpenMicrowave"
     assert result["prompt"] == "Open the microwave door."
