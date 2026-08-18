@@ -85,6 +85,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local_pose_settle_steps", type=int, default=2)
     parser.add_argument("--local_pose_translation_command", type=float, default=1.0)
     parser.add_argument("--local_pose_rotation_command", type=float, default=0.25)
+    parser.add_argument("--local_pose_translation_distance_m", type=float, default=0.10)
+    parser.add_argument("--local_pose_rotation_angle_deg", type=float, default=8.0)
+    parser.add_argument(
+        "--local_pose_held_translation_distance_m", type=float, default=0.01
+    )
+    parser.add_argument("--local_pose_held_rotation_angle_deg", type=float, default=1.0)
+    parser.add_argument("--local_pose_motion_max_steps", type=int, default=2000)
+    parser.add_argument(
+        "--local_pose_translation_tolerance_m", type=float, default=0.005
+    )
+    parser.add_argument("--local_pose_rotation_tolerance_deg", type=float, default=0.5)
+    parser.add_argument(
+        "--local_pose_max_total_translation_m", type=float, default=0.30
+    )
+    parser.add_argument("--local_pose_max_total_rotation_deg", type=float, default=24.0)
+    parser.add_argument("--local_pose_max_invalid_stops", type=int, default=2)
     parser.add_argument("--local_pose_min_confidence", type=float, default=0.55)
     parser.add_argument("common_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -98,6 +114,7 @@ def parse_args() -> argparse.Namespace:
         "local_pose_image_size",
         "local_pose_max_decisions",
         "local_pose_action_steps",
+        "local_pose_motion_max_steps",
     )
     if any(getattr(args, name) <= 0 for name in positive):
         parser.error("local-pose image size, decisions, and action steps must be positive")
@@ -106,6 +123,20 @@ def parse_args() -> argparse.Namespace:
     for name in ("local_pose_translation_command", "local_pose_rotation_command"):
         if not 0.0 < getattr(args, name) <= 1.0:
             parser.error(f"--{name} must be in (0, 1]")
+    for name in (
+        "local_pose_translation_distance_m",
+        "local_pose_rotation_angle_deg",
+        "local_pose_held_translation_distance_m",
+        "local_pose_held_rotation_angle_deg",
+        "local_pose_translation_tolerance_m",
+        "local_pose_rotation_tolerance_deg",
+        "local_pose_max_total_translation_m",
+        "local_pose_max_total_rotation_deg",
+    ):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name} must be positive")
+    if args.local_pose_max_invalid_stops < 0:
+        parser.error("--local_pose_max_invalid_stops must be non-negative")
     if not 0.0 <= args.local_pose_min_confidence <= 1.0:
         parser.error("--local_pose_min_confidence must be in [0, 1]")
     if args.local_pose_timeout_s is not None and args.local_pose_timeout_s <= 0:
@@ -203,6 +234,26 @@ def _local_pose_args(args: argparse.Namespace, variant: str) -> list[str]:
         str(args.local_pose_rotation_command),
         "--local_pose_min_confidence",
         str(args.local_pose_min_confidence),
+        "--local_pose_translation_distance_m",
+        str(args.local_pose_translation_distance_m),
+        "--local_pose_rotation_angle_deg",
+        str(args.local_pose_rotation_angle_deg),
+        "--local_pose_held_translation_distance_m",
+        str(args.local_pose_held_translation_distance_m),
+        "--local_pose_held_rotation_angle_deg",
+        str(args.local_pose_held_rotation_angle_deg),
+        "--local_pose_motion_max_steps",
+        str(args.local_pose_motion_max_steps),
+        "--local_pose_translation_tolerance_m",
+        str(args.local_pose_translation_tolerance_m),
+        "--local_pose_rotation_tolerance_deg",
+        str(args.local_pose_rotation_tolerance_deg),
+        "--local_pose_max_total_translation_m",
+        str(args.local_pose_max_total_translation_m),
+        "--local_pose_max_total_rotation_deg",
+        str(args.local_pose_max_total_rotation_deg),
+        "--local_pose_max_invalid_stops",
+        str(args.local_pose_max_invalid_stops),
         "--local_pose_cameras",
         *cameras,
     ]

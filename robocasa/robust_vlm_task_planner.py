@@ -308,6 +308,221 @@ def _validate_execution_plan(
             )
 
 
+def _split_pick_place_calls(
+    calls: Sequence[AtomicTaskCall],
+    scene_context: Mapping[str, Any],
+    used_ids: set[str],
+) -> tuple[list[AtomicTaskCall], list[dict[str, Any]]]:
+    """Expand complete PickPlace skills into explicit pick and place calls."""
+
+    relations = {"inside", "inserted", "on", "object_fixture_relation"}
+    natural_names = {
+        str(entity["alias"]): str(entity.get("natural_name") or entity["alias"])
+        for group in ("fixtures", "objects")
+        for entity in scene_context.get(group, [])
+        if isinstance(entity, Mapping) and entity.get("alias")
+    }
+
+    def unique_id(base: str) -> str:
+        candidate, suffix = base, 2
+        while candidate in used_ids:
+            candidate, suffix = f"{base}_{suffix}", suffix + 1
+        used_ids.add(candidate)
+        return candidate
+
+    def source_name(task: str, arguments: Mapping[str, Any]) -> str:
+        if arguments.get("source_name"):
+            return str(arguments["source_name"])
+        middle = task.removeprefix("PickPlace").split("To", 1)[0]
+        words = {
+            "FridgeDrawer": "fridge drawer",
+            "FridgeShelf": "fridge shelf",
+            "ToasterOven": "toaster oven",
+        }
+        return words.get(middle, middle.lower() or "current location")
+
+    expanded: list[AtomicTaskCall] = []
+    changes: list[dict[str, Any]] = []
+    for call in calls:
+        if not call.atomic_task.startswith("PickPlace"):
+            expanded.append(call)
+            continue
+        value = call.to_dict()
+        raw_conditions = value["termination_condition"]
+        conditions = raw_conditions if isinstance(raw_conditions, list) else [raw_conditions]
+        relation = next(
+            (item for item in conditions if str(item.get("predicate", "")).lower() in relations),
+            None,
+        )
+        holding = next(
+            (item for item in conditions if str(item.get("predicate", "")).lower() == "holding"),
+            None,
+        )
+        object_id = str(
+            (relation or holding or {}).get("subject")
+            or value["arguments"].get("object_id")
+            or value["arguments"].get("held_object_id")
+            or ""
+        ).strip()
+        if not object_id:
+            raise ValueError(
+                f"{call.subgoal_id} {call.atomic_task} cannot be split: unresolved object"
+            )
+        object_name = str(
+            value["arguments"].get("object_name")
+            or natural_names.get(object_id)
+            or object_id.replace("_", " ")
+        )
+        metadata = dict(value.get("metadata", {}))
+        metadata.update(
+            {
+                "decomposed_from_atomic_task": call.atomic_task,
+                "decomposed_from_subgoal_id": call.subgoal_id,
+            }
+        )
+        explicit_mode = str(metadata.get("pick_place_split_mode", ""))
+        pick_only = explicit_mode == "pick" or (relation is None and holding is not None)
+        place_only = explicit_mode == "place" or str(
+            metadata.get("policy_proxy", "")
+        ).startswith("held_object")
+        generated: list[AtomicTaskCall] = []
+        if not place_only:
+            pick_metadata = dict(metadata)
+            pick_metadata.update(
+                {
+                    "decomposition_role": "pick",
+                    "work_pose": {
+                        "mode": "standard_pick",
+                        "reference_object_id": object_id,
+                    },
+                }
+            )
+            pick_arguments = {
+                "object_id": object_id,
+                "object_name": object_name,
+                "source_name": source_name(call.atomic_task, value["arguments"]),
+            }
+            if value["arguments"].get("source_id"):
+                pick_arguments["source_id"] = value["arguments"]["source_id"]
+            generated.append(
+                AtomicTaskCall.from_mapping(
+                    {
+                        "subgoal_id": unique_id(f"{call.subgoal_id}_pick"),
+                        "atomic_task": "PickObject",
+                        "policy_prompt": (
+                            f"Pick up the {object_name} from the {pick_arguments['source_name']}, "
+                            "lift it clear, retract to a stable carrying pose, and keep holding it."
+                        ),
+                        "arguments": pick_arguments,
+                        "termination_condition": {
+                            "predicate": "holding",
+                            "subject": object_id,
+                            "desired_value": True,
+                        },
+                        "metadata": pick_metadata,
+                    }
+                )
+            )
+        if not pick_only:
+            if relation is None or not relation.get("object"):
+                raise ValueError(
+                    f"{call.subgoal_id} {call.atomic_task} cannot be split: unresolved destination"
+                )
+            destination_id = str(relation["object"])
+            destination_name = str(
+                value["arguments"].get("destination_name")
+                or natural_names.get(destination_id)
+                or destination_id.replace("_", " ")
+            )
+            preposition = str(
+                value["arguments"].get("destination_preposition")
+                or ("on" if str(relation.get("predicate", "")).lower() == "on" else "in")
+            )
+            place_metadata = dict(metadata)
+            place_metadata["decomposition_role"] = "place"
+            generated.append(
+                AtomicTaskCall.from_mapping(
+                    {
+                        "subgoal_id": unique_id(f"{call.subgoal_id}_place"),
+                        "atomic_task": "PlaceObject",
+                        "policy_prompt": (
+                            f"Place the held {object_name} {preposition} the {destination_name}, "
+                            "release it, and move the gripper away."
+                        ),
+                        "arguments": {
+                            "held_object_id": object_id,
+                            "object_id": object_id,
+                            "object_name": object_name,
+                            "destination_id": destination_id,
+                            "destination_name": destination_name,
+                            "destination_preposition": preposition,
+                        },
+                        "termination_condition": [dict(item) for item in conditions],
+                        "metadata": place_metadata,
+                    }
+                )
+            )
+        expanded.extend(generated)
+        changes.append(
+            {
+                "type": "split_pick_place",
+                "subgoal_id": call.subgoal_id,
+                "atomic_task": call.atomic_task,
+                "generated_subgoals": [item.subgoal_id for item in generated],
+                "generated_atomic_tasks": [item.atomic_task for item in generated],
+            }
+        )
+    return expanded, changes
+
+
+def _apply_standard_pick_work_poses(
+    calls: Sequence[AtomicTaskCall],
+) -> tuple[list[AtomicTaskCall], list[dict[str, Any]]]:
+    """Require every PickObject call to start at its object-relative work pose."""
+
+    prepared: list[AtomicTaskCall] = []
+    changes: list[dict[str, Any]] = []
+    for call in calls:
+        if call.atomic_task != "PickObject":
+            prepared.append(call)
+            continue
+        value = call.to_dict()
+        conditions = value["termination_condition"]
+        condition_items = conditions if isinstance(conditions, list) else [conditions]
+        holding = next(
+            (
+                condition
+                for condition in condition_items
+                if str(condition.get("predicate", "")).lower() == "holding"
+            ),
+            {},
+        )
+        object_id = str(
+            holding.get("subject")
+            or value["arguments"].get("object_id")
+            or ""
+        ).strip()
+        if not object_id:
+            raise ValueError(
+                f"{call.subgoal_id} PickObject requires an object for its standard work pose"
+            )
+        expected = {
+            "mode": "standard_pick",
+            "reference_object_id": object_id,
+        }
+        if value["metadata"].get("work_pose") != expected:
+            value["metadata"]["work_pose"] = expected
+            changes.append(
+                {
+                    "type": "apply_standard_pick_work_pose",
+                    "subgoal_id": call.subgoal_id,
+                    "object_id": object_id,
+                }
+            )
+        prepared.append(AtomicTaskCall.from_mapping(value))
+    return prepared, changes
+
+
 def _normalize_execution_plan(
     calls: Sequence[AtomicTaskCall],
     scene_context: Mapping[str, Any],
@@ -664,6 +879,14 @@ def _normalize_execution_plan(
                 }
             )
         normalized.append(call)
+    normalized, split_changes = _split_pick_place_calls(
+        normalized, scene_context, used_ids
+    )
+    changes.extend(split_changes)
+    normalized, work_pose_changes = _apply_standard_pick_work_poses(
+        normalized
+    )
+    changes.extend(work_pose_changes)
     contracted: list[AtomicTaskCall] = []
     for call in normalized:
         enriched_call, contract_changes = apply_skill_contract(

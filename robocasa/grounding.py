@@ -351,6 +351,8 @@ class RoboCasaGrounder:
         raw_env: Any,
         fixture_alias: str,
         reference_object_alias: str | None,
+        position_threshold_m: float,
+        orientation_cosine_threshold: float,
     ) -> tuple[bool | None, list[dict[str, Any]]]:
         try:
             from robocasa.utils import env_utils
@@ -380,8 +382,8 @@ class RoboCasaGrounder:
                 np.linalg.norm(np.asarray(target_pos)[:2] - base_pos[:2])
             )
             orientation_cosine = float(np.cos(target_ori[2] - base_ori[2]))
-            position_ok = position_distance <= self.position_threshold_m
-            orientation_ok = orientation_cosine >= self.orientation_cosine_threshold
+            position_ok = position_distance <= position_threshold_m
+            orientation_ok = orientation_cosine >= orientation_cosine_threshold
             grounded = bool(position_ok and orientation_ok)
             return grounded, [
                 {
@@ -391,9 +393,9 @@ class RoboCasaGrounder:
                     "target_position": np.asarray(target_pos).tolist(),
                     "base_position": base_pos.tolist(),
                     "position_distance": position_distance,
-                    "position_threshold": self.position_threshold_m,
+                    "position_threshold": position_threshold_m,
                     "orientation_cosine": orientation_cosine,
-                    "orientation_cosine_threshold": self.orientation_cosine_threshold,
+                    "orientation_cosine_threshold": orientation_cosine_threshold,
                     "position_ok": bool(position_ok),
                     "orientation_ok": bool(orientation_ok),
                     "value": grounded,
@@ -564,8 +566,25 @@ class RoboCasaGrounder:
                 evidence=tuple(evidence),
             )
 
+        work_pose = call.metadata.get("work_pose", {})
+        if not isinstance(work_pose, Mapping):
+            work_pose = {}
+        try:
+            position_threshold = float(
+                work_pose.get("position_threshold_m", self.position_threshold_m)
+            )
+            orientation_threshold = float(
+                work_pose.get("orientation_cosine_threshold", self.orientation_cosine_threshold)
+            )
+            if position_threshold <= 0 or not -1.0 <= orientation_threshold <= 1.0:
+                raise ValueError("invalid work-pose thresholds")
+        except (TypeError, ValueError) as exc:
+            evidence.append({"source": "work_pose", "error": str(exc)})
+            position_threshold = self.position_threshold_m
+            orientation_threshold = self.orientation_cosine_threshold
         pose_value, pose_evidence = self._navigation_pose(
-            raw_env, target_fixture, reference_object
+            raw_env, target_fixture, reference_object,
+            position_threshold, orientation_threshold,
         )
         evidence.extend(pose_evidence)
         if pose_value is None:
@@ -626,6 +645,12 @@ class RoboCasaGrounder:
             "fixture_id": fixture_alias,
             "fixture_name": fixture_name,
         }
+        work_pose = operation.metadata.get("work_pose", {})
+        if not isinstance(work_pose, Mapping):
+            work_pose = {}
+        work_pose_mode = str(work_pose.get("mode", ""))
+        position_threshold = work_pose.get("position_threshold_m")
+        orientation_threshold = work_pose.get("orientation_cosine_threshold")
         reference_object = result.get("reference_object_alias")
         if reference_object:
             arguments["reference_object_id"] = str(reference_object)
@@ -637,6 +662,12 @@ class RoboCasaGrounder:
                 "desired_value": True,
             }
         ]
+        if position_threshold is not None:
+            conditions[0]["position_threshold_m"] = float(position_threshold)
+        if orientation_threshold is not None:
+            conditions[0]["orientation_cosine_threshold"] = float(
+                orientation_threshold
+            )
         if reference_object:
             conditions[0]["reference_object"] = str(reference_object)
         if held_object:
@@ -649,10 +680,29 @@ class RoboCasaGrounder:
                 }
             )
         prompt = f"Navigate to the {fixture_name}."
+        if work_pose_mode == "standard_pick" and reference_object:
+            prompt = (
+                f"Navigate to the {fixture_name} and align the mobile base at the "
+                f"standard picking pose for the "
+                f"{clean_entity_name(str(reference_object))}. Face the object and stop "
+                "at the requested work pose."
+            )
         if held_object:
             prompt = (
                 f"While keeping hold of {clean_entity_name(str(held_object))}, "
                 f"navigate to the {fixture_name}."
+            )
+        navigation_metadata = {
+            "inserted_by": "scheduler_grounding",
+            "for_subgoal_id": operation.subgoal_id,
+            "grounding_target_mode": result.get("target_mode"),
+            "work_pose_mode": work_pose_mode or None,
+        }
+        if position_threshold is not None:
+            navigation_metadata["position_threshold_m"] = float(position_threshold)
+        if orientation_threshold is not None:
+            navigation_metadata["orientation_cosine_threshold"] = float(
+                orientation_threshold
             )
         call = AtomicTaskCall.from_mapping(
             {
@@ -661,11 +711,7 @@ class RoboCasaGrounder:
                 "policy_prompt": prompt,
                 "arguments": arguments,
                 "termination_condition": conditions[0] if len(conditions) == 1 else conditions,
-                "metadata": {
-                    "inserted_by": "scheduler_grounding",
-                    "for_subgoal_id": operation.subgoal_id,
-                    "grounding_target_mode": result.get("target_mode"),
-                },
+                "metadata": navigation_metadata,
             }
         )
         contracted, _ = apply_skill_contract(call, scene_context=self.scene_context)

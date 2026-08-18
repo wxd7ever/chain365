@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--operation", choices=("all", "pick", "place"), default="all")
     parser.add_argument(
         "--difficulty",
-        choices=("all", "mild", "moderate", "severe"),
+        choices=("all", "mild", "moderate", "severe", "stress"),
         default="all",
     )
     parser.add_argument("--sample_ids", nargs="+")
@@ -83,12 +83,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local_pose_base_url")
     parser.add_argument("--local_pose_model", default="qwen2.5vl:3b")
     parser.add_argument("--local_pose_api_key")
-    parser.add_argument("--local_pose_timeout_s", type=float, default=120.0)
-    parser.add_argument("--local_pose_max_decisions", type=int, default=8)
+    parser.add_argument("--local_pose_timeout_s", type=float, default=240.0)
+    parser.add_argument("--local_pose_max_decisions", type=int, default=10)
     parser.add_argument("--local_pose_action_steps", type=int, default=5)
     parser.add_argument("--local_pose_settle_steps", type=int, default=2)
     parser.add_argument("--local_pose_translation_command", type=float, default=0.20)
     parser.add_argument("--local_pose_rotation_command", type=float, default=0.25)
+    parser.add_argument("--local_pose_translation_distance_m", type=float, default=0.30)
+    parser.add_argument("--local_pose_rotation_angle_deg", type=float, default=25.0)
+    parser.add_argument("--local_pose_medium_translation_distance_m", type=float, default=0.12)
+    parser.add_argument("--local_pose_fine_translation_distance_m", type=float, default=0.05)
+    parser.add_argument("--local_pose_medium_rotation_angle_deg", type=float, default=10.0)
+    parser.add_argument("--local_pose_fine_rotation_angle_deg", type=float, default=5.0)
+    parser.add_argument(
+        "--local_pose_held_translation_distance_m", type=float, default=0.01
+    )
+    parser.add_argument("--local_pose_held_rotation_angle_deg", type=float, default=1.0)
+    parser.add_argument("--local_pose_motion_max_steps", type=int, default=2000)
+    parser.add_argument(
+        "--local_pose_translation_tolerance_m", type=float, default=0.015
+    )
+    parser.add_argument("--local_pose_rotation_tolerance_deg", type=float, default=1.0)
+    parser.add_argument(
+        "--local_pose_max_total_translation_m", type=float, default=1.20
+    )
+    parser.add_argument("--local_pose_max_total_rotation_deg", type=float, default=125.0)
+    parser.add_argument("--local_pose_max_invalid_stops", type=int, default=2)
+    parser.add_argument(
+        "--local_pose_rotation_translation_drift_limit_m", type=float, default=0.08
+    )
+    parser.add_argument(
+        "--local_pose_translation_rotation_drift_limit_deg", type=float, default=5.0
+    )
+    parser.add_argument("--local_pose_stall_window_steps", type=int, default=100)
+    parser.add_argument(
+        "--local_pose_stall_translation_epsilon_m", type=float, default=0.001
+    )
+    parser.add_argument(
+        "--local_pose_stall_rotation_epsilon_deg", type=float, default=0.2
+    )
+    parser.add_argument("--local_pose_partial_progress_ratio", type=float, default=0.75)
+    parser.add_argument("--local_pose_max_motion_recoveries", type=int, default=2)
+    parser.add_argument("--local_pose_max_fine_axis_reversals", type=int, default=3)
     parser.add_argument("--local_pose_min_confidence", type=float, default=0.55)
     parser.add_argument("--pi05_host", default="172.16.36.10")
     parser.add_argument("--pi05_port", type=int, default=8000)
@@ -125,9 +161,35 @@ def parse_args() -> argparse.Namespace:
         args.pi05_verify_interval,
         args.local_pose_max_decisions,
         args.local_pose_action_steps,
+        args.local_pose_motion_max_steps,
+        args.local_pose_translation_distance_m,
+        args.local_pose_rotation_angle_deg,
+        args.local_pose_medium_translation_distance_m,
+        args.local_pose_fine_translation_distance_m,
+        args.local_pose_medium_rotation_angle_deg,
+        args.local_pose_fine_rotation_angle_deg,
+        args.local_pose_held_translation_distance_m,
+        args.local_pose_held_rotation_angle_deg,
+        args.local_pose_translation_tolerance_m,
+        args.local_pose_rotation_tolerance_deg,
+        args.local_pose_max_total_translation_m,
+        args.local_pose_max_total_rotation_deg,
+        args.local_pose_rotation_translation_drift_limit_m,
+        args.local_pose_translation_rotation_drift_limit_deg,
+        args.local_pose_stall_window_steps,
+        args.local_pose_stall_translation_epsilon_m,
+        args.local_pose_stall_rotation_epsilon_deg,
     )
     if any(value <= 0 for value in positive):
         parser.error("camera, policy, and local-pose integer limits must be positive")
+    if args.local_pose_max_invalid_stops < 0:
+        parser.error("--local_pose_max_invalid_stops must be non-negative")
+    if args.local_pose_max_motion_recoveries < 0:
+        parser.error("--local_pose_max_motion_recoveries must be non-negative")
+    if args.local_pose_max_fine_axis_reversals < 0:
+        parser.error("--local_pose_max_fine_axis_reversals must be non-negative")
+    if not 0.0 < args.local_pose_partial_progress_ratio <= 1.0:
+        parser.error("--local_pose_partial_progress_ratio must be in (0, 1]")
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
     return args
@@ -232,6 +294,38 @@ def run_sample(
             rotation_command=args.local_pose_rotation_command,
             min_confidence=args.local_pose_min_confidence,
             held_object_guard=True,
+            translation_distance_m=args.local_pose_translation_distance_m,
+            rotation_angle_deg=args.local_pose_rotation_angle_deg,
+            medium_translation_distance_m=(
+                args.local_pose_medium_translation_distance_m
+            ),
+            fine_translation_distance_m=args.local_pose_fine_translation_distance_m,
+            medium_rotation_angle_deg=args.local_pose_medium_rotation_angle_deg,
+            fine_rotation_angle_deg=args.local_pose_fine_rotation_angle_deg,
+            held_translation_distance_m=args.local_pose_held_translation_distance_m,
+            held_rotation_angle_deg=args.local_pose_held_rotation_angle_deg,
+            motion_max_steps=args.local_pose_motion_max_steps,
+            translation_tolerance_m=args.local_pose_translation_tolerance_m,
+            rotation_tolerance_deg=args.local_pose_rotation_tolerance_deg,
+            max_total_translation_m=args.local_pose_max_total_translation_m,
+            max_total_rotation_deg=args.local_pose_max_total_rotation_deg,
+            max_invalid_stops=args.local_pose_max_invalid_stops,
+            rotation_translation_drift_limit_m=(
+                args.local_pose_rotation_translation_drift_limit_m
+            ),
+            translation_rotation_drift_limit_deg=(
+                args.local_pose_translation_rotation_drift_limit_deg
+            ),
+            stall_window_steps=args.local_pose_stall_window_steps,
+            stall_translation_epsilon_m=(
+                args.local_pose_stall_translation_epsilon_m
+            ),
+            stall_rotation_epsilon_deg=(
+                args.local_pose_stall_rotation_epsilon_deg
+            ),
+            partial_progress_ratio=args.local_pose_partial_progress_ratio,
+            max_motion_recoveries=args.local_pose_max_motion_recoveries,
+            max_fine_axis_reversals=args.local_pose_max_fine_axis_reversals,
         )
         refinement_result = refiner.refine(
             env=env,
@@ -239,7 +333,6 @@ def run_sample(
             grounding_result={
                 "source": "official_dataset",
                 "target_id": expert_record["target_id"],
-                "expert_base_pose": sample["expert_base_pose"],
             },
             episode_id=sample["sample_id"],
         )

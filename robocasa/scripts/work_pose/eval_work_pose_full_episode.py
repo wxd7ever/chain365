@@ -191,7 +191,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--difficulty",
-        choices=("mild", "moderate", "severe"),
+        choices=("mild", "moderate", "severe", "stress"),
         default="mild",
     )
     parser.add_argument("--episode_start", type=int, default=0)
@@ -217,6 +217,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local_pose_settle_steps", type=int, default=2)
     parser.add_argument("--local_pose_translation_command", type=float, default=0.20)
     parser.add_argument("--local_pose_rotation_command", type=float, default=0.25)
+    parser.add_argument("--local_pose_translation_distance_m", type=float, default=0.10)
+    parser.add_argument("--local_pose_rotation_angle_deg", type=float, default=8.0)
+    parser.add_argument(
+        "--local_pose_held_translation_distance_m", type=float, default=0.01
+    )
+    parser.add_argument("--local_pose_held_rotation_angle_deg", type=float, default=1.0)
+    parser.add_argument("--local_pose_motion_max_steps", type=int, default=2000)
+    parser.add_argument(
+        "--local_pose_translation_tolerance_m", type=float, default=0.005
+    )
+    parser.add_argument("--local_pose_rotation_tolerance_deg", type=float, default=0.5)
+    parser.add_argument(
+        "--local_pose_max_total_translation_m", type=float, default=0.30
+    )
+    parser.add_argument("--local_pose_max_total_rotation_deg", type=float, default=24.0)
+    parser.add_argument("--local_pose_max_invalid_stops", type=int, default=2)
     parser.add_argument("--local_pose_min_confidence", type=float, default=0.55)
     parser.add_argument("--pi05_host", default="172.16.36.10")
     parser.add_argument("--pi05_port", type=int, default=8000)
@@ -337,6 +353,15 @@ def parse_args() -> argparse.Namespace:
         args.pi05_verify_interval,
         args.local_pose_max_decisions,
         args.local_pose_action_steps,
+        args.local_pose_motion_max_steps,
+        args.local_pose_translation_distance_m,
+        args.local_pose_rotation_angle_deg,
+        args.local_pose_held_translation_distance_m,
+        args.local_pose_held_rotation_angle_deg,
+        args.local_pose_translation_tolerance_m,
+        args.local_pose_rotation_tolerance_deg,
+        args.local_pose_max_total_translation_m,
+        args.local_pose_max_total_rotation_deg,
         args.min_station_move_steps,
         args.max_station_move_steps,
         args.expert_handoff_window,
@@ -363,6 +388,7 @@ def parse_args() -> argparse.Namespace:
         or args.held_slow_start_steps < 0
         or args.pi05_success_handoff_steps < 0
         or args.expert_handoff_settle_steps < 0
+        or args.local_pose_max_invalid_stops < 0
     ):
         parser.error(
             "stabilization, settle, slow-start, and policy handoff steps must "
@@ -838,6 +864,16 @@ def execute_current_skill(
             settle_steps=args.local_pose_settle_steps,
             translation_command=args.local_pose_translation_command,
             rotation_command=args.local_pose_rotation_command,
+            translation_distance_m=args.local_pose_translation_distance_m,
+            rotation_angle_deg=args.local_pose_rotation_angle_deg,
+            held_translation_distance_m=args.local_pose_held_translation_distance_m,
+            held_rotation_angle_deg=args.local_pose_held_rotation_angle_deg,
+            motion_max_steps=args.local_pose_motion_max_steps,
+            translation_tolerance_m=args.local_pose_translation_tolerance_m,
+            rotation_tolerance_deg=args.local_pose_rotation_tolerance_deg,
+            max_total_translation_m=args.local_pose_max_total_translation_m,
+            max_total_rotation_deg=args.local_pose_max_total_rotation_deg,
+            max_invalid_stops=args.local_pose_max_invalid_stops,
             min_confidence=args.local_pose_min_confidence,
             held_object_guard=True,
         )

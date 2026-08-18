@@ -35,7 +35,7 @@ _VALID_PREDICATES = {
     "turned",
 }
 
-NAVIGATION_POSITION_THRESHOLD_M = 0.62
+NAVIGATION_POSITION_THRESHOLD_M = 0.7
 NAVIGATION_ORIENTATION_COSINE_THRESHOLD = 0.90
 
 
@@ -915,7 +915,11 @@ def _eef_outside_receptacle(
 
 
 def _navigation_pose(
-    chain: list[Any], subject: str, reference_object: str | None = None
+    chain: list[Any],
+    subject: str,
+    reference_object: str | None = None,
+    position_threshold_m: Any = NAVIGATION_POSITION_THRESHOLD_M,
+    orientation_cosine_threshold: Any = NAVIGATION_ORIENTATION_COSINE_THRESHOLD,
 ) -> tuple[bool | None, list[dict[str, Any]]]:
     target_fixture, target_alias = _resolve_entity(chain, subject)
     if target_fixture is None:
@@ -932,6 +936,15 @@ def _navigation_pose(
             }
         ]
     try:
+        position_threshold = float(position_threshold_m)
+        orientation_threshold = float(orientation_cosine_threshold)
+        if not np.isfinite(position_threshold) or position_threshold <= 0:
+            raise ValueError("navigation position threshold must be finite and positive")
+        if (
+            not np.isfinite(orientation_threshold)
+            or not -1.0 <= orientation_threshold <= 1.0
+        ):
+            raise ValueError("navigation orientation threshold must be in [-1, 1]")
         applied_reference = None
         if (
             getattr(raw_env, "target_fixture", None) is target_fixture
@@ -976,10 +989,8 @@ def _navigation_pose(
             raise ValueError("navigation poses must contain finite position and orientation values")
         position_distance = float(np.linalg.norm(target_pos[:2] - base_pos[:2]))
         orientation_cosine = float(np.cos(target_ori[2] - base_ori[2]))
-        position_ok = position_distance <= NAVIGATION_POSITION_THRESHOLD_M
-        orientation_ok = (
-            orientation_cosine >= NAVIGATION_ORIENTATION_COSINE_THRESHOLD
-        )
+        position_ok = position_distance <= position_threshold
+        orientation_ok = orientation_cosine >= orientation_threshold
     except (
         AssertionError,
         AttributeError,
@@ -1001,9 +1012,9 @@ def _navigation_pose(
             "target_position": np.asarray(target_pos).tolist(),
             "base_position": base_pos.tolist(),
             "position_distance": position_distance,
-            "position_threshold": NAVIGATION_POSITION_THRESHOLD_M,
+            "position_threshold": position_threshold,
             "orientation_cosine": orientation_cosine,
-            "orientation_cosine_threshold": NAVIGATION_ORIENTATION_COSINE_THRESHOLD,
+            "orientation_cosine_threshold": orientation_threshold,
             "position_ok": bool(position_ok),
             "orientation_ok": bool(orientation_ok),
             "value": value,
@@ -1396,7 +1407,16 @@ class RuntimeAtomicTaskVerifier:
         elif predicate == "navigation_pose":
             reference_object = str(condition.get("reference_object", "")).strip() or None
             value, navigation_evidence = _navigation_pose(
-                chain, subject, reference_object
+                chain,
+                subject,
+                reference_object,
+                condition.get(
+                    "position_threshold_m", NAVIGATION_POSITION_THRESHOLD_M
+                ),
+                condition.get(
+                    "orientation_cosine_threshold",
+                    NAVIGATION_ORIENTATION_COSINE_THRESHOLD,
+                ),
             )
             evidence.extend(navigation_evidence)
         else:

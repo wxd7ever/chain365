@@ -42,6 +42,16 @@ class _LocalPoseOptions:
     settle_steps: int
     translation_command: float
     rotation_command: float
+    translation_distance_m: float
+    rotation_angle_deg: float
+    held_translation_distance_m: float
+    held_rotation_angle_deg: float
+    motion_max_steps: int
+    translation_tolerance_m: float
+    rotation_tolerance_deg: float
+    max_total_translation_m: float
+    max_total_rotation_deg: float
+    max_invalid_stops: int
     min_confidence: float
     held_object_guard: bool
 
@@ -58,6 +68,16 @@ class _LocalPoseOptions:
             "settle_steps": self.settle_steps,
             "translation_command": self.translation_command,
             "rotation_command": self.rotation_command,
+            "translation_distance_m": self.translation_distance_m,
+            "rotation_angle_deg": self.rotation_angle_deg,
+            "held_translation_distance_m": self.held_translation_distance_m,
+            "held_rotation_angle_deg": self.held_rotation_angle_deg,
+            "motion_max_steps": self.motion_max_steps,
+            "translation_tolerance_m": self.translation_tolerance_m,
+            "rotation_tolerance_deg": self.rotation_tolerance_deg,
+            "max_total_translation_m": self.max_total_translation_m,
+            "max_total_rotation_deg": self.max_total_rotation_deg,
+            "max_invalid_stops": self.max_invalid_stops,
             "min_confidence": self.min_confidence,
             "held_object_guard": self.held_object_guard,
         }
@@ -89,6 +109,22 @@ def _extra_parser() -> argparse.ArgumentParser:
     parser.add_argument("--local_pose_settle_steps", type=int, default=2)
     parser.add_argument("--local_pose_translation_command", type=float, default=0.20)
     parser.add_argument("--local_pose_rotation_command", type=float, default=0.25)
+    parser.add_argument("--local_pose_translation_distance_m", type=float, default=0.10)
+    parser.add_argument("--local_pose_rotation_angle_deg", type=float, default=8.0)
+    parser.add_argument(
+        "--local_pose_held_translation_distance_m", type=float, default=0.01
+    )
+    parser.add_argument("--local_pose_held_rotation_angle_deg", type=float, default=1.0)
+    parser.add_argument("--local_pose_motion_max_steps", type=int, default=2000)
+    parser.add_argument(
+        "--local_pose_translation_tolerance_m", type=float, default=0.005
+    )
+    parser.add_argument("--local_pose_rotation_tolerance_deg", type=float, default=0.5)
+    parser.add_argument(
+        "--local_pose_max_total_translation_m", type=float, default=0.30
+    )
+    parser.add_argument("--local_pose_max_total_rotation_deg", type=float, default=24.0)
+    parser.add_argument("--local_pose_max_invalid_stops", type=int, default=2)
     parser.add_argument("--local_pose_min_confidence", type=float, default=0.55)
     parser.add_argument("--local_pose_disable_held_object_guard", action="store_true")
     return parser
@@ -99,6 +135,7 @@ def _validate_extra(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         "local_pose_image_size",
         "local_pose_max_decisions",
         "local_pose_action_steps",
+        "local_pose_motion_max_steps",
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name} must be positive")
@@ -108,6 +145,20 @@ def _validate_extra(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         value = getattr(args, name)
         if not 0.0 < value <= 1.0:
             parser.error(f"--{name} must be in (0, 1]")
+    for name in (
+        "local_pose_translation_distance_m",
+        "local_pose_rotation_angle_deg",
+        "local_pose_held_translation_distance_m",
+        "local_pose_held_rotation_angle_deg",
+        "local_pose_translation_tolerance_m",
+        "local_pose_rotation_tolerance_deg",
+        "local_pose_max_total_translation_m",
+        "local_pose_max_total_rotation_deg",
+    ):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name} must be positive")
+    if args.local_pose_max_invalid_stops < 0:
+        parser.error("--local_pose_max_invalid_stops must be non-negative")
     if not 0.0 <= args.local_pose_min_confidence <= 1.0:
         parser.error("--local_pose_min_confidence must be in [0, 1]")
     if args.local_pose_timeout_s is not None and args.local_pose_timeout_s <= 0:
@@ -158,6 +209,16 @@ def main() -> int:
             settle_steps=extra_args.local_pose_settle_steps,
             translation_command=extra_args.local_pose_translation_command,
             rotation_command=extra_args.local_pose_rotation_command,
+            translation_distance_m=extra_args.local_pose_translation_distance_m,
+            rotation_angle_deg=extra_args.local_pose_rotation_angle_deg,
+            held_translation_distance_m=extra_args.local_pose_held_translation_distance_m,
+            held_rotation_angle_deg=extra_args.local_pose_held_rotation_angle_deg,
+            motion_max_steps=extra_args.local_pose_motion_max_steps,
+            translation_tolerance_m=extra_args.local_pose_translation_tolerance_m,
+            rotation_tolerance_deg=extra_args.local_pose_rotation_tolerance_deg,
+            max_total_translation_m=extra_args.local_pose_max_total_translation_m,
+            max_total_rotation_deg=extra_args.local_pose_max_total_rotation_deg,
+            max_invalid_stops=extra_args.local_pose_max_invalid_stops,
             min_confidence=extra_args.local_pose_min_confidence,
             held_object_guard=not extra_args.local_pose_disable_held_object_guard,
         )
@@ -187,6 +248,16 @@ def main() -> int:
                 settle_steps=options.settle_steps,
                 translation_command=options.translation_command,
                 rotation_command=options.rotation_command,
+                translation_distance_m=options.translation_distance_m,
+                rotation_angle_deg=options.rotation_angle_deg,
+                held_translation_distance_m=options.held_translation_distance_m,
+                held_rotation_angle_deg=options.held_rotation_angle_deg,
+                motion_max_steps=options.motion_max_steps,
+                translation_tolerance_m=options.translation_tolerance_m,
+                rotation_tolerance_deg=options.rotation_tolerance_deg,
+                max_total_translation_m=options.max_total_translation_m,
+                max_total_rotation_deg=options.max_total_rotation_deg,
+                max_invalid_stops=options.max_invalid_stops,
                 min_confidence=options.min_confidence,
                 held_object_guard=options.held_object_guard,
             )

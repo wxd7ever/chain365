@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--difficulties",
         nargs="+",
-        choices=("mild", "moderate", "severe"),
+        choices=("mild", "moderate", "severe", "stress"),
         default=("mild", "moderate", "severe"),
     )
     parser.add_argument("--samples_per_stage", type=int, default=3)

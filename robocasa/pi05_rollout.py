@@ -353,7 +353,7 @@ def execute_pi05_atomic_task_policy(
     min_steps_before_verify: int = 10,
     render: bool = True,
     video_skip: int = 2,
-    base_action_mode: str = "residual",
+    base_action_mode: str = "full",
     base_residual_limit: float = 0.15,
     held_object_guard: bool = True,
     held_object_hold_confirmation_steps: int = 2,
