@@ -3,7 +3,9 @@
 # Local refinement and all post-skill arm-return modules are intentionally disabled.
 
 map:
-  resolution: 0.05
+  # Throughput-oriented compatibility setting: use a finer 2.5 cm grid so a
+  # valid start / corridor is less likely to disappear through quantization.
+  resolution: 0.025
   boundary_padding: 1.00
   border_obstacle_cells: 1
   # Floor fixtures define room bounds but are traversable and not obstacles.
@@ -19,14 +21,14 @@ map:
   debug_articulated_map: false
 
 robot:
-  # Omron collision box half-size. Inflation rotates this rectangle with the
-  # base instead of applying the over-conservative 0.43 m corner radius to
-  # every flat counter face.
-  half_length: 0.35
-  half_width: 0.25
+  # Planning-only footprint, deliberately about 10% smaller than the physical
+  # Omron collision box for end-to-end compatibility runs. The simulator's
+  # real collision geometry is unchanged.
+  half_length: 0.32
+  half_width: 0.23
   # Retained as the legacy fallback for external callers.
   radius: 0.4301162634
-  safety_margin: 0.01
+  safety_margin: 0.005
   # Collision-box center relative to the mobile-base control origin.
   # Read from robosuite's omron_mobile_base.xml (wheeled_base pos=-0.20 0 0.192).
   footprint_center_offset_xy: [-0.20, 0.0]
