@@ -904,6 +904,7 @@ def move_eef_to_pose(
     max_rotation_command: float = 0.15,
     stable_steps: int = 8,
     settle_steps: int = 0,
+    settle_mode: str = "closed_loop",
     gripper_action: float = 0.0,
 ) -> dict[str, Any]:
     """Move the EEF to an official base-relative handoff pose."""
@@ -918,6 +919,10 @@ def move_eef_to_pose(
     )
     if any(value <= 0 for value in positive) or settle_steps < 0:
         raise ValueError("EEF handoff limits and tolerances must be positive")
+    if settle_mode not in {"closed_loop", "zero_delta"}:
+        raise ValueError(
+            "settle_mode must be either 'closed_loop' or 'zero_delta'"
+        )
     target_position = np.asarray(target_pose["position"], dtype=np.float64)
     target_quaternion = _normalized_quaternion_xyzw(
         target_pose["quaternion_xyzw"]
@@ -989,12 +994,16 @@ def move_eef_to_pose(
             applied[:6], dtype=float
         ).tolist()
         if guard is not None:
-            guard_failure = guard.observe(step_index=step_index)
-        if environment_done or guard_failure is not None:
+            observed_guard_failure = guard.observe(step_index=step_index)
+            if guard_failure is None and observed_guard_failure is not None:
+                guard_failure = observed_guard_failure
+        # Guard failures are diagnostic only for arm control: complete the
+        # commanded EEF motion, then report the captured failure to the caller.
+        if environment_done:
             break
 
     for _ in range(settle_steps):
-        if environment_done or guard_failure is not None:
+        if environment_done:
             break
         pose = current_eef_pose(env)
         position_error = target_position - np.asarray(
@@ -1004,16 +1013,17 @@ def move_eef_to_pose(
             pose["quaternion_xyzw"], target_quaternion
         )
         action = np.zeros(12, dtype=np.float32)
-        action[:3] = np.clip(
-            4.0 * position_error,
-            -max_translation_command,
-            max_translation_command,
-        )
-        action[3:6] = np.clip(
-            2.0 * orientation_error,
-            -max_rotation_command,
-            max_rotation_command,
-        )
+        if settle_mode == "closed_loop":
+            action[:3] = np.clip(
+                4.0 * position_error,
+                -max_translation_command,
+                max_translation_command,
+            )
+            action[3:6] = np.clip(
+                2.0 * orientation_error,
+                -max_rotation_command,
+                max_rotation_command,
+            )
         action[RAW_ACTION_GRIPPER] = float(gripper_action)
         action[RAW_ACTION_MODE] = 1.0
         step_index = len(trace) + 1
@@ -1029,7 +1039,9 @@ def move_eef_to_pose(
             _, _, terminated, truncated, _ = step_result
             environment_done = bool(terminated or truncated)
         if guard is not None:
-            guard_failure = guard.observe(step_index=step_index)
+            observed_guard_failure = guard.observe(step_index=step_index)
+            if guard_failure is None and observed_guard_failure is not None:
+                guard_failure = observed_guard_failure
         settled_pose = current_eef_pose(env)
         settled_error = eef_pose_error(settled_pose, target_pose)
         within = (
@@ -1040,7 +1052,7 @@ def move_eef_to_pose(
         trace.append(
             {
                 "step": step_index,
-                "phase": "closed_loop_settle",
+                "phase": f"{settle_mode}_settle",
                 "translation_error_m": settled_error["translation_m"],
                 "orientation_error_deg": settled_error["orientation_deg"],
                 "consecutive_successes": consecutive,
@@ -1076,11 +1088,285 @@ def move_eef_to_pose(
         "steps": len(trace),
         "requested_max_steps": int(max_steps),
         "stable_steps": int(stable_steps),
+        "settle_steps": int(settle_steps),
+        "settle_mode": settle_mode,
         "final_consecutive": int(consecutive),
         "guard_failure": guard_failure,
         "guard": guard.to_dict() if guard is not None else None,
         "trace": trace,
     }
+
+def _quaternion_slerp_xyzw(
+    start_xyzw: Sequence[float],
+    target_xyzw: Sequence[float],
+    fraction: float,
+) -> np.ndarray:
+    """Interpolate unit quaternions along their shortest arc."""
+
+    start = _normalized_quaternion_xyzw(start_xyzw)
+    target = _normalized_quaternion_xyzw(target_xyzw)
+    amount = float(np.clip(fraction, 0.0, 1.0))
+    dot = float(np.dot(start, target))
+    if dot < 0.0:
+        target = -target
+        dot = -dot
+    dot = float(np.clip(dot, -1.0, 1.0))
+    if dot > 0.9995:
+        return _normalized_quaternion_xyzw(start + amount * (target - start))
+    theta = math.acos(dot)
+    sin_theta = math.sin(theta)
+    start_weight = math.sin((1.0 - amount) * theta) / sin_theta
+    target_weight = math.sin(amount * theta) / sin_theta
+    return _normalized_quaternion_xyzw(
+        start_weight * start + target_weight * target
+    )
+
+
+def _quintic_smoothstep(fraction: float) -> float:
+    """Return a zero-velocity, zero-acceleration trajectory fraction."""
+
+    value = float(np.clip(fraction, 0.0, 1.0))
+    return value * value * value * (10.0 + value * (-15.0 + 6.0 * value))
+
+
+def move_eef_to_pose_smooth(
+    env: Any,
+    target_pose: Mapping[str, Any],
+    *,
+    guard: Any | None = None,
+    max_steps: int = 240,
+    trajectory_steps: int = 80,
+    translation_tolerance_m: float = 0.025,
+    orientation_tolerance_deg: float = 12.0,
+    max_translation_command: float = 0.20,
+    max_rotation_command: float = 0.15,
+    max_translation_command_delta: float = 0.01,
+    max_rotation_command_delta: float = 0.008,
+    translation_gain: float = 4.0,
+    rotation_gain: float = 2.0,
+    stable_steps: int = 8,
+    settle_steps: int = 0,
+    settle_mode: str = "closed_loop",
+    gripper_action: float = 0.0,
+) -> dict[str, Any]:
+    """Move the EEF along a quintic Cartesian path with bounded action slew."""
+
+    positive = (
+        max_steps,
+        trajectory_steps,
+        translation_tolerance_m,
+        orientation_tolerance_deg,
+        max_translation_command,
+        max_rotation_command,
+        max_translation_command_delta,
+        max_rotation_command_delta,
+        translation_gain,
+        rotation_gain,
+        stable_steps,
+    )
+    if any(value <= 0 for value in positive) or settle_steps < 0:
+        raise ValueError("smooth EEF trajectory limits must be positive")
+    if trajectory_steps > max_steps:
+        raise ValueError("trajectory_steps must not exceed max_steps")
+    if settle_mode not in {"closed_loop", "zero_delta"}:
+        raise ValueError(
+            "settle_mode must be either closed_loop or zero_delta"
+        )
+    target_position = np.asarray(target_pose["position"], dtype=np.float64)
+    target_quaternion = _normalized_quaternion_xyzw(
+        target_pose["quaternion_xyzw"]
+    )
+    if target_position.shape != (3,) or not np.isfinite(target_position).all():
+        raise ValueError("target EEF position must contain three finite values")
+    if not np.isfinite(gripper_action) or not -1.0 <= gripper_action <= 1.0:
+        raise ValueError("gripper_action must be finite and within [-1, 1]")
+
+    if guard is not None:
+        guard.start()
+    initial_pose = current_eef_pose(env)
+    initial_position = np.asarray(initial_pose["position"], dtype=np.float64)
+    initial_quaternion = _normalized_quaternion_xyzw(
+        initial_pose["quaternion_xyzw"]
+    )
+    trace: list[dict[str, Any]] = []
+    previous_arm_action = np.zeros(6, dtype=np.float64)
+    consecutive = 0
+    guard_failure = None
+    environment_done = False
+
+    def step_toward(
+        reference_position: np.ndarray,
+        reference_quaternion: np.ndarray,
+        *,
+        phase: str,
+        progress: float,
+        force_zero: bool = False,
+    ) -> None:
+        nonlocal previous_arm_action
+        nonlocal consecutive
+        nonlocal guard_failure
+        nonlocal environment_done
+
+        pose = current_eef_pose(env)
+        if force_zero:
+            desired = np.zeros(6, dtype=np.float64)
+        else:
+            position_error = reference_position - np.asarray(
+                pose["position"], dtype=np.float64
+            )
+            orientation_error = _orientation_error_axis_angle(
+                pose["quaternion_xyzw"], reference_quaternion
+            )
+            desired = np.concatenate(
+                [
+                    np.clip(
+                        translation_gain * position_error,
+                        -max_translation_command,
+                        max_translation_command,
+                    ),
+                    np.clip(
+                        rotation_gain * orientation_error,
+                        -max_rotation_command,
+                        max_rotation_command,
+                    ),
+                ]
+            )
+        delta_limits = np.asarray(
+            [max_translation_command_delta] * 3
+            + [max_rotation_command_delta] * 3,
+            dtype=np.float64,
+        )
+        arm_action = previous_arm_action + np.clip(
+            desired - previous_arm_action, -delta_limits, delta_limits
+        )
+        action = np.zeros(12, dtype=np.float32)
+        action[:6] = arm_action.astype(np.float32)
+        action[RAW_ACTION_GRIPPER] = float(gripper_action)
+        action[RAW_ACTION_MODE] = 1.0
+        step_index = len(trace) + 1
+        applied = (
+            guard.apply_action(action, step_index=step_index)
+            if guard is not None
+            else action
+        )
+        step_result = env.step(applied)
+        if len(step_result) == 4:
+            _, _, environment_done, _ = step_result
+        elif len(step_result) == 5:
+            _, _, terminated, truncated, _ = step_result
+            environment_done = bool(terminated or truncated)
+        else:
+            raise RuntimeError("unexpected env.step result during EEF trajectory")
+        previous_arm_action = np.asarray(applied[:6], dtype=np.float64)
+        if guard is not None:
+            observed = guard.observe(step_index=step_index)
+            if guard_failure is None and observed is not None:
+                guard_failure = observed
+        observed_pose = current_eef_pose(env)
+        final_error = eef_pose_error(observed_pose, target_pose)
+        within = (
+            final_error["translation_m"] <= translation_tolerance_m
+            and final_error["orientation_deg"] <= orientation_tolerance_deg
+        )
+        trajectory_complete = progress >= 1.0
+        consecutive = consecutive + 1 if within and trajectory_complete else 0
+        trace.append(
+            {
+                "step": step_index,
+                "phase": phase,
+                "trajectory_progress": float(progress),
+                "translation_error_m": final_error["translation_m"],
+                "orientation_error_deg": final_error["orientation_deg"],
+                "consecutive_successes": consecutive,
+                "reference_position": reference_position.tolist(),
+                "reference_quaternion_xyzw": reference_quaternion.tolist(),
+                "applied_arm_action": np.asarray(applied[:6], dtype=float).tolist(),
+            }
+        )
+
+    for trajectory_index in range(1, trajectory_steps + 1):
+        if environment_done:
+            break
+        fraction = trajectory_index / trajectory_steps
+        progress = _quintic_smoothstep(fraction)
+        reference_position = initial_position + progress * (
+            target_position - initial_position
+        )
+        reference_quaternion = _quaternion_slerp_xyzw(
+            initial_quaternion, target_quaternion, progress
+        )
+        step_toward(
+            reference_position,
+            reference_quaternion,
+            phase="smooth_trajectory",
+            progress=progress,
+        )
+
+    while (
+        not environment_done
+        and len(trace) < max_steps
+        and consecutive < stable_steps
+    ):
+        step_toward(
+            target_position,
+            target_quaternion,
+            phase="target_convergence",
+            progress=1.0,
+        )
+
+    for _ in range(settle_steps):
+        if environment_done:
+            break
+        force_zero = settle_mode == "zero_delta"
+        step_toward(
+            target_position,
+            target_quaternion,
+            phase=(
+                "rate_limited_zero_delta_settle"
+                if force_zero
+                else "closed_loop_settle"
+            ),
+            progress=1.0,
+            force_zero=force_zero,
+        )
+
+    final_pose = current_eef_pose(env)
+    final_error = eef_pose_error(final_pose, target_pose)
+    success = bool(
+        guard_failure is None
+        and not environment_done
+        and final_error["translation_m"] <= translation_tolerance_m
+        and final_error["orientation_deg"] <= orientation_tolerance_deg
+    )
+    return {
+        "success": success,
+        "failure_code": (
+            None
+            if success
+            else (
+                "OBJECT_DROPPED_DURING_EXPERT_HANDOFF"
+                if guard_failure is not None
+                else "EXPERT_EEF_POSE_NOT_CONVERGED"
+            )
+        ),
+        "trajectory_type": "quintic_scurve_slerp",
+        "target_pose": dict(target_pose),
+        "initial_pose": initial_pose,
+        "final_pose": final_pose,
+        "final_error": final_error,
+        "steps": len(trace),
+        "requested_max_steps": int(max_steps),
+        "trajectory_steps": int(trajectory_steps),
+        "stable_steps": int(stable_steps),
+        "settle_steps": int(settle_steps),
+        "settle_mode": settle_mode,
+        "final_consecutive": int(consecutive),
+        "guard_failure": guard_failure,
+        "guard": guard.to_dict() if guard is not None else None,
+        "trace": trace,
+    }
+
+
 
 def object_eef_diagnostics(env: Any, object_id: str) -> dict[str, Any]:
     """Return ground-truth grasp diagnostics without affecting simulation state."""
@@ -1354,7 +1640,9 @@ def holding_state(env: Any, object_id: str) -> bool | None:
     try:
         return bool(
             object_utils.check_obj_grasped(
-                raw_task_env(env), object_id, threshold=0.05
+                raw_task_env(env),
+                object_id,
+                threshold=object_utils.GRASP_CLOSED_THRESHOLD,
             )
         )
     except (AssertionError, AttributeError, KeyError, TypeError, ValueError):

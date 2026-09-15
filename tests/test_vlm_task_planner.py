@@ -11,6 +11,7 @@ ROBOCASA_DIR = Path(__file__).resolve().parents[1] / "robocasa"
 sys.path.insert(0, str(ROBOCASA_DIR))
 
 import vlm_task_planner  # noqa: E402
+import vlm_client  # noqa: E402
 from vlm_task_planner import (  # noqa: E402
     OpenAICompatibleVLMPlanner,
     parse_vlm_task_plan,
@@ -85,7 +86,7 @@ def test_openai_compatible_request_and_response(monkeypatch):
         captured["timeout"] = timeout
         return Response()
 
-    monkeypatch.setattr(vlm_task_planner.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(vlm_client.urllib.request, "urlopen", fake_urlopen)
     planner = OpenAICompatibleVLMPlanner(
         base_url="http://172.16.11.115:11434/v1",
         model="qwen2.5vl:3b",
@@ -97,4 +98,35 @@ def test_openai_compatible_request_and_response(monkeypatch):
     assert captured["url"].endswith("/v1/chat/completions")
     assert captured["authorization"] == "Bearer ollama"
     assert captured["payload"]["model"] == "qwen2.5vl:3b"
+    assert captured["payload"]["chat_template_kwargs"] == {
+        "enable_thinking": False
+    }
     assert provenance["num_images"] == 0
+
+
+def test_planner_uses_shared_client_and_clears_failed_response_diagnostics():
+    planner = OpenAICompatibleVLMPlanner(
+        base_url="http://vlm.invalid/v1",
+        model="qwen-vl",
+        api_key=None,
+        include_images=False,
+    )
+
+    class FakeSharedClient:
+        endpoint = "http://vlm.invalid/v1/chat/completions"
+        last_response_text = json.dumps(plan_value())
+        last_raw_http_response = "raw-http"
+        last_parsed_response = plan_value()
+        last_http_status = 200
+        last_finish_reason = "stop"
+        last_usage = {"total_tokens": 10}
+
+        def query_json(self, **kwargs):
+            assert kwargs["images"] == []
+            return plan_value()
+
+    planner._vlm_client = FakeSharedClient()
+    calls, provenance = planner.plan(task="Open and turn on the microwave.")
+    assert len(calls) == 2
+    assert provenance["raw_http_response"] == "raw-http"
+    assert planner.last_finish_reason == "stop"

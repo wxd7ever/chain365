@@ -20,6 +20,7 @@ try:
         LocalWorkPoseRefiner,
         OpenAICompatibleLocalPoseVLM,
     )
+    from .view_scheduler import FixedViewScheduler
 except ImportError:
     import eval_vlm_pi05 as base_eval
     from local_pose_policy_adapter import LocalPoseRefiningPolicyAdapter
@@ -27,6 +28,7 @@ except ImportError:
         LocalWorkPoseRefiner,
         OpenAICompatibleLocalPoseVLM,
     )
+    from view_scheduler import FixedViewScheduler
 
 
 @dataclass(frozen=True)
@@ -223,6 +225,13 @@ def main() -> int:
             held_object_guard=not extra_args.local_pose_disable_held_object_guard,
         )
         options_holder["options"] = options
+        options_holder["view_scheduler"] = FixedViewScheduler(
+            config_path=args.view_selection_config
+        )
+        # This legacy entrypoint remains the local-only baseline. The main evaluator
+        # now owns target-aware navigation and its integrated local-refiner path.
+        args.target_aware_navigation = False
+        args.enable_local_refiner = False
         # Safe, non-secret settings are persisted by the baseline config writer.
         for key, value in options.safe_dict().items():
             setattr(args, f"local_pose_{key}", value)
@@ -242,6 +251,7 @@ def main() -> int:
                 ),
                 log_dir=atomic_task_policy_adapter.log_dir,
                 camera_names=options.camera_names,
+                view_scheduler=options_holder["view_scheduler"],
                 image_size=options.image_size,
                 max_decisions=options.max_decisions,
                 action_steps=options.action_steps,

@@ -63,22 +63,130 @@ def test_normalizer_resolves_aliases_defaults_condition_and_inserts_close():
     normalized, changes = _normalize_execution_plan(calls, context)
 
     assert [call.atomic_task for call in normalized] == [
-        "PickPlaceCounterToMicrowave",
+        "PickObject",
+        "PlaceObject",
         "CloseMicrowave",
         "TurnOnMicrowave",
     ]
-    first_conditions = normalized[0].termination_condition
-    assert isinstance(first_conditions, list)
-    assert first_conditions[0]["subject"] == "obj"
-    assert first_conditions[0]["object"] == "microwave_main_group"
-    assert first_conditions[0]["desired_value"] is True
-    assert [item["predicate"] for item in first_conditions] == [
+    assert normalized[0].termination_condition == {
+        "predicate": "holding",
+        "subject": "obj",
+        "desired_value": True,
+    }
+    assert normalized[0].metadata["work_pose"] == {
+        "mode": "standard_pick",
+        "reference_object_id": "obj",
+    }
+    place_conditions = normalized[1].termination_condition
+    assert [item["predicate"] for item in place_conditions] == [
         "inside", "released", "eef_outside_receptacle"
     ]
-    assert normalized[0].metadata["skill_contract"]["family"] == "object_transfer"
-    assert normalized[1].termination_condition["subject"] == "microwave_main_group"
+    assert place_conditions[0]["subject"] == "obj"
+    assert place_conditions[0]["object"] == "microwave_main_group"
+    assert normalized[0].metadata["skill_contract"]["family"] == "object_pick"
+    assert normalized[1].metadata["skill_contract"]["family"] == "object_transfer"
+    assert normalized[2].termination_condition["subject"] == "microwave_main_group"
+    assert any(change["type"] == "split_pick_place" for change in changes)
     assert any(change["type"] == "insert_prerequisite" for change in changes)
     _validate_execution_plan(normalized, context)
+
+
+def test_existing_pick_object_also_gets_standard_pick_work_pose():
+    calls = [
+        AtomicTaskCall.from_mapping(
+            {
+                "subgoal_id": "pick_vegetable",
+                "atomic_task": "PickObject",
+                "policy_prompt": "Pick up the vegetable from the sink.",
+                "arguments": {
+                    "object_id": "vegetable",
+                    "object_name": "vegetable",
+                    "source_name": "sink",
+                },
+                "termination_condition": {
+                    "predicate": "holding",
+                    "subject": "vegetable",
+                    "desired_value": True,
+                },
+            }
+        )
+    ]
+    context = {
+        "fixtures": [{"alias": "sink", "natural_name": "sink"}],
+        "objects": [{"alias": "vegetable", "natural_name": "vegetable"}],
+    }
+
+    normalized, changes = _normalize_execution_plan(calls, context)
+
+    assert normalized[0].metadata["work_pose"] == {
+        "mode": "standard_pick",
+        "reference_object_id": "vegetable",
+    }
+    assert any(
+        change["type"] == "apply_standard_pick_work_pose"
+        for change in changes
+    )
+
+
+def test_composite_place_reuses_preceding_pick_of_same_object():
+    calls = [
+        AtomicTaskCall.from_mapping(
+            {
+                "subgoal_id": "pick_bowl",
+                "atomic_task": "PickObject",
+                "policy_prompt": "Pick up the bowl and keep holding it.",
+                "arguments": {"object_id": "bowl", "object_name": "bowl"},
+                "termination_condition": {
+                    "predicate": "holding",
+                    "subject": "bowl",
+                    "desired_value": True,
+                },
+            }
+        ),
+        AtomicTaskCall.from_mapping(
+            {
+                "subgoal_id": "transfer_bowl",
+                "atomic_task": "PickPlaceCounterToMicrowave",
+                "policy_prompt": "Put the bowl into the microwave.",
+                "arguments": {
+                    "object_id": "bowl",
+                    "object_name": "bowl",
+                    "destination_id": "microwave_main_group",
+                },
+                "termination_condition": {
+                    "predicate": "inside",
+                    "subject": "bowl",
+                    "object": "microwave_main_group",
+                    "desired_value": True,
+                },
+            }
+        ),
+    ]
+    context = {
+        "fixtures": [
+            {
+                "alias": "microwave_main_group",
+                "natural_name": "microwave",
+                "type": "Microwave",
+            }
+        ],
+        "objects": [{"alias": "bowl", "natural_name": "bowl"}],
+    }
+
+    normalized, changes = _normalize_execution_plan(calls, context)
+
+    assert [call.atomic_task for call in normalized] == [
+        "PickObject",
+        "PlaceObject",
+    ]
+    assert normalized[1].arguments["held_object_id"] == "bowl"
+    assert normalized[0].policy_prompt == "Pick up the bowl."
+    assert normalized[1].policy_prompt == "Place the bowl in the microwave."
+    assert any(
+        change["type"] == "reuse_prior_pick_for_place"
+        and change["subgoal_id"] == "transfer_bowl"
+        for change in changes
+    )
 
 
 @pytest.mark.parametrize(
@@ -422,8 +530,8 @@ def test_controlled_retrieve_ice_tray_uses_scene_roles_and_preserves_grasp():
     prepared, changes = prepare_execution_plan(calls, context)
     assert [call.atomic_task for call in prepared] == [
         "OpenFridge",
-        "PickPlaceFridgeShelfToDrawer",
-        "PickPlaceCabinetToCounter",
+        "PickObject",
+        "PlaceObject",
     ]
     placement_conditions = prepared[2].termination_condition
     assert [condition["predicate"] for condition in placement_conditions] == [
@@ -486,7 +594,7 @@ def test_normalizer_skips_navigation_to_initialized_object():
 
     normalized, changes = prepare_execution_plan(calls, context)
 
-    assert [call.atomic_task for call in normalized] == ["PickPlaceCounterToSink"]
+    assert [call.atomic_task for call in normalized] == ["PickObject", "PlaceObject"]
     skipped = next(
         change
         for change in changes

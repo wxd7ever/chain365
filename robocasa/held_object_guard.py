@@ -1,4 +1,4 @@
-"""Runtime guard that keeps a confirmed grasp closed until placement."""
+"""Runtime grasp monitor with optional, explicitly enabled action guarding."""
 
 from __future__ import annotations
 
@@ -171,7 +171,11 @@ def _check_holding(raw_env: Any, object_alias: str) -> bool | None:
         from robocasa.utils import object_utils
 
         return bool(
-            object_utils.check_obj_grasped(raw_env, object_alias, threshold=0.05)
+            object_utils.check_obj_grasped(
+                raw_env,
+                object_alias,
+                threshold=object_utils.GRASP_CLOSED_THRESHOLD,
+            )
         )
     except (
         AssertionError,
@@ -227,7 +231,7 @@ def _check_destination(raw_env: Any, condition: Mapping[str, Any] | None) -> boo
 
 
 class HeldObjectGuard:
-    """Latch a confirmed Panda grasp until the destination relation is true."""
+    """Monitor a confirmed grasp and optionally override gripper actions."""
 
     def __init__(
         self,
@@ -237,6 +241,7 @@ class HeldObjectGuard:
         destination_condition: Mapping[str, Any] | None = None,
         holding_checker: Callable[[], bool | None] | None = None,
         destination_checker: Callable[[], bool | None] | None = None,
+        action_override_enabled: bool = False,
         hold_confirmation_steps: int = 2,
         drop_confirmation_steps: int = 2,
         reason: str = "",
@@ -250,6 +255,7 @@ class HeldObjectGuard:
         )
         self.holding_checker = holding_checker
         self.destination_checker = destination_checker
+        self.action_override_enabled = bool(action_override_enabled)
         self.hold_confirmation_steps = int(hold_confirmation_steps)
         self.drop_confirmation_steps = int(drop_confirmation_steps)
         self.reason = reason
@@ -260,6 +266,8 @@ class HeldObjectGuard:
         self.latched_step: int | None = None
         self.release_allowed_step: int | None = None
         self.dropped_step: int | None = None
+        self.drop_active = False
+        self.drop_event_count = 0
         self.gripper_override_count = 0
         self.events: list[dict[str, Any]] = []
         self.trace: list[dict[str, Any]] = []
@@ -315,7 +323,12 @@ class HeldObjectGuard:
         destination = self._destination()
         if destination is True:
             self._allow_release(step_index)
-        override = bool(self.enabled and self.latched and not self.release_allowed)
+        override = bool(
+            self.action_override_enabled
+            and self.enabled
+            and self.latched
+            and not self.release_allowed
+        )
         if override:
             guarded[_GRIPPER_ACTION_INDEX] = _CLOSE_GRIPPER_ACTION
             if float(array[_GRIPPER_ACTION_INDEX]) != _CLOSE_GRIPPER_ACTION:
@@ -357,6 +370,15 @@ class HeldObjectGuard:
                 self.lost_consecutive += 1
             elif holding is True:
                 self.lost_consecutive = 0
+                if self.drop_active:
+                    self.drop_active = False
+                    self.events.append(
+                        {
+                            "step_index": step_index,
+                            "event": "object_reacquired_after_drop",
+                            "object": self.object_alias,
+                        }
+                    )
 
         trace = dict(self._pending_action or {"step_index": step_index})
         trace.update(
@@ -375,8 +397,12 @@ class HeldObjectGuard:
             self.latched
             and not self.release_allowed
             and self.lost_consecutive >= self.drop_confirmation_steps
+            and not self.drop_active
         ):
-            self.dropped_step = step_index
+            self.drop_active = True
+            self.drop_event_count += 1
+            if self.dropped_step is None:
+                self.dropped_step = step_index
             evidence = {
                 "source": "held_object_guard",
                 "object": self.object_alias,
@@ -417,6 +443,9 @@ class HeldObjectGuard:
             "release_allowed": self.release_allowed,
             "release_allowed_step": self.release_allowed_step,
             "dropped_step": self.dropped_step,
+            "drop_active": self.drop_active,
+            "drop_event_count": self.drop_event_count,
+            "action_override_enabled": self.action_override_enabled,
             "gripper_override_count": self.gripper_override_count,
             "events": self.events,
             "gripper_action_trace": self.trace,
@@ -430,6 +459,7 @@ def build_held_object_guard(
     enabled: bool = True,
     hold_confirmation_steps: int = 2,
     drop_confirmation_steps: int = 2,
+    action_override_enabled: bool = False,
 ) -> HeldObjectGuard:
     """Build a guard only for object-transfer or explicit held-object calls."""
 
@@ -472,6 +502,7 @@ def build_held_object_guard(
         destination_condition=destination,
         holding_checker=lambda: _check_holding(raw_env, object_alias),
         destination_checker=lambda: _check_destination(raw_env, destination),
+        action_override_enabled=action_override_enabled,
         hold_confirmation_steps=hold_confirmation_steps,
         drop_confirmation_steps=drop_confirmation_steps,
         reason="guarding_resolved_object",

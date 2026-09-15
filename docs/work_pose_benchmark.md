@@ -64,6 +64,7 @@ GitHub。不要把 API key 写入脚本或配置文件。
 - mild：平移 0.10–0.20 m，旋转 5–10°；
 - moderate：平移 0.20–0.40 m，旋转 10–25°；
 - severe：平移 0.40–0.60 m，旋转 25–40°。
+- stress：平移 0.60–0.90 m，旋转 40–60°，用于验证 VLM 是否真的能控制底盘。
 
 底盘必须通过环境原生 12 维动作真正到达目标，不能直接篡改位姿。Place 样本还
 必须在移动前后持续夹住目标物体。不可达、碰撞受限或掉落的候选写入
@@ -101,8 +102,103 @@ Pick/Place 成功率：
       --pi05_port 8000 \
       --pi05_horizon 600
 
+初步验证 VLM 是否真的能控制底盘时，建议先只跑一个 mild Pick，并显式使用
+10 cm 的非持物修正：
+
+    MUJOCO_GL=egl /opt/conda/envs/robocasa/bin/python -m \
+      robocasa.scripts.work_pose.eval_work_pose_refinement \
+      --condition refiner \
+      --operation pick \
+      --difficulty mild \
+      --limit 1 \
+      --local_pose_base_url http://172.16.11.115:11434/v1 \
+      --local_pose_model qwen2.5vl:3b \
+      --local_pose_api_key ollama \
+      --local_pose_translation_distance_m 0.10 \
+      --local_pose_rotation_angle_deg 8 \
+      --local_pose_held_translation_distance_m 0.01 \
+      --local_pose_held_rotation_angle_deg 1 \
+      --pi05_host 172.16.11.115 \
+      --pi05_port 8000 \
+      --pi05_horizon 600 \
+      --video
+
+VLM 现在输出 distance、lateral、yaw 三轴对齐判断，程序按 yaw、lateral、
+distance 的优先级映射成离散动作。每个动作以真实底盘位姿闭环到 10 cm 或 8°；
+Place 等持物阶段自动缩小为 1 cm 或 1°。无效 STOP 最多重新询问 2 次。
+result.json 会保存 requested/actual 位移、目标/最终位姿、收敛状态和逐步 trace。
+
 旧版官方 model.xml.gz 没有顶部和前方相机时，恢复代码会把相机注入机器人底盘
 或手腕对应 body，不修改原始数据文件。
+
+### 大扰动底盘控制验证
+
+不要覆盖已有的 mild/moderate/severe manifest。先单独生成 5 个非持物 Pick 的
+stress 状态；物理物化会排除碰撞、不可达和状态恢复失败的候选：
+
+    MUJOCO_GL=egl /opt/conda/envs/robocasa/bin/python -m \
+      robocasa.scripts.work_pose.generate_degraded_work_poses \
+      --operation pick \
+      --difficulties stress \
+      --samples_per_stage 5 \
+      --max_candidate_attempts 10 \
+      --max_move_steps 1200 \
+      --output robocasa/outputs_work_pose_benchmark/SteamInMicrowave/degraded_stress_pick
+
+在同一个 manifest 上先跑 baseline。保持 π0.5 底盘冻结，避免把操作策略自己的
+底盘动作误算成站位优化效果：
+
+    MUJOCO_GL=egl /opt/conda/envs/robocasa/bin/python -m \
+      robocasa.scripts.work_pose.eval_work_pose_refinement \
+      --manifest robocasa/outputs_work_pose_benchmark/SteamInMicrowave/degraded_stress_pick/perturbations.json \
+      --output_root robocasa/outputs_work_pose_benchmark/SteamInMicrowave/evaluation_stress \
+      --condition baseline \
+      --operation pick \
+      --difficulty stress \
+      --limit 5 \
+      --pi05_base_action_mode frozen \
+      --pi05_host 172.16.11.115 \
+      --pi05_port 8000 \
+      --pi05_horizon 600 \
+      --video
+
+然后在完全相同的 5 个状态上运行 refiner。stress 最大可偏移 0.90 m，而默认累计
+修正上限只有 0.30 m，因此这里显式提高最大决策次数和累计移动/旋转上限：
+
+    MUJOCO_GL=egl /opt/conda/envs/robocasa/bin/python -m \
+      robocasa.scripts.work_pose.eval_work_pose_refinement \
+      --manifest robocasa/outputs_work_pose_benchmark/SteamInMicrowave/degraded_stress_pick/perturbations.json \
+      --output_root robocasa/outputs_work_pose_benchmark/SteamInMicrowave/evaluation_stress \
+      --condition refiner \
+      --operation pick \
+      --difficulty stress \
+      --limit 5 \
+      --local_pose_base_url http://172.16.11.115:11434/v1 \
+      --local_pose_model qwen2.5vl:3b \
+      --local_pose_api_key ollama \
+      --local_pose_max_decisions 16 \
+      --local_pose_translation_distance_m 0.10 \
+      --local_pose_rotation_angle_deg 10 \
+      --local_pose_max_total_translation_m 1.20 \
+      --local_pose_max_total_rotation_deg 90 \
+      --local_pose_max_invalid_stops 3 \
+      --pi05_base_action_mode frozen \
+      --pi05_host 172.16.11.115 \
+      --pi05_port 8000 \
+      --pi05_horizon 600 \
+      --video
+
+判断 VLM 底盘控制是否有效时，不应只比较最终操作成功率，还要配对比较同一
+sample ID 的以下字段：
+
+- `pose_error_before.translation_m` 与 `pose_error_after_refinement.translation_m`；
+- `pose_error_before.yaw_deg` 与 `pose_error_after_refinement.yaw_deg`；
+- `num_executed_actions` 和各离散动作的 requested/actual 位移；
+- baseline/refiner 的 Pick 成功率；
+- `STOP`、无效决策和修正方向反复切换的比例。
+
+建议先完成这个非持物 Pick 对照，再测试 Place。否则大扰动持物移动造成的掉落会
+同时影响结果，无法单独说明 VLM 的底盘站位控制是否有效。
 
 ## 5. 公平比较
 
@@ -120,7 +216,7 @@ pose_error_before、pose_error_after_refinement 和 success 分别衡量优化�
 建议分别报告：
 
 - Pick 与 Place 的成功率；
-- mild、moderate、severe 各难度成功率；
+- mild、moderate、severe、stress 各难度成功率；
 - 平移和角度误差下降量；
 - VLM 输出 stay 的比例、有效底盘动作数和物体掉落率；
 - 相同 sample ID 上 refiner 相对 baseline 的配对成功率变化。

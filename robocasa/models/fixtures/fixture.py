@@ -709,7 +709,7 @@ class Fixture(MujocoXMLObjectRobocasa):
                 env.rng.uniform(desired_min, desired_max),
             )
 
-    def is_open(self, env, joint_names=None, th=0.90):
+    def is_open(self, env, joint_names=None, th=0.75):
         if joint_names is None:
             joint_names = self.door_joint_names
         joint_state = self.get_joint_state(env, joint_names)

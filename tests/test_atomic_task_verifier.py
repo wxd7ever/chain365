@@ -97,6 +97,23 @@ def test_navigation_pose_uses_relaxed_position_and_orientation_thresholds():
     assert result["state_evidence"][-1]["orientation_ok"] is False
 
 
+def test_navigation_pose_honors_call_specific_position_threshold():
+    call = navigation_call()
+    call["termination_condition"]["position_threshold_m"] = 0.10
+    result = RuntimeAtomicTaskVerifier()(
+        env=NavigationEnv([1.11, 2.0, 0.0]),
+        atomic_task_call=call,
+        observation={},
+        step_index=10,
+        info={},
+    )
+
+    assert result["status"] == "uncertain"
+    evidence = result["state_evidence"][-1]
+    assert evidence["position_threshold"] == 0.10
+    assert evidence["position_ok"] is False
+
+
 class CountEnv:
     def __init__(self, inside):
         self.fixtures = {}
@@ -712,6 +729,42 @@ def test_bare_global_predicate_state_cannot_satisfy_an_unrelated_goal(monkeypatc
 
     assert result["status"] == "uncertain"
     assert result["goal_satisfied"] is False
+
+
+def test_skill_end_uses_one_terminal_success_even_when_contract_requires_two():
+    call = navigation_call()
+    call["metadata"] = {
+        "skill_contract": {
+            "verification": {"required_consecutive_successes": 2}
+        }
+    }
+    env = NavigationEnv([1.1, 2.1, 0.0])
+    verifier = RuntimeAtomicTaskVerifier()
+
+    periodic = verifier(
+        env=env,
+        atomic_task_call=call,
+        observation={},
+        step_index=600,
+        info={"verification_mode": "periodic"},
+    )
+    skill_end = verifier(
+        env=env,
+        atomic_task_call=call,
+        observation={},
+        step_index=600,
+        info={"verification_mode": "skill_end"},
+    )
+
+    assert periodic["status"] == "uncertain"
+    assert periodic["state_evidence"][-1]["required_consecutive_successes"] == 2
+    assert skill_end["status"] == "success"
+    assert skill_end["goal_satisfied"] is True
+    assert skill_end["retryable"] is False
+    policy = skill_end["state_evidence"][-1]
+    assert policy["source"] == "verification_policy"
+    assert policy["contract_required_consecutive_successes"] == 2
+    assert policy["effective_required_consecutive_successes"] == 1
 
 
 def test_empty_boolean_condition_is_invalid_and_non_retryable():

@@ -31,6 +31,50 @@ def test_explicit_policy_prompt_has_priority():
     assert build_atomic_task_prompt(value) == "Open the microwave door now."
 
 
+def test_pick_object_prompt_is_reduced_to_the_action_only():
+    value = call(
+        atomic_task="PickObject",
+        policy_prompt=(
+            "Pick up the lemon wedge from the sink, lift it clear, retract to a "
+            "stable carrying pose, and keep holding it."
+        ),
+        arguments={
+            "object_id": "vegetable",
+            "object_name": "vegetable",
+            "source_name": "sink",
+        },
+        termination_condition={
+            "predicate": "holding",
+            "subject": "vegetable",
+            "desired_value": True,
+        },
+    )
+    assert build_atomic_task_prompt(value) == "Pick up the lemon wedge from the sink."
+
+
+def test_place_object_prompt_is_reduced_to_the_action_only():
+    value = call(
+        atomic_task="PlaceObject",
+        policy_prompt=(
+            "Place the held lemon wedge inside the bowl, release it, and move "
+            "the gripper away."
+        ),
+        arguments={
+            "object_id": "vegetable",
+            "object_name": "vegetable",
+            "destination_id": "bowl",
+            "destination_name": "bowl",
+            "destination_preposition": "inside",
+        },
+        termination_condition={
+            "predicate": "inside",
+            "subject": "vegetable",
+            "object": "bowl",
+        },
+    )
+    assert build_atomic_task_prompt(value) == "Place the lemon wedge inside the bowl."
+
+
 def test_registry_template_and_argument_replacement():
     value = call(
         atomic_task="PickPlaceCounterToMicrowave",

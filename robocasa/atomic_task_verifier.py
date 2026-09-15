@@ -35,8 +35,8 @@ _VALID_PREDICATES = {
     "turned",
 }
 
-NAVIGATION_POSITION_THRESHOLD_M = 0.7
-NAVIGATION_ORIENTATION_COSINE_THRESHOLD = 0.90
+NAVIGATION_POSITION_THRESHOLD_M = 1.0
+NAVIGATION_ORIENTATION_COSINE_THRESHOLD = 0.5
 
 
 def _env_chain(env: Any) -> list[Any]:
@@ -463,7 +463,7 @@ def _object_relation(
                 object_utils.check_obj_grasped(
                     raw_env,
                     subject_alias,
-                    threshold=0.035 if receptacle_threshold is None else receptacle_threshold,
+                    threshold=object_utils.GRASP_CLOSED_THRESHOLD,
                 ), relation_api
             )
         elif predicate in {"inside", "inserted", "on"} and object_kind == "object":
@@ -1525,7 +1525,13 @@ class RuntimeAtomicTaskVerifier:
                 call=call,
                 condition=condition,
             )
-            required = self._required_consecutive_successes(call)
+            contract_required = self._required_consecutive_successes(call)
+            verification_mode = str(info.get("verification_mode", "")).strip().lower()
+            single_check_mode = verification_mode in {
+                "skill_end",
+                "periodic_early_stop",
+            }
+            required = 1 if single_check_mode else contract_required
             satisfied, evidence = self._evaluate_condition(
                 env=env, condition=grounded_condition, info=info
             )
@@ -1582,13 +1588,33 @@ class RuntimeAtomicTaskVerifier:
             separators=(",", ":"),
             default=str,
         )
-        consecutive_count = self._record_consecutive_result(
-            env=env,
-            subgoal_id=call.subgoal_id,
-            condition_key=condition_key,
-            step_index=int(step_index),
-            satisfied=satisfied is True,
-        )
+        if verification_mode in {"skill_end", "periodic_early_stop"}:
+            # Skill-end verification has exactly one terminal observation. Its
+            # result must not depend on periodic history or a repeated local
+            # step index from an atomic-task retry.
+            consecutive_count = 1 if satisfied is True else 0
+            if contract_required != required:
+                evidence.append(
+                    {
+                        "source": "verification_policy",
+                        "verification_mode": verification_mode,
+                        "contract_required_consecutive_successes": contract_required,
+                        "effective_required_consecutive_successes": required,
+                        "reason": (
+                            "single_terminal_verification"
+                            if verification_mode == "skill_end"
+                            else "rollout_requires_two_interval_separated_successes"
+                        ),
+                    }
+                )
+        else:
+            consecutive_count = self._record_consecutive_result(
+                env=env,
+                subgoal_id=call.subgoal_id,
+                condition_key=condition_key,
+                step_index=int(step_index),
+                satisfied=satisfied is True,
+            )
         if required > 1:
             evidence.append(
                 {

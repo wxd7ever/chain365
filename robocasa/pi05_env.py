@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Mapping
 
+import imageio.v2 as imageio
 import numpy as np
 
 
@@ -49,6 +51,19 @@ class RawRoboCasaPi05Env:
     def __init__(self, env: Any):
         self.env = env
         self._observation: dict[str, Any] | None = None
+        self._episode_video_writer: Any | None = None
+        self._episode_video_step = 0
+        self._episode_video_metadata: dict[str, Any] = {
+            "enabled": False,
+            "path": None,
+            "camera": None,
+            "fps": None,
+            "frame_stride": None,
+            "frame_count": 0,
+            "env_steps_seen": 0,
+            "finalized": True,
+            "error": None,
+        }
 
     @property
     def unwrapped(self) -> "RawRoboCasaPi05Env":
@@ -76,7 +91,107 @@ class RawRoboCasaPi05Env:
             raise RuntimeError("raw RoboCasa env.step must return (obs, reward, done, info)")
         observation, reward, done, info = result
         self._observation = _process_observation(observation)
+        self._episode_video_step += 1
+        self._episode_video_metadata["env_steps_seen"] = self._episode_video_step
+        frame_stride = self._episode_video_metadata.get("frame_stride")
+        if (
+            self._episode_video_writer is not None
+            and isinstance(frame_stride, int)
+            and self._episode_video_step % frame_stride == 0
+        ):
+            self._append_episode_video_frame()
         return self._observation, reward, done, info
+
+    def start_episode_video_recording(
+        self,
+        path: str | Path,
+        *,
+        camera_name: str = "robot0_agentview_left",
+        fps: int = 20,
+        frame_stride: int = 2,
+    ) -> dict[str, Any]:
+        """Start one streaming video spanning all subsequent environment steps."""
+
+        if self._observation is None:
+            raise RuntimeError(
+                "RoboCasa environment must be reset before recording video"
+            )
+        if fps <= 0:
+            raise ValueError("episode video fps must be positive")
+        if frame_stride <= 0:
+            raise ValueError("episode video frame_stride must be positive")
+        if not isinstance(camera_name, str) or not camera_name.strip():
+            raise ValueError("episode video camera_name must be non-empty")
+        if self._episode_video_writer is not None:
+            self.finalize_episode_video_recording()
+
+        output_path = Path(path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._episode_video_step = 0
+        self._episode_video_metadata = {
+            "enabled": True,
+            "path": str(output_path),
+            "camera": camera_name.strip(),
+            "fps": int(fps),
+            "frame_stride": int(frame_stride),
+            "frame_count": 0,
+            "env_steps_seen": 0,
+            "finalized": False,
+            "error": None,
+        }
+        try:
+            self._episode_video_writer = imageio.get_writer(
+                str(output_path),
+                fps=int(fps),
+                macro_block_size=None,
+            )
+            # Include the state immediately before the first grounding/policy call.
+            self._append_episode_video_frame()
+        except Exception as exc:
+            self._episode_video_metadata["error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            self.finalize_episode_video_recording()
+        return dict(self._episode_video_metadata)
+
+    def _append_episode_video_frame(self) -> None:
+        if self._episode_video_writer is None or self._observation is None:
+            return
+        camera_name = str(self._episode_video_metadata["camera"])
+        key = f"{camera_name}_image"
+        try:
+            frame = np.asarray(self._observation[key])
+            if frame.ndim != 3 or frame.shape[-1] not in (3, 4):
+                raise ValueError(f"invalid video frame shape {frame.shape}")
+            if frame.shape[-1] == 4:
+                frame = frame[..., :3]
+            if frame.dtype != np.uint8:
+                frame = np.clip(frame, 0, 255).astype(np.uint8)
+            self._episode_video_writer.append_data(
+                np.ascontiguousarray(frame)
+            )
+            self._episode_video_metadata["frame_count"] += 1
+        except Exception as exc:
+            self._episode_video_metadata["error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            self.finalize_episode_video_recording()
+
+    def finalize_episode_video_recording(self) -> dict[str, Any]:
+        """Close the episode writer; safe to call repeatedly and on failures."""
+
+        writer = self._episode_video_writer
+        self._episode_video_writer = None
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception as exc:
+                if self._episode_video_metadata.get("error") is None:
+                    self._episode_video_metadata["error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+        self._episode_video_metadata["finalized"] = True
+        return dict(self._episode_video_metadata)
 
     def render(
         self,
@@ -132,6 +247,7 @@ class RawRoboCasaPi05Env:
         }
 
     def close(self) -> None:
+        self.finalize_episode_video_recording()
         self.env.close()
 
     def __getattr__(self, name: str) -> Any:

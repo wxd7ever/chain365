@@ -27,6 +27,7 @@ from robocasa.work_pose_dataset import (
     generate_pose_perturbations,
     move_base_to_pose,
     move_eef_to_pose,
+    move_eef_to_pose_smooth,
     pose_error,
     steam_operation_spec,
     terminal_eef_pose,
@@ -164,6 +165,33 @@ def test_pose_perturbations_are_seeded_and_within_difficulty_ranges():
         yaw = sample["initial_pose_error"]["yaw_deg"]
         assert 0.10 <= distance <= 0.20
         assert 5.0 <= yaw <= 10.0
+
+
+def test_stress_pose_perturbations_use_large_translation_and_yaw_ranges():
+    record = {
+        "episode_index": 7,
+        "operation": "pick",
+        "object_id": "vegetable",
+        "snapshot_id": "snapshot",
+        "segment": {"subtask_idx": 0},
+        "expert_base_pose": {
+            "position": [0.0, 0.0, 0.7],
+            "quaternion_xyzw": yaw_quaternion_xyzw(0.0),
+            "yaw_rad": 0.0,
+        },
+    }
+
+    samples = generate_pose_perturbations(
+        [record], difficulties=["stress"], samples_per_stage=16, seed=456
+    )
+
+    assert len(samples) == 16
+    assert all(sample["difficulty"] == "stress" for sample in samples)
+    for sample in samples:
+        distance = sample["initial_pose_error"]["translation_m"]
+        yaw = sample["initial_pose_error"]["yaw_deg"]
+        assert 0.60 <= distance <= 0.90
+        assert 40.0 <= yaw <= 60.0
 
 
 def test_camera_injection_adds_missing_views_without_duplicates():
@@ -379,3 +407,103 @@ def test_move_eef_to_expert_pose_freezes_base_and_converges():
     assert all(np.allclose(action[7:10], 0.0) for action in env.actions)
     assert all(action[11] == pytest.approx(1.0) for action in env.actions)
     assert all(action[6] == pytest.approx(0.5) for action in env.actions)
+
+
+def test_move_eef_to_pose_smooth_bounds_action_slew_and_converges():
+    class FakeEnv:
+        def __init__(self):
+            self.position = np.zeros(3, dtype=np.float64)
+            self.quaternion = np.array([0.0, 0.0, 0.0, 1.0])
+            self.actions = []
+
+        def get_observation(self):
+            return {
+                "robot0_base_to_eef_pos": self.position.copy(),
+                "robot0_base_to_eef_quat": self.quaternion.copy(),
+            }
+
+        def step(self, action):
+            action = np.asarray(action, dtype=np.float64)
+            self.actions.append(action.copy())
+            self.position += action[:3] * 0.20
+            return self.get_observation(), 0.0, False, {}
+
+    env = FakeEnv()
+    result = move_eef_to_pose_smooth(
+        env,
+        {
+            "position": [0.06, -0.03, 0.04],
+            "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "frame": "robot_base",
+        },
+        max_steps=100,
+        trajectory_steps=40,
+        translation_tolerance_m=0.003,
+        orientation_tolerance_deg=1.0,
+        max_translation_command=0.10,
+        max_rotation_command=0.08,
+        max_translation_command_delta=0.006,
+        max_rotation_command_delta=0.004,
+        stable_steps=3,
+    )
+
+    arm_actions = np.asarray([action[:6] for action in env.actions])
+    action_changes = np.diff(
+        np.vstack([np.zeros((1, 6)), arm_actions]), axis=0
+    )
+    trajectory_trace = [
+        item for item in result["trace"] if item["phase"] == "smooth_trajectory"
+    ]
+
+    assert result["success"] is True
+    assert result["trajectory_type"] == "quintic_scurve_slerp"
+    assert len(trajectory_trace) == 40
+    assert trajectory_trace[0]["trajectory_progress"] < 0.001
+    assert trajectory_trace[-1]["trajectory_progress"] == pytest.approx(1.0)
+    assert np.max(np.abs(action_changes[:, :3])) <= 0.006001
+    assert np.max(np.abs(action_changes[:, 3:6])) <= 0.004001
+
+
+def test_move_eef_to_pose_zero_delta_settle_holds_arm_stationary():
+    class FakeEnv:
+        def __init__(self):
+            self.position = np.zeros(3, dtype=np.float64)
+            self.quaternion = np.array([0.0, 0.0, 0.0, 1.0])
+            self.actions = []
+
+        def get_observation(self):
+            return {
+                "robot0_base_to_eef_pos": self.position.copy(),
+                "robot0_base_to_eef_quat": self.quaternion.copy(),
+            }
+
+        def step(self, action):
+            action = np.asarray(action, dtype=np.float64)
+            self.actions.append(action.copy())
+            self.position += action[:3] * 0.05
+            return self.get_observation(), 0.0, False, {}
+
+    env = FakeEnv()
+    result = move_eef_to_pose(
+        env,
+        {
+            "position": [0.05, 0.0, 0.0],
+            "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "frame": "robot_base",
+        },
+        max_steps=40,
+        translation_tolerance_m=0.003,
+        orientation_tolerance_deg=1.0,
+        stable_steps=3,
+        settle_steps=3,
+        settle_mode="zero_delta",
+        gripper_action=1.0,
+    )
+
+    settle_actions = env.actions[-3:]
+    assert result["success"] is True
+    assert result["settle_mode"] == "zero_delta"
+    assert len(settle_actions) == 3
+    assert all(np.allclose(action[:6], 0.0) for action in settle_actions)
+    assert all(action[6] == pytest.approx(1.0) for action in settle_actions)
+    assert all(action[11] == pytest.approx(1.0) for action in settle_actions)

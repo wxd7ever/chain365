@@ -46,6 +46,7 @@ def test_adapter_builds_prompt_calls_rollout_and_returns_module_result(monkeypat
     result = adapter.execute(env=object(), scheduler_query=query(), episode_id=3)
     assert captured["episode_id"] == 3
     assert captured["held_object_guard"] is True
+    assert captured["held_object_guard_action_override"] is True
     assert captured["held_object_hold_confirmation_steps"] == 2
     assert captured["held_object_drop_confirmation_steps"] == 2
     assert captured["success_handoff_steps"] == 30
@@ -61,3 +62,31 @@ def test_adapter_requires_atomic_task_call(tmp_path):
     )
     with pytest.raises(ValueError, match="atomic_task_call"):
         adapter.execute(env=object(), scheduler_query={}, episode_id=0)
+
+
+def test_adapter_applies_per_task_action_and_handoff_overrides(
+    monkeypatch, tmp_path
+):
+    captured = {}
+
+    def fake_rollout(**kwargs):
+        captured.update(kwargs)
+        return True, {"Final_Verification": {"status": "success"}}
+
+    monkeypatch.setattr(pi05_rollout, "execute_pi05_atomic_task_policy", fake_rollout)
+    adapter = RemoteAtomicTaskPolicyAdapter(
+        client=Client(),
+        verifier=lambda **kwargs: {},
+        log_dir=tmp_path,
+        base_action_mode="residual",
+        base_action_mode_by_task={"OpenMicrowave": "frozen"},
+        success_handoff_steps=30,
+        success_handoff_steps_by_task={"OpenMicrowave": 0},
+        freeze_manipulator_tasks={"OpenMicrowave"},
+    )
+
+    adapter.execute(env=object(), scheduler_query=query(), episode_id=4)
+
+    assert captured["base_action_mode"] == "frozen"
+    assert captured["success_handoff_steps"] == 0
+    assert captured["freeze_manipulator"] is True

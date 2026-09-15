@@ -17,7 +17,18 @@ try:
     from .atomic_task_verifier import RuntimeAtomicTaskVerifier
     from .grounding import RoboCasaGrounder
     from .io_utils import make_run_dir, save_obs_image, write_json
+    from .local_work_pose_refiner import (
+        LocalWorkPoseRefiner,
+        OpenAICompatibleLocalPoseVLM,
+    )
+    from .multi_view_perception import MultiViewObservationProvider
+    from .navigation import TargetAwareNavigationPipeline, TargetAwarePolicyAdapter
+    from .navigation.navigation_pipeline import (
+        DEFAULT_CONFIG_PATH as DEFAULT_NAVIGATION_CONFIG,
+        load_navigation_config,
+    )
     from .openpi_client import OpenPIWebsocketClient
+    from .oracle_logging import OracleLoggingGrounder, OracleLoggingVerifier
     from .orchestrator import RoboCasaOrchestrator
     from .pi05_env import POLICY_CAMERA_NAMES, create_pi05_env
     from .pi05_rollout import _image_to_hwc_uint8
@@ -25,13 +36,31 @@ try:
         RobustOpenAICompatibleVLMPlanner,
         prepare_execution_plan,
     )
+    from .view_scheduler import (
+        DEFAULT_VIEW_SELECTION_CONFIG,
+        FixedViewScheduler,
+    )
+    from .vlm_atomic_task_verifier import VLMAtomicTaskVerifier
+    from .vlm_client import OpenAICompatibleVisionClient
+    from .vlm_grounding import VLMRoboCasaGrounder
     from .vlm_task_planner import load_vlm_task_plan
 except ImportError:  # Support ``python robocasa/eval_vlm_pi05.py``.
     from atomic_task_policy_adapter import RemoteAtomicTaskPolicyAdapter
     from atomic_task_verifier import RuntimeAtomicTaskVerifier
     from grounding import RoboCasaGrounder
     from io_utils import make_run_dir, save_obs_image, write_json
+    from local_work_pose_refiner import (
+        LocalWorkPoseRefiner,
+        OpenAICompatibleLocalPoseVLM,
+    )
+    from multi_view_perception import MultiViewObservationProvider
+    from navigation import TargetAwareNavigationPipeline, TargetAwarePolicyAdapter
+    from navigation.navigation_pipeline import (
+        DEFAULT_CONFIG_PATH as DEFAULT_NAVIGATION_CONFIG,
+        load_navigation_config,
+    )
     from openpi_client import OpenPIWebsocketClient
+    from oracle_logging import OracleLoggingGrounder, OracleLoggingVerifier
     from orchestrator import RoboCasaOrchestrator
     from pi05_env import POLICY_CAMERA_NAMES, create_pi05_env
     from pi05_rollout import _image_to_hwc_uint8
@@ -39,6 +68,13 @@ except ImportError:  # Support ``python robocasa/eval_vlm_pi05.py``.
         RobustOpenAICompatibleVLMPlanner,
         prepare_execution_plan,
     )
+    from view_scheduler import (
+        DEFAULT_VIEW_SELECTION_CONFIG,
+        FixedViewScheduler,
+    )
+    from vlm_atomic_task_verifier import VLMAtomicTaskVerifier
+    from vlm_client import OpenAICompatibleVisionClient
+    from vlm_grounding import VLMRoboCasaGrounder
     from vlm_task_planner import load_vlm_task_plan
 
 
@@ -63,8 +99,93 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vlm_model", default="qwen2.5vl:3b")
     parser.add_argument("--vlm_api_key", default="ollama")
     parser.add_argument("--vlm_timeout_s", type=float, default=120.0)
+    parser.add_argument("--vlm_max_tokens", type=int, default=4096)
+    parser.add_argument("--vlm_enable_thinking", action="store_true")
     parser.add_argument("--vlm_validation_retries", type=int, default=2)
     parser.add_argument("--vlm_text_only", action="store_true")
+    parser.add_argument("--grounding_vlm_base_url")
+    parser.add_argument("--grounding_vlm_model")
+    parser.add_argument("--grounding_vlm_api_key")
+    parser.add_argument("--grounding_vlm_timeout_s", type=float)
+    parser.add_argument("--grounding_vlm_max_tokens", type=int, default=4096)
+    parser.add_argument("--grounding_vlm_enable_thinking", action="store_true")
+    parser.add_argument(
+        "--grounding_vlm_validation_retries",
+        type=int,
+        default=1,
+        help="Retry a grounding response that fails strict schema validation.",
+    )
+    parser.add_argument("--verifier_vlm_base_url")
+    parser.add_argument("--verifier_vlm_model")
+    parser.add_argument("--verifier_vlm_api_key")
+    parser.add_argument("--verifier_vlm_timeout_s", type=float)
+    parser.add_argument("--verifier_vlm_max_tokens", type=int, default=4096)
+    parser.add_argument("--verifier_vlm_enable_thinking", action="store_true")
+    parser.add_argument(
+        "--reasoning_mode",
+        choices=(
+            "simulator",
+            "vlm_critic",
+            "vlm",
+            "vlm_with_oracle_logging",
+        ),
+        default="simulator",
+        help=(
+            "Reasoning backend. vlm_critic uses a final task-level visual critic; "
+            "legacy vlm modes remain available for periodic baseline comparison."
+        ),
+    )
+    parser.add_argument(
+        "--view_selection_config",
+        type=Path,
+        default=DEFAULT_VIEW_SELECTION_CONFIG,
+        help="Task-conditioned fixed VLM camera-selection YAML.",
+    )
+    parser.add_argument(
+        "--navigation_config",
+        type=Path,
+        default=DEFAULT_NAVIGATION_CONFIG,
+        help="Target-aware global-navigation YAML.",
+    )
+    parser.add_argument(
+        "--target_aware_navigation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable target-aware geometric navigation before manipulation skills.",
+    )
+    parser.add_argument(
+        "--enable_local_refiner",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable the existing VLM local work-pose refiner before π0.5.",
+    )
+    parser.add_argument(
+        "--local_refiner_failure_policy",
+        choices=("use_coarse_pose", "abort"),
+        default=None,
+    )
+    parser.add_argument("--local_pose_base_url")
+    parser.add_argument("--local_pose_model")
+    parser.add_argument("--local_pose_api_key")
+    parser.add_argument("--local_pose_timeout_s", type=float)
+    parser.add_argument("--local_pose_max_tokens", type=int, default=8192)
+    parser.add_argument(
+        "--local_pose_enable_thinking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--local_pose_cameras",
+        nargs="+",
+        default=(
+            "robot0_topview",
+            "robot0_frontview",
+            "robot0_agentview_left",
+            "robot0_agentview_right",
+            "robot0_eye_in_hand",
+        ),
+    )
+    parser.add_argument("--local_pose_max_decisions", type=int, default=8)
     parser.add_argument(
         "--plan_only",
         action="store_true",
@@ -87,6 +208,16 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Retry a verifier-marked retryable atomic task without resetting the environment.",
     )
+    parser.add_argument(
+        "--retry_recovery_mode",
+        choices=("same_skill", "dependency_recovery"),
+        default="same_skill",
+        help=(
+            "same_skill preserves the original retry behavior; "
+            "dependency_recovery re-runs the producer PickObject after "
+            "OBJECT_DROPPED, then re-grounds and retries the interrupted task."
+        ),
+    )
     parser.add_argument("--pi05_resize_size", type=int, default=224)
     parser.add_argument("--pi05_replan_steps", type=int, default=5)
     parser.add_argument("--pi05_atomic_task_horizon", type=int, default=300)
@@ -95,8 +226,28 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use each atomic task's horizon from RoboCasa dataset_registry.py.",
     )
-    parser.add_argument("--pi05_verify_interval", type=int, default=5)
-    parser.add_argument("--pi05_min_steps_before_verify", type=int, default=10)
+    parser.add_argument(
+        "--verification_mode",
+        choices=("periodic", "periodic_early_stop", "skill_end"),
+        default=None,
+        help=(
+            "periodic preserves the handoff baseline; periodic_early_stop "
+            "checks every interval and stops after two consecutive successes "
+            "(or accepts one success exactly at the horizon); skill_end "
+            "checks exactly once after the full rollout. Existing defaults "
+            "remain periodic for vlm_critic and skill_end otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--pi05_verify_interval",
+        type=int,
+        help="Periodic verifier interval; ignored in skill_end mode.",
+    )
+    parser.add_argument(
+        "--pi05_min_steps_before_verify",
+        type=int,
+        help="Earliest periodic verification step; ignored in skill_end mode.",
+    )
     parser.add_argument(
         "--pi05_base_action_mode",
         choices=("full", "residual", "frozen"),
@@ -106,7 +257,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pi05_disable_held_object_guard",
         action="store_true",
-        help="Disable grasp latching and early OBJECT_DROPPED detection.",
+        help="Disable grasp latching, gripper protection, and OBJECT_DROPPED detection.",
+    )
+    parser.add_argument(
+        "--pi05_held_object_guard_action_override",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Keep the gripper closed after a grasp is latched until the "
+            "destination condition permits release."
+        ),
     )
     parser.add_argument(
         "--pi05_held_object_hold_confirmation_steps", type=int, default=2
@@ -123,13 +283,15 @@ def parse_args() -> argparse.Namespace:
     positive = (
         "camera_size",
         "vlm_timeout_s",
+        "vlm_max_tokens",
+        "grounding_vlm_max_tokens",
+        "verifier_vlm_max_tokens",
         "pi05_port",
         "pi05_connect_timeout_s",
         "pi05_infer_timeout_s",
         "pi05_resize_size",
         "pi05_replan_steps",
         "pi05_atomic_task_horizon",
-        "pi05_verify_interval",
         "pi05_held_object_hold_confirmation_steps",
         "pi05_held_object_drop_confirmation_steps",
         "pi05_video_skip",
@@ -137,12 +299,32 @@ def parse_args() -> argparse.Namespace:
     for name in positive:
         if getattr(args, name) <= 0:
             parser.error(f"--{name} must be positive")
+    for module in ("grounding", "verifier"):
+        for field in ("base_url", "model", "api_key", "timeout_s"):
+            name = f"{module}_vlm_{field}"
+            if getattr(args, name) is None:
+                setattr(args, name, getattr(args, f"vlm_{field}"))
+        if getattr(args, f"{module}_vlm_timeout_s") <= 0:
+            parser.error(f"--{module}_vlm_timeout_s must be positive")
     if (
         args.vlm_validation_retries < 0
+        or args.grounding_vlm_validation_retries < 0
         or args.pi05_max_retries < 0
         or args.pi05_task_retries < 0
     ):
         parser.error("retry counts must be non-negative")
+    if args.verification_mode is None:
+        args.verification_mode = (
+            "periodic" if args.reasoning_mode == "vlm_critic" else "skill_end"
+        )
+    if args.pi05_verify_interval is None:
+        args.pi05_verify_interval = 60 if args.reasoning_mode != "simulator" else 5
+    if args.pi05_min_steps_before_verify is None:
+        args.pi05_min_steps_before_verify = (
+            60 if args.reasoning_mode != "simulator" else 10
+        )
+    if args.pi05_verify_interval <= 0:
+        parser.error("--pi05_verify_interval must be positive")
     if args.pi05_min_steps_before_verify < 0:
         parser.error("--pi05_min_steps_before_verify must be non-negative")
     if args.pi05_base_residual_limit < 0:
@@ -153,6 +335,44 @@ def parse_args() -> argparse.Namespace:
         parser.error("this RoboCasa version uses 1-based --layout_id and --style_id")
     if args.vlm_plan_json is not None and not args.vlm_plan_json.is_file():
         parser.error(f"--vlm_plan_json does not exist: {args.vlm_plan_json}")
+    if not args.view_selection_config.is_file():
+        parser.error(
+            f"--view_selection_config does not exist: {args.view_selection_config}"
+        )
+    if not args.navigation_config.is_file():
+        parser.error(f"--navigation_config does not exist: {args.navigation_config}")
+    try:
+        navigation_options = load_navigation_config(args.navigation_config)["navigation"]
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        parser.error(f"invalid --navigation_config: {exc}")
+    if args.target_aware_navigation is None:
+        args.target_aware_navigation = bool(navigation_options.get("enabled", True))
+    if args.enable_local_refiner is None:
+        args.enable_local_refiner = bool(
+            navigation_options.get("enable_local_refiner", True)
+        )
+    if args.local_refiner_failure_policy is None:
+        args.local_refiner_failure_policy = str(
+            navigation_options.get(
+                "local_refiner_failure_policy", "use_coarse_pose"
+            )
+        )
+    if args.local_refiner_failure_policy not in {"use_coarse_pose", "abort"}:
+        parser.error("navigation local_refiner_failure_policy must be use_coarse_pose or abort")
+    if args.local_pose_max_tokens <= 0 or args.local_pose_max_decisions <= 0:
+        parser.error("local-pose token and decision limits must be positive")
+    args.local_pose_base_url = args.local_pose_base_url or args.vlm_base_url
+    args.local_pose_model = args.local_pose_model or args.vlm_model
+    args.local_pose_api_key = (
+        args.local_pose_api_key
+        if args.local_pose_api_key is not None
+        else args.vlm_api_key
+    )
+    args.local_pose_timeout_s = args.local_pose_timeout_s or args.vlm_timeout_s
+    if args.local_pose_timeout_s <= 0:
+        parser.error("--local_pose_timeout_s must be positive")
+    if not args.local_pose_cameras:
+        parser.error("--local_pose_cameras must not be empty")
     return args
 
 
@@ -293,18 +513,65 @@ def _save_initial_views(run_dir: Path, observation: Mapping[str, Any]) -> None:
             save_obs_image(run_dir / "initial_views" / f"{camera_name}.png", observation[key])
 
 
+def _evaluation_only_privileged_oracle(env: Any) -> dict[str, Any]:
+    """Score the final task state without influencing runtime execution.
+
+    RoboCasa task environments expose their native success predicate through
+    _check_success. The pi0.5 wrapper keeps that environment in env. This
+    check intentionally runs only after the orchestrator has returned so
+    privileged state cannot change grounding, verification, retries, or policy
+    actions in a VLM reasoning run.
+    """
+
+    task_env = getattr(env, "env", env)
+    check_success = getattr(task_env, "_check_success", None)
+    source = f"{type(task_env).__name__}._check_success"
+    if not callable(check_success):
+        return {
+            "available": False,
+            "success": None,
+            "source": source,
+            "error": "task environment does not expose _check_success",
+            "affects_runtime": False,
+        }
+    try:
+        success = bool(check_success())
+    except Exception as exc:  # Evaluation must preserve the completed rollout.
+        return {
+            "available": False,
+            "success": None,
+            "source": source,
+            "error": f"{type(exc).__name__}: {exc}",
+            "affects_runtime": False,
+        }
+    return {
+        "available": True,
+        "success": success,
+        "source": source,
+        "error": None,
+        "affects_runtime": False,
+    }
+
+
 def main() -> int:
     args = parse_args()
     run_name = f"{args.env_name}_vlm_pi05"
     run_dir = make_run_dir(args.output_root, env_name=run_name)
     config = vars(args).copy()
-    config["vlm_api_key"] = "***" if args.vlm_api_key else None
+    for key in (
+        "vlm_api_key",
+        "grounding_vlm_api_key",
+        "verifier_vlm_api_key",
+        "local_pose_api_key",
+    ):
+        config[key] = "***" if getattr(args, key) else None
     config["pi05_api_key"] = "***" if args.pi05_api_key else None
     write_json(run_dir / "config.json", config)
 
     env = None
     client = None
     planner = None
+    full_episode_video: dict[str, Any] | None = None
     try:
         observation = None
         context = None
@@ -340,6 +607,8 @@ def main() -> int:
                 model=args.vlm_model,
                 api_key=args.vlm_api_key,
                 timeout_s=args.vlm_timeout_s,
+                max_tokens=args.vlm_max_tokens,
+                enable_thinking=args.vlm_enable_thinking,
                 include_images=not args.vlm_text_only and observation is not None,
                 max_validation_retries=args.vlm_validation_retries,
             )
@@ -368,6 +637,13 @@ def main() -> int:
             return 0
         if env is None:
             raise RuntimeError("execution requires a RoboCasa environment")
+        if not args.no_video:
+            full_episode_video = env.start_episode_video_recording(
+                run_dir / "episode_full.mp4",
+                camera_name="robot0_agentview_left",
+                fps=20,
+                frame_stride=args.pi05_video_skip,
+            )
 
         client = OpenPIWebsocketClient(
             host=args.pi05_host,
@@ -390,15 +666,150 @@ def main() -> int:
                 model=args.vlm_model,
                 api_key=args.vlm_api_key,
                 timeout_s=args.vlm_timeout_s,
+                max_tokens=args.vlm_max_tokens,
+                enable_thinking=args.vlm_enable_thinking,
                 include_images=False,
                 max_validation_retries=args.vlm_validation_retries,
             )
         entity_alias_resolver = alias_resolver_client.resolve_entity_alias
+        if args.reasoning_mode == "simulator":
+            runtime_verifier: Any = RuntimeAtomicTaskVerifier(
+                entity_alias_resolver=entity_alias_resolver
+            )
+            runtime_grounder: Any = RoboCasaGrounder(
+                scene_context=context,
+                entity_alias_resolver=entity_alias_resolver,
+            )
+        else:
+            grounding_vlm_client = OpenAICompatibleVisionClient(
+                base_url=args.grounding_vlm_base_url,
+                model=args.grounding_vlm_model,
+                api_key=args.grounding_vlm_api_key,
+                timeout_s=args.grounding_vlm_timeout_s,
+                max_tokens=args.grounding_vlm_max_tokens,
+                enable_thinking=args.grounding_vlm_enable_thinking,
+            )
+            verifier_vlm_client = OpenAICompatibleVisionClient(
+                base_url=args.verifier_vlm_base_url,
+                model=args.verifier_vlm_model,
+                api_key=args.verifier_vlm_api_key,
+                timeout_s=args.verifier_vlm_timeout_s,
+                max_tokens=args.verifier_vlm_max_tokens,
+                enable_thinking=args.verifier_vlm_enable_thinking,
+            )
+            observation_provider = MultiViewObservationProvider(
+                image_size=args.camera_size
+            )
+            view_scheduler = FixedViewScheduler(
+                config_path=args.view_selection_config
+            )
+            vlm_verifier = VLMAtomicTaskVerifier(
+                client=verifier_vlm_client,
+                observation_provider=observation_provider,
+                view_scheduler=view_scheduler,
+                scene_context=context,
+                critic_only=args.reasoning_mode == "vlm_critic",
+                log_dir=run_dir,
+            )
+            vlm_grounder = VLMRoboCasaGrounder(
+                client=grounding_vlm_client,
+                observation_provider=observation_provider,
+                view_scheduler=view_scheduler,
+                scene_context=context,
+                max_validation_retries=args.grounding_vlm_validation_retries,
+                log_dir=run_dir,
+            )
+            runtime_verifier = vlm_verifier
+            runtime_grounder = vlm_grounder
+            if args.reasoning_mode == "vlm_with_oracle_logging":
+                simulator_verifier = RuntimeAtomicTaskVerifier(
+                    entity_alias_resolver=entity_alias_resolver
+                )
+                simulator_grounder = RoboCasaGrounder(
+                    scene_context=context,
+                    entity_alias_resolver=entity_alias_resolver,
+                )
+                runtime_verifier = OracleLoggingVerifier(
+                    primary=vlm_verifier,
+                    oracle=simulator_verifier,
+                    log_dir=run_dir,
+                )
+                runtime_grounder = OracleLoggingGrounder(
+                    primary=vlm_grounder,
+                    oracle=simulator_grounder,
+                    log_dir=run_dir,
+                )
+        # The rollout reads this mode from the callable so the existing policy
+        # adapter and its camera/action contract remain unchanged.
+        runtime_verifier.verification_mode = args.verification_mode
+        write_json(
+            run_dir / "reasoning_backend.json",
+            {
+                "reasoning_mode": args.reasoning_mode,
+                "runtime_grounder": type(runtime_grounder).__name__,
+                "runtime_verifier": type(runtime_verifier).__name__,
+                "verification_mode": args.verification_mode,
+                "retry_recovery_mode": args.retry_recovery_mode,
+                "verifier_strategy": (
+                    (
+                        f"vlm_critic_{args.verification_mode}"
+                    )
+                    if args.reasoning_mode == "vlm_critic"
+                    else (
+                        "periodic_baseline"
+                        if args.verification_mode == "periodic"
+                        else "periodic_two_check_early_stop"
+                        if args.verification_mode == "periodic_early_stop"
+                        else type(runtime_verifier).__name__
+                    )
+                ),
+                "verify_interval": args.pi05_verify_interval,
+                "min_steps_before_verify": args.pi05_min_steps_before_verify,
+                "view_scheduler": (
+                    view_scheduler.to_dict()
+                    if args.reasoning_mode != "simulator"
+                    else None
+                ),
+                "policy_camera_names": list(POLICY_CAMERA_NAMES),
+                "target_aware_navigation": args.target_aware_navigation,
+                "navigation_config": str(args.navigation_config),
+                "post_grasp_transport": load_navigation_config(
+                    args.navigation_config
+                ).get("post_grasp_transport"),
+                "post_place_retreat": load_navigation_config(
+                    args.navigation_config
+                ).get("post_place_retreat"),
+                "post_skill_return": load_navigation_config(
+                    args.navigation_config
+                ).get("post_skill_return"),
+                "local_refiner_enabled": args.enable_local_refiner,
+                "local_refiner_failure_policy": args.local_refiner_failure_policy,
+                "local_pose_vlm": (
+                    {
+                        "base_url": args.local_pose_base_url,
+                        "model": args.local_pose_model,
+                        "timeout_s": args.local_pose_timeout_s,
+                        "max_tokens": args.local_pose_max_tokens,
+                        "enable_thinking": args.local_pose_enable_thinking,
+                        "camera_names": list(args.local_pose_cameras),
+                    }
+                    if args.enable_local_refiner
+                    else None
+                ),
+                "simulator_held_object_guard_enabled": bool(
+                    args.reasoning_mode == "simulator"
+                    and not args.pi05_disable_held_object_guard
+                ),
+                "simulator_held_object_guard_action_override_enabled": bool(
+                    args.reasoning_mode == "simulator"
+                    and not args.pi05_disable_held_object_guard
+                    and args.pi05_held_object_guard_action_override
+                ),
+            },
+        )
         adapter = RemoteAtomicTaskPolicyAdapter(
             client=client,
-            verifier=RuntimeAtomicTaskVerifier(
-                entity_alias_resolver=entity_alias_resolver
-            ),
+            verifier=runtime_verifier,
             log_dir=run_dir,
             resize_size=args.pi05_resize_size,
             replan_steps=args.pi05_replan_steps,
@@ -408,32 +819,101 @@ def main() -> int:
             min_steps_before_verify=args.pi05_min_steps_before_verify,
             base_action_mode=args.pi05_base_action_mode,
             base_residual_limit=args.pi05_base_residual_limit,
-            held_object_guard=not args.pi05_disable_held_object_guard,
+            # This legacy guard reads privileged simulator grasp / relation state.
+            # Keep it for the simulator baseline, but never let it influence a VLM
+            # runtime mode (including oracle-shadow logging).
+            held_object_guard=(
+                args.reasoning_mode == "simulator"
+                and not args.pi05_disable_held_object_guard
+            ),
+            held_object_guard_action_override=(
+                args.pi05_held_object_guard_action_override
+            ),
             held_object_hold_confirmation_steps=(
                 args.pi05_held_object_hold_confirmation_steps
             ),
             held_object_drop_confirmation_steps=(
                 args.pi05_held_object_drop_confirmation_steps
             ),
+            verification_mode=args.verification_mode,
             render=not args.no_video,
             video_skip=args.pi05_video_skip,
         )
+        navigation_runtime_config = load_navigation_config(
+            args.navigation_config
+        )
+        post_skill_return_enabled = bool(
+            navigation_runtime_config.get("post_skill_return", {}).get(
+                "enabled", False
+            )
+        )
+        if (
+            args.target_aware_navigation
+            or args.enable_local_refiner
+            or post_skill_return_enabled
+        ):
+            navigation_pipeline = TargetAwareNavigationPipeline(
+                config_path=args.navigation_config
+            )
+            local_refiner = None
+            if args.enable_local_refiner:
+                local_refiner = LocalWorkPoseRefiner(
+                    decision_maker=OpenAICompatibleLocalPoseVLM(
+                        base_url=args.local_pose_base_url,
+                        model=args.local_pose_model,
+                        api_key=args.local_pose_api_key,
+                        timeout_s=args.local_pose_timeout_s,
+                        max_tokens=args.local_pose_max_tokens,
+                        enable_thinking=args.local_pose_enable_thinking,
+                    ),
+                    log_dir=run_dir,
+                    camera_names=args.local_pose_cameras,
+                    view_scheduler=FixedViewScheduler(
+                        config_path=args.view_selection_config
+                    ),
+                    image_size=args.camera_size,
+                    max_decisions=args.local_pose_max_decisions,
+                    held_object_guard=True,
+                )
+            adapter = TargetAwarePolicyAdapter(
+                policy_adapter=adapter,
+                navigation_pipeline=navigation_pipeline,
+                refiner=local_refiner,
+                navigation_enabled=args.target_aware_navigation,
+                local_refiner_enabled=args.enable_local_refiner,
+                local_refiner_failure_policy=args.local_refiner_failure_policy,
+                context={
+                    "layout_id": args.layout_id,
+                    "style_id": args.style_id,
+                    "seed": args.seed,
+                },
+            )
         result = RoboCasaOrchestrator(
             atomic_task_policy_adapter=adapter,
-            grounder=RoboCasaGrounder(
-                scene_context=context,
-                entity_alias_resolver=entity_alias_resolver,
-            ),
+            grounder=runtime_grounder,
         ).run_task_plan(
             env=env,
             task_plan=calls,
             episode_id=0,
             stop_on_unsuccessful=not args.continue_on_unsuccessful,
             max_task_retries=args.pi05_task_retries,
+            retry_recovery_mode=args.retry_recovery_mode,
+        )
+        full_episode_video = env.finalize_episode_video_recording()
+        write_json(run_dir / "full_episode_video.json", full_episode_video)
+        result["full_episode_video"] = full_episode_video
+        result["runtime_reported_success"] = bool(result.get("success", False))
+        result["evaluation_only_privileged_oracle"] = (
+            _evaluation_only_privileged_oracle(env)
         )
         result["task_plan_path"] = str(run_dir / "task_plan.json")
         write_json(run_dir / "long_horizon_result.json", result)
-        print(f"[Done] status={result['status']} output={run_dir}")
+        oracle = result["evaluation_only_privileged_oracle"]
+        print(
+            f"[Done] status={result['status']} "
+            f"runtime_success={result['runtime_reported_success']} "
+            f"oracle_success={oracle['success']} output={run_dir}"
+        )
         return 0 if result["success"] else 2
     except Exception as exc:
         error = {"error": str(exc), "traceback": traceback.format_exc()}
@@ -442,12 +922,36 @@ def main() -> int:
             (run_dir / "vlm_raw_response.txt").write_text(
                 raw_response + "\n", encoding="utf-8"
             )
+        raw_http_response = getattr(planner, "last_raw_http_response", None)
+        if isinstance(raw_http_response, str):
+            (run_dir / "vlm_raw_http_response.json").write_text(
+                raw_http_response, encoding="utf-8"
+            )
+        if planner is not None:
+            write_json(
+                run_dir / "vlm_diagnostics.json",
+                {
+                    "http_status": getattr(planner, "last_http_status", None),
+                    "finish_reason": getattr(planner, "last_finish_reason", None),
+                    "usage": getattr(planner, "last_usage", None),
+                    "parsed_response": getattr(
+                        planner, "last_parsed_response", None
+                    ),
+                },
+            )
         write_json(run_dir / "run_error.json", error)
         print(f"[Error] {exc}")
         print(error["traceback"])
         print(f"[Error] Details saved to {run_dir / 'run_error.json'}")
         return 1
     finally:
+        if env is not None:
+            full_episode_video = env.finalize_episode_video_recording()
+            if full_episode_video.get("enabled", False):
+                write_json(
+                    run_dir / "full_episode_video.json",
+                    full_episode_video,
+                )
         if client is not None:
             client.close()
         if env is not None:

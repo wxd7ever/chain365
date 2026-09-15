@@ -356,9 +356,11 @@ def execute_pi05_atomic_task_policy(
     base_action_mode: str = "full",
     base_residual_limit: float = 0.15,
     held_object_guard: bool = True,
+    held_object_guard_action_override: bool = True,
     held_object_hold_confirmation_steps: int = 2,
     held_object_drop_confirmation_steps: int = 2,
     success_handoff_steps: int = 0,
+    verification_mode: str | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """Execute one atomic subgoal without resetting the RoboCasa environment.
 
@@ -408,6 +410,36 @@ def execute_pi05_atomic_task_policy(
         raise TypeError("client must provide infer(observation) -> mapping")
     if not callable(verifier):
         raise TypeError("verifier must be callable")
+    if verification_mode is None:
+        verification_mode = str(
+            getattr(verifier, "verification_mode", "skill_end")
+        )
+    periodic_verification = verification_mode in {
+        "periodic",
+        "periodic_early_stop",
+    }
+    if verification_mode not in {
+        "periodic",
+        "periodic_early_stop",
+        "skill_end",
+    }:
+        raise ValueError(
+            "verification_mode must be one of "
+            "periodic/periodic_early_stop/skill_end, "
+            f"got {verification_mode!r}"
+        )
+    simple_periodic_critic = bool(
+        periodic_verification
+        and getattr(verifier, "critic_only", False)
+    )
+    periodic_early_stop_required_successes = (
+        2 if verification_mode == "periodic_early_stop" else 1
+    )
+    effective_success_handoff_steps = (
+        0
+        if simple_periodic_critic or verification_mode == "periodic_early_stop"
+        else success_handoff_steps
+    )
     # Validate mode and limit even if no environment step is eventually taken.
     _apply_base_action_mode(
         np.zeros(_ACTION_DIM, dtype=np.float32),
@@ -423,6 +455,7 @@ def execute_pi05_atomic_task_policy(
         env=env,
         atomic_task_call=call,
         enabled=held_object_guard,
+        action_override_enabled=held_object_guard_action_override,
         hold_confirmation_steps=held_object_hold_confirmation_steps,
         drop_confirmation_steps=held_object_drop_confirmation_steps,
     )
@@ -435,6 +468,7 @@ def execute_pi05_atomic_task_policy(
     policy_infer_ms: list[float] = []
     video_frames: list[np.ndarray] = []
     verification_history: list[dict[str, Any]] = []
+    guard_failures: list[dict[str, Any]] = []
     action_min = math.inf
     action_max = -math.inf
     atomic_task_success = False
@@ -443,11 +477,105 @@ def execute_pi05_atomic_task_policy(
     info: Mapping[str, Any] = {}
     last_verified_step: int | None = None
     final_verification: dict[str, Any] | None = None
+    initial_verification: dict[str, Any] | None = None
     first_success_step: int | None = None
     handoff_target_step: int | None = None
-    maximum_total_steps = horizon + success_handoff_steps
+    periodic_early_stop_consecutive_successes = 0
+    periodic_early_stop_last_success_step: int | None = None
+    periodic_early_stop_success_steps: list[int] = []
+    periodic_early_stop_horizon_success_accepted = False
+    maximum_total_steps = (
+        horizon + effective_success_handoff_steps
+        if periodic_verification
+        else horizon
+    )
 
-    for step_index in range(maximum_total_steps):
+    def record_periodic_early_stop_result(
+        result: dict[str, Any], *, step: int
+    ) -> bool:
+        """Require two interval-separated successful checks before stopping."""
+
+        nonlocal periodic_early_stop_consecutive_successes
+        nonlocal periodic_early_stop_last_success_step
+        nonlocal periodic_early_stop_success_steps
+        nonlocal periodic_early_stop_horizon_success_accepted
+        instantaneous_success = result["status"] == "success"
+        interval_satisfied = bool(
+            periodic_early_stop_last_success_step is None
+            or step - periodic_early_stop_last_success_step >= verify_interval
+        )
+        if instantaneous_success:
+            if periodic_early_stop_consecutive_successes == 0:
+                periodic_early_stop_consecutive_successes = 1
+                periodic_early_stop_last_success_step = step
+                periodic_early_stop_success_steps = [step]
+            elif interval_satisfied:
+                periodic_early_stop_consecutive_successes += 1
+                periodic_early_stop_last_success_step = step
+                periodic_early_stop_success_steps.append(step)
+        else:
+            periodic_early_stop_consecutive_successes = 0
+            periodic_early_stop_last_success_step = None
+            periodic_early_stop_success_steps = []
+        consecutive_stable = (
+            periodic_early_stop_consecutive_successes
+            >= periodic_early_stop_required_successes
+        )
+        horizon_single_success = bool(
+            instantaneous_success
+            and step == horizon
+            and periodic_early_stop_consecutive_successes == 1
+        )
+        if horizon_single_success:
+            periodic_early_stop_horizon_success_accepted = True
+        stable = consecutive_stable or horizon_single_success
+        result["state_evidence"].append(
+            {
+                "source": "rollout_consecutive_stability",
+                "instantaneous_satisfied": instantaneous_success,
+                "consecutive_successes": (
+                    periodic_early_stop_consecutive_successes
+                ),
+                "required_consecutive_successes": (
+                    periodic_early_stop_required_successes
+                ),
+                "verification_interval_steps": int(verify_interval),
+                "interval_satisfied": interval_satisfied,
+                "success_steps": list(periodic_early_stop_success_steps),
+                "consecutive_stable": consecutive_stable,
+                "horizon_single_success_accepted": horizon_single_success,
+                "stable": stable,
+            }
+        )
+        result["rollout_stable_success"] = stable
+        return stable
+
+    if verification_mode == "periodic" and not simple_periodic_critic:
+        # Preserve the baseline behavior, including the idempotent task-start
+        # check and verifier-driven early stop.
+        initial_verification = _validate_verifier_result(
+            verifier(
+                env=env,
+                atomic_task_call=call,
+                observation=observation,
+                step_index=0,
+                info={
+                    **dict(info),
+                    "verification_mode": verification_mode,
+                    "verification_phase": "task_start",
+                    "verification_step": 0,
+                },
+            )
+        )
+        verification_history.append(initial_verification)
+        final_verification = initial_verification
+        last_verified_step = 0
+        if initial_verification["status"] == "success":
+            atomic_task_success = True
+            first_success_step = 0
+            handoff_target_step = 0
+
+    for step_index in range(0 if atomic_task_success else maximum_total_steps):
         if not action_plan:
             payload = build_pi05_observation(
                 observation, prompt, resize_size=resize_size
@@ -508,32 +636,68 @@ def execute_pi05_atomic_task_policy(
 
         guard_failure = object_guard.observe(step_index=completed_steps)
         if guard_failure is not None:
-            final_verification = _validate_verifier_result(guard_failure)
-            verification_history.append(final_verification)
-            last_verified_step = completed_steps
-            terminal_failure = False
-            break
+            validated_guard_failure = _validate_verifier_result(guard_failure)
+            guard_failures.append(validated_guard_failure)
+            print(
+                "[HeldObjectGuard] detected {} at step {}; continuing atomic "
+                "policy rollout until its normal verification boundary".format(
+                    validated_guard_failure.get("failure_code", "OBJECT_DROPPED"),
+                    completed_steps,
+                )
+            )
 
-        should_verify = completed_steps >= min_steps_before_verify and (
-            completed_steps % verify_interval == 0 or done
+        handoff_due = bool(
+            handoff_target_step is not None
+            and completed_steps >= handoff_target_step
+        )
+        horizon_due = bool(first_success_step is None and completed_steps >= horizon)
+        should_verify = (
+            periodic_verification
+            and completed_steps >= min_steps_before_verify
+            and (
+                completed_steps % verify_interval == 0
+                or done
+                or handoff_due
+                or horizon_due
+            )
         )
         if should_verify:
+            verification_phase = (
+                "task_end" if done or handoff_due or horizon_due else "periodic"
+            )
             final_verification = _validate_verifier_result(
                 verifier(
                     env=env,
                     atomic_task_call=call,
                     observation=observation,
                     step_index=completed_steps,
-                    info=info,
+                    info={
+                        **dict(info),
+                        "verification_mode": verification_mode,
+                        "verification_phase": verification_phase,
+                        "verification_step": completed_steps,
+                    },
                 )
             )
             verification_history.append(final_verification)
             last_verified_step = completed_steps
-            if final_verification["status"] == "success":
+            if verification_mode == "periodic_early_stop":
+                stable_success = record_periodic_early_stop_result(
+                    final_verification, step=completed_steps
+                )
+                if periodic_early_stop_consecutive_successes == 1:
+                    first_success_step = periodic_early_stop_success_steps[0]
+                elif periodic_early_stop_consecutive_successes == 0:
+                    first_success_step = None
+                if stable_success:
+                    handoff_target_step = completed_steps
+                    atomic_task_success = True
+                    break
+            elif final_verification["status"] == "success":
                 if first_success_step is None:
                     first_success_step = completed_steps
                     handoff_target_step = (
-                        completed_steps + success_handoff_steps
+                        completed_steps + effective_success_handoff_steps
                     )
                 if completed_steps >= handoff_target_step:
                     atomic_task_success = True
@@ -547,21 +711,64 @@ def execute_pi05_atomic_task_policy(
             break
 
     completed_steps = len(rewards)
-    if last_verified_step != completed_steps or final_verification is None:
+    if verification_mode == "skill_end":
         final_verification = _validate_verifier_result(
             verifier(
                 env=env,
                 atomic_task_call=call,
                 observation=observation,
                 step_index=completed_steps,
-                info=info,
+                info={
+                    **dict(info),
+                    "verification_mode": verification_mode,
+                    "verification_phase": "skill_end",
+                    "verification_step": completed_steps,
+                },
             )
         )
         verification_history.append(final_verification)
+        last_verified_step = completed_steps
         if final_verification["status"] == "success":
+            atomic_task_success = True
+            first_success_step = completed_steps
+            handoff_target_step = completed_steps
+        elif final_verification["status"] == "failed":
+            terminal_failure = not bool(
+                final_verification.get("retryable", False)
+            )
+    elif last_verified_step != completed_steps or final_verification is None:
+        final_verification = _validate_verifier_result(
+            verifier(
+                env=env,
+                atomic_task_call=call,
+                observation=observation,
+                step_index=completed_steps,
+                info={
+                    **dict(info),
+                    "verification_mode": verification_mode,
+                    "verification_phase": "task_end",
+                    "verification_step": completed_steps,
+                },
+            )
+        )
+        verification_history.append(final_verification)
+        if verification_mode == "periodic_early_stop":
+            stable_success = record_periodic_early_stop_result(
+                final_verification, step=completed_steps
+            )
+            if periodic_early_stop_consecutive_successes == 1:
+                first_success_step = periodic_early_stop_success_steps[0]
+            elif periodic_early_stop_consecutive_successes == 0:
+                first_success_step = None
+            if stable_success:
+                handoff_target_step = completed_steps
+                atomic_task_success = True
+        elif final_verification["status"] == "success":
             if first_success_step is None:
                 first_success_step = completed_steps
-                handoff_target_step = completed_steps + success_handoff_steps
+                handoff_target_step = (
+                    completed_steps + effective_success_handoff_steps
+                )
             atomic_task_success = completed_steps >= handoff_target_step
         elif final_verification["status"] == "failed":
             terminal_failure = not bool(final_verification.get("retryable", False))
@@ -580,11 +787,34 @@ def execute_pi05_atomic_task_policy(
         "Success": bool(atomic_task_success),
         "Terminal_Failure": bool(terminal_failure),
         "Final_Verification": final_verification,
+        "Initial_Verification": initial_verification,
         "Verification_History": verification_history,
+        "verification_mode": verification_mode,
+        "verification_step": completed_steps,
         "Return": float(np.sum(rewards)),
         "Horizon": completed_steps,
         "Configured_Pre_Success_Horizon": int(horizon),
         "Success_Handoff_Steps": int(success_handoff_steps),
+        "Effective_Success_Handoff_Steps": int(
+            effective_success_handoff_steps
+        ),
+        "Simple_Periodic_Critic": simple_periodic_critic,
+        "Immediate_Periodic_Early_Stop": False,
+        "Periodic_Early_Stop_Required_Consecutive_Successes": int(
+            periodic_early_stop_required_successes
+        ),
+        "Periodic_Early_Stop_Consecutive_Successes": int(
+            periodic_early_stop_consecutive_successes
+        ),
+        "Periodic_Early_Stop_Success_Steps": list(
+            periodic_early_stop_success_steps
+        ),
+        "Periodic_Early_Stop_Verification_Interval_Steps": int(
+            verify_interval
+        ),
+        "Periodic_Early_Stop_Horizon_Single_Success_Accepted": bool(
+            periodic_early_stop_horizon_success_accepted
+        ),
         "First_Success_Step": first_success_step,
         "Handoff_Target_Step": handoff_target_step,
         "Post_Success_Steps_Executed": (
@@ -606,6 +836,12 @@ def execute_pi05_atomic_task_policy(
         "Input_Image_Size": int(resize_size),
         "Action_Interface_Validated": action_contract_validated,
         "Held_Object_Guard": object_guard.to_dict(),
+        "Held_Object_Guard_Action_Override_Enabled": bool(
+            getattr(object_guard, "enabled", False)
+            and getattr(object_guard, "action_override_enabled", False)
+        ),
+        "Guard_Failures": guard_failures,
+        "First_Guard_Failure": guard_failures[0] if guard_failures else None,
         "Action_Raw_Min": float(action_min) if rewards else None,
         "Action_Raw_Max": float(action_max) if rewards else None,
         "Server_Infer_Ms": _timing_summary(server_infer_ms),

@@ -27,6 +27,7 @@ def test_confirmed_grasp_is_latched_and_drop_fails_early():
         destination_checker=lambda: state["destination"],
         hold_confirmation_steps=2,
         drop_confirmation_steps=2,
+        action_override_enabled=True,
     )
     guard.start()
     opening = np.zeros(12, dtype=np.float32)
@@ -51,8 +52,24 @@ def test_confirmed_grasp_is_latched_and_drop_fails_early():
     assert guard.dropped_step == 4
     assert guard.gripper_override_count == 2
 
+    # A continuing rollout receives only one failure for a continuous drop.
+    assert guard.observe(step_index=5) is None
+    assert guard.drop_event_count == 1
 
-def test_destination_relation_unlocks_policy_release():
+    # Reacquiring the object clears the active drop episode. A later drop can
+    # be reported again without changing the first dropped_step diagnostic.
+    state["holding"] = True
+    assert guard.observe(step_index=6) is None
+    assert guard.drop_active is False
+    state["holding"] = False
+    assert guard.observe(step_index=7) is None
+    second_failure = guard.observe(step_index=8)
+    assert second_failure["failure_code"] == "OBJECT_DROPPED"
+    assert guard.dropped_step == 4
+    assert guard.drop_event_count == 2
+
+
+def test_monitor_only_tracks_destination_without_overriding_policy_action():
     state = {"holding": True, "destination": False}
     guard = HeldObjectGuard(
         enabled=True,
@@ -69,7 +86,7 @@ def test_destination_relation_unlocks_policy_release():
     opening = np.zeros(12, dtype=np.float32)
     opening[6] = -1.0
 
-    assert guard.apply_action(opening, step_index=1)[6] == 1.0
+    assert guard.apply_action(opening, step_index=1)[6] == -1.0
     assert guard.observe(step_index=1) is None
 
     state["destination"] = True
@@ -78,6 +95,8 @@ def test_destination_relation_unlocks_policy_release():
     assert guard.observe(step_index=2) is None
     assert guard.release_allowed is True
     assert guard.release_allowed_step == 2
+    assert guard.action_override_enabled is False
+    assert guard.gripper_override_count == 0
     assert guard.dropped_step is None
 
 
@@ -113,6 +132,7 @@ def test_factory_resolves_pickplace_object_and_destination():
     guard = build_held_object_guard(env=GuardEnv(), atomic_task_call=call)
 
     assert guard.enabled is True
+    assert guard.action_override_enabled is False
     assert guard.object_alias == "bowl"
     assert guard.destination_condition["object"] == "microwave_main_group"
     assert guard.destination_condition["object_kind"] == "fixture"

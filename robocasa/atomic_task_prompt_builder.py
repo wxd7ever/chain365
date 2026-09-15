@@ -20,6 +20,43 @@ _PROMPT_REGISTRY_PATH = (
 _INSTANCE_SUFFIX = re.compile(r"_\d+$")
 
 
+def simplify_pick_place_prompt(atomic_task: str, prompt: str) -> str:
+    """Remove rollout-behavior suffixes from PickObject / PlaceObject prompts."""
+
+    simplified = prompt.strip()
+    if atomic_task == "PickObject":
+        suffix_markers = (
+            ", lift it clear",
+            ". lift it clear",
+            " and keep holding it",
+            ". keep holding it",
+        )
+    elif atomic_task == "PlaceObject":
+        simplified = re.sub(
+            r"^Place\s+the\s+held\s+",
+            "Place the ",
+            simplified,
+            flags=re.IGNORECASE,
+        )
+        suffix_markers = (
+            ", release it",
+            ". release it",
+            " and release it",
+        )
+    else:
+        return simplified
+
+    lowered = simplified.lower()
+    suffix_positions = [
+        position
+        for marker in suffix_markers
+        if (position := lowered.find(marker)) >= 0
+    ]
+    if suffix_positions:
+        simplified = simplified[: min(suffix_positions)]
+    return simplified.rstrip(" ,.!?") + "."
+
+
 def clean_entity_name(value: str) -> str:
     """Convert simulator instance identifiers into natural-language names."""
 
@@ -80,7 +117,7 @@ def build_atomic_task_prompt(
         prompt = call.policy_prompt.strip()
         if not prompt:
             raise ValueError("atomic task policy_prompt must not be empty")
-        return prompt
+        return simplify_pick_place_prompt(call.atomic_task, prompt)
 
     registry = dict(
         load_atomic_task_prompts() if prompt_registry is None else prompt_registry
@@ -112,4 +149,4 @@ def build_atomic_task_prompt(
         ) from exc
     if not prompt:
         raise ValueError(f"Prompt for atomic task {call.atomic_task!r} is empty")
-    return prompt
+    return simplify_pick_place_prompt(call.atomic_task, prompt)

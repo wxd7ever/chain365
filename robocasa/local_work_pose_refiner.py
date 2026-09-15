@@ -7,13 +7,9 @@ short velocity pulse, and closes the loop with a new set of images.
 
 from __future__ import annotations
 
-import base64
-import io
 import json
 import math
 import re
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -23,6 +19,13 @@ from PIL import Image
 try:
     from .atomic_task_schemas import AtomicTaskCall
     from .held_object_guard import build_held_object_guard
+    from .view_scheduler import FixedViewScheduler
+    from .vlm_client import (
+        OpenAICompatibleVisionClient,
+        VisionVLMOutputTruncated,
+        extract_assistant_response,
+        image_to_data_url,
+    )
     from .work_pose_dataset import (
         current_base_pose,
         object_eef_diagnostics,
@@ -31,6 +34,13 @@ try:
 except ImportError:
     from atomic_task_schemas import AtomicTaskCall
     from held_object_guard import build_held_object_guard
+    from view_scheduler import FixedViewScheduler
+    from vlm_client import (
+        OpenAICompatibleVisionClient,
+        VisionVLMOutputTruncated,
+        extract_assistant_response,
+        image_to_data_url,
+    )
     from work_pose_dataset import (
         current_base_pose,
         object_eef_diagnostics,
@@ -167,141 +177,19 @@ def _as_rgb_uint8(image: Any) -> np.ndarray:
 
 
 def _encode_png_data_url(image: Any) -> str:
-    buffer = io.BytesIO()
-    Image.fromarray(_as_rgb_uint8(image)).save(buffer, format="PNG")
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
-
-
-def _nonempty_text(value: Any) -> str | None:
-    if isinstance(value, str) and value.strip():
-        return value
-    return None
-
-
-def _content_parts(value: Any) -> list[str]:
-    """Extract textual payloads from OpenAI-compatible structured content.
-
-    Different servers / model backends return assistant content in slightly
-    different schemas.  Accept plain strings, structured text objects, and
-    lists of either without requiring a specific ``type`` label.
-    """
-    direct = _nonempty_text(value)
-    if direct is not None:
-        return [direct]
-
-    if isinstance(value, Mapping):
-        # If the server already returned the requested JSON object directly as
-        # message.content, preserve it losslessly as JSON text.
-        decision_keys = {
-            "distance_alignment",
-            "lateral_alignment",
-            "yaw_alignment",
-            "action",
-        }
-        if decision_keys.intersection(value.keys()):
-            return [json.dumps(_jsonable(value), ensure_ascii=False)]
-
-        parts: list[str] = []
-        # Common variants include {text: ...}, {value: ...},
-        # {output_text: ...}, or nested {text: {value: ...}}.
-        for key in ("text", "output_text", "content", "value"):
-            if key not in value:
-                continue
-            nested_parts = _content_parts(value.get(key))
-            if nested_parts:
-                parts.extend(nested_parts)
-        return parts
-
-    if isinstance(value, (list, tuple)):
-        parts: list[str] = []
-        for item in value:
-            parts.extend(_content_parts(item))
-        return parts
-
-    return []
-
-
-def _json_object_from_text(text: str) -> str | None:
-    """Return the outermost JSON object embedded in text, if present."""
-    stripped = _JSON_FENCE.sub("", text.strip()).strip()
-    if stripped.startswith("{") and stripped.endswith("}"):
-        return stripped
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start >= 0 and end > start:
-        candidate = stripped[start : end + 1]
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            return None
-        if isinstance(parsed, Mapping):
-            return candidate
-    return None
+    return image_to_data_url(image)
 
 
 def _extract_response_text(response: Mapping[str, Any]) -> str:
-    """Extract assistant text from several OpenAI-compatible schemas.
+    """Backward-compatible alias for the shared response parser."""
 
-    Supported examples include:
-      * choices[0].message.content = "..."
-      * content = [{"type": "text", "text": "..."}]
-      * content = [{"type": "output_text", "text": "..."}]
-      * content = {"text": "..."} or a direct decision object
-      * choices[0].text = "..."
-      * message.reasoning_content containing the requested JSON object
-    """
-    choices = response.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise RuntimeError(
-            "local-pose VLM response has no choices; "
-            f"top_level_keys={list(response.keys())}"
-        )
-
-    choice = choices[0]
-    if not isinstance(choice, Mapping):
-        raise RuntimeError(
-            "local-pose VLM choice must be an object; "
-            f"choice_type={type(choice).__name__}"
-        )
-
-    message = choice.get("message")
-    if isinstance(message, Mapping):
-        content = message.get("content")
-        parts = _content_parts(content)
-        if parts:
-            return "".join(parts)
-
-        # Some reasoning-capable OpenAI-compatible servers may put the final
-        # JSON in reasoning_content while leaving content null / structured.
-        reasoning = _nonempty_text(message.get("reasoning_content"))
-        if reasoning is not None:
-            candidate = _json_object_from_text(reasoning)
-            if candidate is not None:
-                return candidate
-
-        raise RuntimeError(
-            "local-pose VLM message content has no extractable text; "
-            f"content_type={type(content).__name__}; "
-            f"message_keys={list(message.keys())}; "
-            f"content_preview={repr(content)[:500]}"
-        )
-
-    # Legacy / completion-style OpenAI-compatible response.
-    choice_text = _nonempty_text(choice.get("text"))
-    if choice_text is not None:
-        return choice_text
-
-    raise RuntimeError(
-        "local-pose VLM choice has neither a valid message nor text; "
-        f"choice_keys={list(choice.keys())}"
-    )
-
+    return extract_assistant_response(response)
 
 
 def _normalise_alignment(value: Any, aliases: Mapping[str, str]) -> str:
     text = str(value or "").strip().upper().replace(" ", "_").replace("-", "_")
     return aliases.get(text, text)
+
 
 def _normalise_action(value: Any) -> str:
     text = str(value or "").strip().upper().replace(" ", "_").replace("-", "_")
@@ -330,6 +218,7 @@ def _fallback_action_from_alignment(
     yaw_alignment: str,
 ) -> str:
     """Best-effort fallback used only when the VLM omitted an action field."""
+
     if "UNRESOLVED" in {distance_alignment, lateral_alignment, yaw_alignment}:
         return "UNRESOLVED"
     if yaw_alignment != "ALIGNED":
@@ -343,6 +232,7 @@ def _fallback_action_from_alignment(
     if distance_alignment != "ALIGNED":
         return "FORWARD_SMALL" if distance_alignment == "TOO_FAR" else "BACKWARD_SMALL"
     return "STOP"
+
 
 def _validate_decision(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
@@ -548,7 +438,7 @@ class OpenAICompatibleLocalPoseVLM:
         model: str,
         api_key: str | None,
         timeout_s: float = 120.0,
-        max_tokens: int = 8192,
+        max_tokens: int = 16384,
         enable_thinking: bool = True,
     ):
         if not isinstance(base_url, str) or not base_url.strip():
@@ -572,10 +462,25 @@ class OpenAICompatibleLocalPoseVLM:
         self.last_http_status: int | None = None
         self.last_finish_reason: str | None = None
         self.last_usage: dict[str, Any] | None = None
+        self._vision_client = OpenAICompatibleVisionClient(
+            base_url=self.base_url,
+            model=self.model,
+            api_key=self.api_key,
+            timeout_s=self.timeout_s,
+            max_tokens=self.max_tokens,
+            enable_thinking=self.enable_thinking,
+        )
 
     @property
     def endpoint(self) -> str:
-        return f"{self.base_url}/chat/completions"
+        return self._vision_client.endpoint
+
+    def _sync_client_diagnostics(self) -> None:
+        self.last_response_text = self._vision_client.last_response_text
+        self.last_raw_http_response = self._vision_client.last_raw_http_response
+        self.last_http_status = self._vision_client.last_http_status
+        self.last_finish_reason = self._vision_client.last_finish_reason
+        self.last_usage = self._vision_client.last_usage
 
     def decide(
         self,
@@ -583,216 +488,56 @@ class OpenAICompatibleLocalPoseVLM:
         images: Mapping[str, np.ndarray],
         context: Mapping[str, Any],
     ) -> dict[str, Any]:
-        # Clear all response diagnostics before issuing a new request.  Without
-        # this, a parse / timeout failure could incorrectly expose the previous
-        # successful response as if it belonged to the current decision.
         self.last_response_text = None
         self.last_raw_http_response = None
         self.last_http_status = None
         self.last_finish_reason = None
         self.last_usage = None
-
         if not images:
             raise ValueError("local-pose VLM requires at least one camera image")
-        content: list[dict[str, Any]] = [
-            {
-                "type": "text",
-                "text": (
-                    "Judge the robot work pose for the operation below along three "
-                    "independent axes. All directions are in the ROBOT BASE frame, "
-                    "not image coordinates. "
-                    "IMPORTANT: distance_alignment describes MANIPULATION REACHABILITY, "
-                    "not visual framing, image centeredness, or apparent image proximity. "
-                    "Use distance_alignment=TOO_FAR when the target may be visible or even "
-                    "centered, but the robot base still appears too far away for the arm to "
-                    "comfortably reach and manipulate the target without additional base motion. "
-                    "Use distance_alignment=ALIGNED only when there is reasonably strong visual "
-                    "evidence that the base is close enough for comfortable arm reach. A target "
-                    "being centered in frontview or eye-in-hand, clearly visible, or visually "
-                    "near the gripper is NOT sufficient evidence for ALIGNED. "
-                    "Use distance_alignment=TOO_CLOSE when the base is so close that arm workspace, "
-                    "collision clearance, or manipulation posture is likely compromised. "
-                    "Use distance_alignment=UNRESOLVED when the available views do not provide "
-                    "enough evidence to judge manipulation reachability. When uncertain between "
-                    "ALIGNED and TOO_FAR, prefer TOO_FAR and request a conservative forward "
-                    "correction rather than prematurely declaring the pose ready. "
-                    "distance_alignment is therefore one of TOO_FAR, ALIGNED, TOO_CLOSE, or "
-                    "UNRESOLVED. lateral_alignment is TARGET_LEFT, ALIGNED, TARGET_RIGHT, or "
-                    "UNRESOLVED. yaw_alignment is TURN_LEFT, ALIGNED, TURN_RIGHT, or UNRESOLVED. "
-                    "Also choose exactly one action from FORWARD_SMALL, BACKWARD_SMALL, "
-                    "STRAFE_LEFT_SMALL, STRAFE_RIGHT_SMALL, TURN_LEFT_SMALL, TURN_RIGHT_SMALL, "
-                    "STOP, or UNRESOLVED. Use the STRICT refinement order yaw -> lateral -> "
-                    "distance. If yaw_alignment is TURN_LEFT or TURN_RIGHT, propose the matching "
-                    "TURN action regardless of lateral or distance error. Only after yaw_alignment "
-                    "is ALIGNED may you propose a STRAFE action for lateral error. Only after both "
-                    "yaw_alignment and lateral_alignment are ALIGNED may you propose FORWARD or "
-                    "BACKWARD for distance error. Explain the current stage in reason. The runtime "
-                    "controller will enforce this same priority from the alignment fields. Visual "
-                    "alignment does NOT imply distance alignment. "
-                    "Eye-in-hand alignment is useful evidence for direction and target visibility, "
-                    "but is weak evidence for metric arm reachability. Do not infer reachability "
-                    "solely because the gripper appears over, near, or centered on the target. "
-                    "Mark operation_ready true only if all three axes are aligned AND the target "
-                    "appears comfortably reachable by the arm. If reachability is uncertain, set "
-                    "operation_ready=false and distance_alignment to TOO_FAR or UNRESOLVED. "
-                    "STOP is valid only when all three axes are ALIGNED, target_visible is true, "
-                    "and operation_ready is true. Return confidence as a numeric value in [0, 1]. "
-                    "The controller executes one correction "
-                    "and then requests fresh images. Corrections listed in "
-                    "previous_corrections have already been physically executed; reassess "
-                    "all axes from the new views before choosing the next action. Action names "
-                    "encode direction/axis only; the controller selects an adaptive coarse, "
-                    "medium, or fine magnitude. If temporal_guidance reports repeated corrections "
-                    "on one axis, a direction reversal, or an unresolved different axis, explicitly "
-                    "reassess whether continuing the same axis is still justified by fresh visual "
-                    "evidence. Never estimate lateral/distance error from world x/y coordinates or "
-                    "from evaluator poses; judge directions in the ROBOT BASE frame from images. "
-                    "Context:\n"
-                    + json.dumps(_jsonable(context), ensure_ascii=False)
-                ),
-            }
-        ]
-        for camera_name, image in images.items():
-            camera_label = f"Camera view: {camera_name}"
-            if camera_name == "robot0_topview":
-                camera_label += (
-                    ". CALIBRATED IMAGE AXES: image RIGHT = robot FORWARD; "
-                    "image UP = robot LEFT; image LEFT = robot BACKWARD; "
-                    "image DOWN = robot RIGHT. Use this mapping exactly when "
-                    "judging lateral and distance corrections."
-                )
-            content.extend(
-                (
-                    {
-                        "type": "text",
-                        "text": camera_label,
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": _encode_png_data_url(image)},
-                    },
-                )
-            )
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a conservative RoboCasa local work-pose controller. "
-                        "Return exactly one JSON object with keys distance_alignment, "
-                        "lateral_alignment, yaw_alignment, action, confidence, target_visible, "
-                        "operation_ready, reason. Never output arm commands. "
-                        "Interpret distance_alignment strictly as MANIPULATION REACHABILITY: "
-                        "ALIGNED means the base appears close enough for the arm to comfortably "
-                        "reach the target, not merely that the target is visible, centered, or "
-                        "aligned with the gripper in an image. A centered target in frontview or "
-                        "eye-in-hand is not proof of reachability. If distance/reachability is "
-                        "ambiguous, prefer TOO_FAR over ALIGNED and keep operation_ready=false. "
-                        "Use UNRESOLVED when the views truly cannot support a reachability or "
-                        "direction judgment. Follow the STRICT action priority yaw -> lateral -> "
-                        "distance. Any non-ALIGNED yaw must be corrected first with TURN_LEFT or "
-                        "TURN_RIGHT. Only when yaw is ALIGNED may lateral error be corrected with "
-                        "STRAFE_LEFT or STRAFE_RIGHT. Only when both yaw and lateral are ALIGNED may "
-                        "distance be corrected with FORWARD or BACKWARD. The runtime controller also "
-                        "enforces this priority, so use reason to explain the current refinement "
-                        "stage. Return confidence as a number from 0 to 1, "
-                        "not a word such as high. Treat entries in previous_corrections as completed "
-                        "physical motion and reassess from the fresh images. operation_ready=true "
-                        "requires all three axes ALIGNED and strong visual evidence of comfortable "
-                        "arm reachability. STOP is valid only when all three axes are ALIGNED and "
-                        "target_visible and operation_ready are true."
-                    ),
-                },
-                {"role": "user", "content": content},
-            ],
-            # Thinking mode: use sampling instead of greedy decoding
-            "temperature": 0.6,
-            "top_p": 0.95,
-            "top_k": 20,
-            "min_p": 0.0,
-            "presence_penalty": 1.5,
 
-            "max_tokens": self.max_tokens,
-
-            "chat_template_kwargs": {
-                "enable_thinking": self.enable_thinking,
-            },
-            "stream": False,
-            "response_format": {"type": "json_object"},
-        }
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        request = urllib.request.Request(
-            self.endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
+        user_prompt = (
+            "Judge the robot work pose for the operation below along three independent "
+            "axes in the ROBOT BASE frame. distance_alignment is TOO_FAR, ALIGNED, "
+            "TOO_CLOSE, or UNRESOLVED; lateral_alignment is TARGET_LEFT, ALIGNED, "
+            "TARGET_RIGHT, or UNRESOLVED; yaw_alignment is TURN_LEFT, ALIGNED, "
+            "TURN_RIGHT, or UNRESOLVED. Distance means manipulation reachability, not "
+            "image centeredness. A visible or centered target is not proof of reachability; "
+            "when uncertain between ALIGNED and TOO_FAR, prefer TOO_FAR. Follow strict "
+            "priority yaw -> lateral -> distance and choose exactly one action from "
+            "FORWARD_SMALL, BACKWARD_SMALL, STRAFE_LEFT_SMALL, STRAFE_RIGHT_SMALL, "
+            "TURN_LEFT_SMALL, TURN_RIGHT_SMALL, STOP, UNRESOLVED. operation_ready=true "
+            "and STOP require target_visible=true, all axes ALIGNED, and strong visual "
+            "evidence of comfortable arm reachability. Reassess from these fresh images; "
+            "previous_corrections have already executed. For robot0_topview use the exact "
+            "calibration: image RIGHT=robot FORWARD, image UP=robot LEFT, image "
+            "LEFT=robot BACKWARD, image DOWN=robot RIGHT. Context:\n"
+            + json.dumps(_jsonable(context), ensure_ascii=False)
+        )
+        system_prompt = (
+            "You are a conservative RoboCasa local work-pose controller. Return exactly "
+            "one JSON object with keys distance_alignment, lateral_alignment, "
+            "yaw_alignment, action, confidence, target_visible, operation_ready, reason. "
+            "Never output arm commands. confidence must be numeric in [0,1]. Enforce "
+            "yaw -> lateral -> distance priority. Use UNRESOLVED when the views cannot "
+            "support a judgment, and do not declare reachability from visual centering."
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
-                status = getattr(response, "status", None)
-                if isinstance(status, int):
-                    self.last_http_status = status
-                raw_http_response = response.read().decode("utf-8", errors="replace")
-                # Save the exact body BEFORE JSON / message parsing.  This is the
-                # authoritative response for debugging parser failures.
-                self.last_raw_http_response = raw_http_response
-                try:
-                    response_data = json.loads(raw_http_response)
-                except json.JSONDecodeError as exc:
-                    raise RuntimeError(
-                        "local-pose VLM returned invalid HTTP JSON: "
-                        f"{exc}; body_preview={raw_http_response[:1000]!r}"
-                    ) from exc
-        except urllib.error.HTTPError as exc:
-            self.last_http_status = int(exc.code)
-            detail = exc.read().decode("utf-8", errors="replace")
-            self.last_raw_http_response = detail
-            raise RuntimeError(
-                f"local-pose VLM HTTP {exc.code} from {self.endpoint}: {detail}"
-            ) from exc
-        except (TimeoutError, urllib.error.URLError) as exc:
-            reason = getattr(exc, "reason", exc)
-            raise RuntimeError(
-                f"could not reach local-pose VLM {self.endpoint}: {reason}"
-            ) from exc
-        if not isinstance(response_data, Mapping):
-            raise RuntimeError(
-                "local-pose VLM returned non-object JSON; "
-                f"response_type={type(response_data).__name__}"
+            decision = self._vision_client.query_json(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                images=images,
+                max_tokens=self.max_tokens,
+                enable_thinking=self.enable_thinking,
             )
-
-        usage = response_data.get("usage")
-        if isinstance(usage, Mapping):
-            self.last_usage = dict(usage)
-
-        choices = response_data.get("choices")
-        if isinstance(choices, list) and choices and isinstance(choices[0], Mapping):
-            finish_reason = choices[0].get("finish_reason")
-            if finish_reason is not None:
-                self.last_finish_reason = str(finish_reason)
-
-        # A length stop means the generation budget was exhausted.  Never try
-        # to execute a possibly incomplete decision, even if some partial text
-        # happens to be present.  In the failure mode observed with Qwen, the
-        # model spent the entire budget in reasoning and returned content=null.
-        if self.last_finish_reason == "length":
+        except VisionVLMOutputTruncated as exc:
             raise LocalPoseVLMOutputTruncated(
                 "local-pose VLM exhausted max_tokens before producing a complete "
-                f"decision; max_tokens={self.max_tokens}; usage={self.last_usage}"
-            )
-
-        response_text = _extract_response_text(response_data)
-        self.last_response_text = response_text
-        cleaned = _JSON_FENCE.sub("", response_text.strip())
-        try:
-            decision = json.loads(cleaned)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"local-pose VLM did not return valid JSON: {exc}"
+                f"decision; max_tokens={self.max_tokens}; "
+                f"usage={self._vision_client.last_usage}"
             ) from exc
+        finally:
+            self._sync_client_diagnostics()
         return _validate_decision(decision)
 
 
@@ -1030,6 +775,7 @@ class LocalWorkPoseRefiner:
         decision_maker: Any,
         log_dir: str | Path,
         camera_names: Sequence[str],
+        view_scheduler: FixedViewScheduler | None = None,
         image_size: int = 256,
         max_decisions: int = 10,
         action_steps: int = 5,
@@ -1068,6 +814,10 @@ class LocalWorkPoseRefiner:
             raise ValueError("local-pose camera_names must not be empty")
         if len(set(names)) != len(names):
             raise ValueError("local-pose camera_names must not contain duplicates")
+        if view_scheduler is not None and not callable(
+            getattr(view_scheduler, "select_views", None)
+        ):
+            raise TypeError("view_scheduler must provide select_views(...)")
         if image_size <= 0 or max_decisions <= 0 or action_steps <= 0:
             raise ValueError("image_size, max_decisions, and action_steps must be positive")
         if settle_steps < 0:
@@ -1122,6 +872,7 @@ class LocalWorkPoseRefiner:
         self.decision_maker = decision_maker
         self.log_dir = Path(log_dir)
         self.camera_names = names
+        self.view_scheduler = view_scheduler
         self.image_size = int(image_size)
         self.max_decisions = int(max_decisions)
         self.action_steps = int(action_steps)
@@ -1547,6 +1298,26 @@ class LocalWorkPoseRefiner:
         }
         return observation, motion, guard_failure
 
+    def select_camera_names(
+        self, atomic_task_call: AtomicTaskCall | Mapping[str, Any]
+    ) -> tuple[str, ...]:
+        """Select the VLM-only local-refinement cameras for one atomic task."""
+
+        call = (
+            atomic_task_call
+            if isinstance(atomic_task_call, AtomicTaskCall)
+            else AtomicTaskCall.from_mapping(atomic_task_call)
+        )
+        if self.view_scheduler is None:
+            return self.camera_names
+        return tuple(
+            self.view_scheduler.select_views(
+                atomic_task_call=call,
+                purpose="work_pose_refinement",
+                available_views=self.camera_names,
+            )
+        )
+
     def refine(
         self,
         *,
@@ -1560,6 +1331,7 @@ class LocalWorkPoseRefiner:
             if isinstance(atomic_task_call, AtomicTaskCall)
             else AtomicTaskCall.from_mapping(atomic_task_call)
         )
+        selected_camera_names = self.select_camera_names(call)
         safe_episode = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(episode_id))
         output_dir = self.log_dir / "local_pose_refinement" / safe_episode
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1598,7 +1370,7 @@ class LocalWorkPoseRefiner:
 
         for decision_index in range(self.max_decisions):
             images = _render_views(
-                env, self.camera_names, image_size=self.image_size
+                env, selected_camera_names, image_size=self.image_size
             )
             for camera_name, image in images.items():
                 Image.fromarray(image).save(
@@ -1612,6 +1384,9 @@ class LocalWorkPoseRefiner:
                 "decision_index": decision_index,
                 "previous_actions": executed_actions,
                 "held_mode": held_mode,
+                "view_selection_purpose": "work_pose_refinement",
+                "available_camera_names": list(self.camera_names),
+                "selected_camera_names": list(selected_camera_names),
                 "correction_scales": {
                     "translation_m": {
                         "coarse": self.translation_distance_m,
@@ -1971,8 +1746,10 @@ class LocalWorkPoseRefiner:
             "failure_code": failure_code,
             "atomic_task": call.atomic_task,
             "subgoal_id": call.subgoal_id,
-            "camera_names": list(self.camera_names),
-            "uses_top_camera": "robot0_topview" in self.camera_names,
+            "camera_names": list(selected_camera_names),
+            "available_camera_names": list(self.camera_names),
+            "view_selection_purpose": "work_pose_refinement",
+            "uses_top_camera": "robot0_topview" in selected_camera_names,
             "num_decisions": len(decisions),
             "num_executed_actions": len(executed_actions),
             "total_env_steps": total_env_steps,

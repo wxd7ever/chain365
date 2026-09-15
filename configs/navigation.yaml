@@ -1,0 +1,376 @@
+map:
+  resolution: 0.05
+  boundary_padding: 1.00
+  border_obstacle_cells: 1
+  # Floor fixtures define room bounds but are traversable and not obstacles.
+  traversable_fixture_types: [Floor]
+  # Cache only fixture layout footprints. Door / drawer / rack collision geoms
+  # are read from the current MuJoCo world transforms before every navigation.
+  articulated_enabled: true
+  articulated_min_projected_area_m2: 0.001
+  articulated_min_projected_span_m: 0.015
+  # Used only if live robot collision geoms cannot be queried. Production runs
+  # derive the current mobile-manipulator z envelope from MuJoCo automatically.
+  robot_collision_z_fallback: [0.0, 1.8]
+  debug_articulated_map: false
+
+robot:
+  # Omron collision box half-size. Inflation rotates this rectangle with the
+  # base instead of applying the over-conservative 0.43 m corner radius to
+  # every flat counter face.
+  half_length: 0.35
+  half_width: 0.25
+  # Retained as the legacy fallback for external callers.
+  radius: 0.4301162634
+  safety_margin: 0.01
+  # Collision-box center relative to the mobile-base control origin.
+  # Read from robosuite's omron_mobile_base.xml (wheeled_base pos=-0.20 0 0.192).
+  footprint_center_offset_xy: [-0.20, 0.0]
+
+candidate_generation:
+  min_distance: 0.50
+  preferred_distance: 0.70
+  max_distance: 0.95
+  radial_step: 0.05
+  angular_step_deg: 10
+
+fixture_candidate:
+  min_distance: 0.45
+  preferred_distance: 0.70
+  max_distance: 1.00
+  distance_step: 0.05
+  lateral_range: 0.60
+  lateral_step: 0.10
+
+candidate_scoring:
+  w_clearance: 1.0
+  w_facing: 0.5
+  w_distance: 1.0
+  w_path: 0.75
+  clearance_saturation_m: 1.00
+
+post_grasp_transport:
+  enabled: true
+  # Base-relative Cartesian motion executed only before a required global
+  # navigation while holding an object.
+  lift_height: 0.10
+  retract_distance: 0.08
+  minimum_planar_radius: 0.35
+  # Readiness is based on achieved safety, not exact Cartesian convergence.
+  minimum_object_lift_m: 0.03
+  minimum_object_clearance_m: 0.03
+  maximum_transport_planar_radius: 0.70
+  lift_max_steps: 160
+  retract_max_steps: 160
+  translation_tolerance_m: 0.025
+  orientation_tolerance_deg: 12.0
+  max_translation_command: 0.12
+  max_rotation_command: 0.10
+  stable_steps: 5
+  hold_steps: 10
+  # Freeze the final carry pose with zero Cartesian increments. This avoids
+  # small closed-loop corrections caused by noisy pose observations.
+  hold_mode: zero_delta
+  hold_confirmation_steps: 2
+  drop_confirmation_steps: 2
+  # Temporarily skip the pre-atomic-task / pre-navigation transport-ready
+  # gate. Post-skill return still runs after a verified skill, and the held
+  # object guard remains active while the base is moving.
+  enforce_before_navigation: false
+
+post_place_retreat:
+  enabled: true
+  # A failed best-effort retreat must not invalidate a verified Place. It is
+  # retried only if the next atomic skill actually requires base navigation.
+  failure_policy: warn
+  # Executed immediately after a successful Place verifier. Keep the gripper
+  # open, lift away from the receptacle, then compact the arm toward the base.
+  lift_height: 0.10
+  retract_distance: 0.12
+  minimum_planar_radius: 0.35
+  minimum_eef_lift_m: 0.03
+  maximum_retreat_planar_radius: 0.72
+  lift_max_steps: 160
+  retract_max_steps: 180
+  translation_tolerance_m: 0.025
+  orientation_tolerance_deg: 12.0
+  max_translation_command: 0.12
+  max_rotation_command: 0.10
+  stable_steps: 5
+  hold_steps: 10
+  # Keep the open gripper and arm stationary after the retreat.
+  hold_mode: zero_delta
+
+# Unified handoff used after every verified manipulation skill. Each atomic
+# task maps to an explicit, fixed base-frame EEF position. Motion still goes
+# through the existing Cartesian controller; joints are never reset directly.
+# Pick keeps the gripper closed. Other completed skills return with it open.
+post_skill_return:
+  # Execute the return motion and retain diagnostics, but do not let its
+  # ready/failure result override an already verified atomic-task result.
+  enforce_result: false
+  enabled: true
+  # Compatibility policy used only when enforce_result is true.
+  failure_policy: block
+  # Every verified non-pick skill shares the exact PlaceObject return pose and
+  # motion settings. PickObject remains the only carry/closed-gripper preset.
+  default_preset: released
+  task_presets:
+    PickObject: carry
+    PlaceObject: released
+    PickPlaceObject: released
+    CoffeeServeMug: released
+    CoffeeSetupMug: released
+    PickPlaceCabinetToCounter: released
+    PickPlaceCounterToBlender: released
+    PickPlaceCounterToCabinet: released
+    PickPlaceCounterToDrawer: released
+    PickPlaceCounterToMicrowave: released
+    PickPlaceCounterToOven: released
+    PickPlaceCounterToSink: released
+    PickPlaceCounterToStandMixer: released
+    PickPlaceCounterToStove: released
+    PickPlaceCounterToToasterOven: released
+    PickPlaceDrawerToCounter: released
+    PickPlaceFridgeDrawerToShelf: released
+    PickPlaceFridgeShelfToDrawer: released
+    PickPlaceMicrowaveToCounter: released
+    PickPlaceSinkToCounter: released
+    PickPlaceStoveToCounter: released
+    PickPlaceToasterOvenToCounter: released
+    PickPlaceToasterToCounter: released
+    CloseBlenderLid: released
+    CloseCabinet: released
+    CloseDishwasher: released
+    CloseDrawer: released
+    CloseElectricKettleLid: released
+    CloseFridge: released
+    CloseFridgeDrawer: released
+    CloseMicrowave: released
+    CloseOven: released
+    CloseStandMixerHead: released
+    CloseToasterOvenDoor: released
+    OpenBlenderLid: released
+    OpenCabinet: released
+    OpenDishwasher: released
+    OpenDrawer: released
+    OpenElectricKettleLid: released
+    OpenFridge: released
+    OpenFridgeDrawer: released
+    OpenMicrowave: released
+    OpenOven: released
+    OpenStandMixerHead: released
+    OpenToasterOvenDoor: released
+    SlideDishwasherRack: released
+    SlideOvenRack: released
+    SlideToasterOvenRack: released
+    AdjustToasterOvenTemperature: released
+    AdjustWaterTemperature: released
+    PreheatOven: released
+    StartCoffeeMachine: released
+    TurnOffMicrowave: released
+    TurnOffSinkFaucet: released
+    TurnOffStove: released
+    TurnOnBlender: released
+    TurnOnElectricKettle: released
+    TurnOnMicrowave: released
+    TurnOnSinkFaucet: released
+    TurnOnStove: released
+    TurnOnToaster: released
+    TurnOnToasterOven: released
+    TurnSinkSpout: released
+    NavigateKitchen: released
+  # Smooth staged profile shared by every post-skill preset. Each return uses
+  # quintic Cartesian references and bounded action slew; fixed orientations
+  # are applied only after translation, while carry preserves grasp orientation.
+  presets:
+    carry:
+      # Median initial/home EEF pose from 511 official SteamInMicrowave human
+      # demonstrations. It is compact and high enough for base transport.
+      target_position: [0.2465, -0.0040, 0.5959]
+      # Preserve the grasp orientation while carrying; rotating a loaded bowl
+      # toward a global fixed quaternion causes unnecessary swing.
+      orientation_mode: preserve_skill_end
+      target_quaternion_xyzw: [-0.98954, -0.03339, -0.13870, 0.02138]
+      pre_lift_height: 0.10
+      pre_lift_minimum_z: 0.35
+      pre_lift_max_steps: 280
+      pre_lift_trajectory_steps: 60
+      return_max_steps: 480
+      return_translation_trajectory_steps: 120
+      return_orientation_trajectory_steps: 60
+      translation_tolerance_m: 0.025
+      orientation_tolerance_deg: 12.0
+      max_translation_command: 0.045
+      max_rotation_command: 0.035
+      # Limit the change between adjacent OSC actions; caps alone do not
+      # constrain acceleration or jerk.
+      max_translation_command_delta: 0.006
+      max_rotation_command_delta: 0.004
+      translation_gain: 3.0
+      rotation_gain: 1.5
+      stable_steps: 8
+      hold_steps: 20
+      hold_mode: zero_delta
+      hold_confirmation_steps: 2
+      drop_confirmation_steps: 2
+    released:
+      target_position: [0.2465, -0.0040, 0.5959]
+      orientation_mode: fixed
+      target_quaternion_xyzw: [-0.98954, -0.03339, -0.13870, 0.02138]
+      gripper_action: -1.0
+      pre_lift_height: 0.10
+      pre_lift_minimum_z: 0.35
+      pre_lift_max_steps: 280
+      pre_lift_trajectory_steps: 60
+      return_max_steps: 480
+      return_translation_trajectory_steps: 120
+      return_orientation_trajectory_steps: 60
+      translation_tolerance_m: 0.025
+      orientation_tolerance_deg: 12.0
+      max_translation_command: 0.045
+      max_rotation_command: 0.035
+      # Limit the change between adjacent OSC actions; caps alone do not
+      # constrain acceleration or jerk.
+      max_translation_command_delta: 0.006
+      max_rotation_command_delta: 0.004
+      translation_gain: 3.0
+      rotation_gain: 1.5
+      stable_steps: 8
+      hold_steps: 20
+      hold_mode: zero_delta
+    fixture_neutral:
+      target_position: [0.2465, -0.0040, 0.5959]
+      orientation_mode: fixed
+      target_quaternion_xyzw: [-0.98954, -0.03339, -0.13870, 0.02138]
+      gripper_action: -1.0
+      pre_lift_height: 0.08
+      pre_lift_minimum_z: 0.35
+      pre_lift_max_steps: 240
+      pre_lift_trajectory_steps: 60
+      return_max_steps: 440
+      return_translation_trajectory_steps: 120
+      return_orientation_trajectory_steps: 60
+      translation_tolerance_m: 0.03
+      orientation_tolerance_deg: 15.0
+      max_translation_command: 0.045
+      max_rotation_command: 0.035
+      # Limit the change between adjacent OSC actions; caps alone do not
+      # constrain acceleration or jerk.
+      max_translation_command_delta: 0.006
+      max_rotation_command_delta: 0.004
+      translation_gain: 3.0
+      rotation_gain: 1.5
+      stable_steps: 8
+      hold_steps: 20
+      hold_mode: zero_delta
+    control_neutral:
+      target_position: [0.2465, -0.0040, 0.5959]
+      orientation_mode: fixed
+      target_quaternion_xyzw: [-0.98954, -0.03339, -0.13870, 0.02138]
+      gripper_action: -1.0
+      pre_lift_height: 0.08
+      pre_lift_minimum_z: 0.35
+      pre_lift_max_steps: 240
+      pre_lift_trajectory_steps: 60
+      return_max_steps: 440
+      return_translation_trajectory_steps: 120
+      return_orientation_trajectory_steps: 60
+      translation_tolerance_m: 0.03
+      orientation_tolerance_deg: 15.0
+      max_translation_command: 0.045
+      max_rotation_command: 0.035
+      # Limit the change between adjacent OSC actions; caps alone do not
+      # constrain acceleration or jerk.
+      max_translation_command_delta: 0.006
+      max_rotation_command_delta: 0.004
+      translation_gain: 3.0
+      rotation_gain: 1.5
+      stable_steps: 8
+      hold_steps: 20
+      hold_mode: zero_delta
+    navigation_neutral:
+      target_position: [0.2465, -0.0040, 0.5959]
+      orientation_mode: fixed
+      target_quaternion_xyzw: [-0.98954, -0.03339, -0.13870, 0.02138]
+      gripper_action: -1.0
+      pre_lift_height: 0.08
+      pre_lift_minimum_z: 0.35
+      pre_lift_max_steps: 240
+      pre_lift_trajectory_steps: 60
+      return_max_steps: 440
+      return_translation_trajectory_steps: 120
+      return_orientation_trajectory_steps: 60
+      translation_tolerance_m: 0.03
+      orientation_tolerance_deg: 15.0
+      max_translation_command: 0.045
+      max_rotation_command: 0.035
+      # Limit the change between adjacent OSC actions; caps alone do not
+      # constrain acceleration or jerk.
+      max_translation_command_delta: 0.006
+      max_rotation_command_delta: 0.004
+      translation_gain: 3.0
+      rotation_gain: 1.5
+      stable_steps: 8
+      hold_steps: 20
+      hold_mode: zero_delta
+    neutral:
+      target_position: [0.2465, -0.0040, 0.5959]
+      orientation_mode: fixed
+      target_quaternion_xyzw: [-0.98954, -0.03339, -0.13870, 0.02138]
+      gripper_action: -1.0
+      pre_lift_height: 0.08
+      pre_lift_minimum_z: 0.35
+      pre_lift_max_steps: 240
+      pre_lift_trajectory_steps: 60
+      return_max_steps: 440
+      return_translation_trajectory_steps: 120
+      return_orientation_trajectory_steps: 60
+      translation_tolerance_m: 0.03
+      orientation_tolerance_deg: 15.0
+      max_translation_command: 0.045
+      max_rotation_command: 0.035
+      # Limit the change between adjacent OSC actions; caps alone do not
+      # constrain acceleration or jerk.
+      max_translation_command_delta: 0.006
+      max_rotation_command_delta: 0.004
+      translation_gain: 3.0
+      rotation_gain: 1.5
+      stable_steps: 8
+      hold_steps: 20
+      hold_mode: zero_delta
+
+navigation:
+  enabled: true
+  enable_local_refiner: true
+  local_refiner_failure_policy: use_coarse_pose
+  waypoint_position_tolerance: 0.12
+  final_position_tolerance: 0.08
+  # Same-order inner tolerance leaves 1 cm for settle drift before 8 cm acceptance.
+  controller_final_position_tolerance: 0.07
+  final_yaw_tolerance_deg: 10.0
+  max_waypoint_retries: 1
+  # Normalized base-action limits used only by Target-Aware Navigation.
+  # Keep larger step budgets when lowering these limits so long paths do not
+  # fail simply because the base is moving more gently.
+  waypoint_max_steps: 240
+  final_position_max_steps: 320
+  final_yaw_max_steps: 320
+  max_translation_command: 0.55
+  max_rotation_command: 0.35
+  skip_facing_cosine: 0.50
+  # Preserve navigation failures in diagnostics, but continue the atomic policy
+  # when conservative map/path planning cannot produce a collision-free route.
+  # Motion, object-drop, and transport-preparation failures remain blocking.
+  continue_policy_after_failure_reasons:
+    - START_IN_COLLISION
+    - GOAL_IN_COLLISION
+    - NO_VALID_WORK_POSE
+    - PATH_NOT_FOUND
+    - PATH_INVALIDATED_BY_SCENE_STATE
+  held_object_guard: true
+  # Keep the gripper closed while navigating with a latched object. Drop
+  # detection still terminates navigation through OBJECT_DROPPED.
+  held_object_guard_action_override: true
+  hold_confirmation_steps: 2
+  drop_confirmation_steps: 2

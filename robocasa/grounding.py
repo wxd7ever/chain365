@@ -41,9 +41,14 @@ class GroundingResult:
     status: str
     target_entity_alias: str | None = None
     target_entity_kind: str | None = None
+    entity_role: str | None = None
     target_fixture_alias: str | None = None
     reference_object_alias: str | None = None
     held_object_alias: str | None = None
+    holding_source_object: bool | None = None
+    source_object_alias: str | None = None
+    destination_entity_alias: str | None = None
+    destination_role: str | None = None
     target_mode: str | None = None
     reason: str = ""
     evidence: tuple[dict[str, Any], ...] = field(default_factory=tuple)
@@ -680,6 +685,7 @@ class RoboCasaGrounder:
                 }
             )
         prompt = f"Navigate to the {fixture_name}."
+
         if work_pose_mode == "standard_pick" and reference_object:
             prompt = (
                 f"Navigate to the {fixture_name} and align the mobile base at the "
@@ -687,11 +693,10 @@ class RoboCasaGrounder:
                 f"{clean_entity_name(str(reference_object))}. Face the object and stop "
                 "at the requested work pose."
             )
+
         if held_object:
-            prompt = (
-                f"While keeping hold of {clean_entity_name(str(held_object))}, "
-                f"navigate to the {fixture_name}."
-            )
+            arguments["held_object_id"] = str(held_object)
+
         navigation_metadata = {
             "inserted_by": "scheduler_grounding",
             "for_subgoal_id": operation.subgoal_id,

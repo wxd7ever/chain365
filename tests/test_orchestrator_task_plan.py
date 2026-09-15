@@ -129,8 +129,8 @@ class Grounder:
         }
 
 
-def grounding(grounded, *, fixture="sink_main_group", status=None):
-    return {
+def grounding(grounded, *, fixture="sink_main_group", status=None, **extra):
+    result = {
         "grounded": grounded,
         "status": status or ("grounded" if grounded else "navigation_required"),
         "target_fixture_alias": fixture,
@@ -138,6 +138,37 @@ def grounding(grounded, *, fixture="sink_main_group", status=None):
         "target_entity_kind": "object",
         "target_mode": "operation_object_current_location",
         "evidence": [],
+    }
+    result.update(extra)
+    return result
+
+
+def pick_object_call():
+    return {
+        "subgoal_id": "pick_vegetable",
+        "atomic_task": "PickObject",
+        "policy_prompt": "Pick up the vegetable and keep holding it.",
+        "arguments": {"object_id": "vegetable"},
+        "termination_condition": {
+            "predicate": "holding",
+            "subject": "vegetable",
+            "desired_value": True,
+        },
+    }
+
+
+def place_object_call():
+    return {
+        "subgoal_id": "place_vegetable_in_bowl",
+        "atomic_task": "PlaceObject",
+        "policy_prompt": "Put the vegetable in the bowl.",
+        "arguments": {"object_id": "vegetable", "destination_id": "bowl"},
+        "termination_condition": {
+            "predicate": "inside",
+            "subject": "vegetable",
+            "object": "bowl",
+            "desired_value": True,
+        },
     }
 
 
@@ -157,6 +188,39 @@ def test_grounded_operation_does_not_insert_navigation():
     assert result["num_inserted_navigation_steps"] == 0
     assert adapter.atomic_tasks == ["PickPlaceCounterToSink"]
     assert grounder.num_ground_calls == 1
+
+
+def test_target_aware_adapter_receives_grounding_decision():
+    class TargetAwareAdapter(Adapter):
+        handles_target_aware_navigation = True
+
+        def __init__(self):
+            super().__init__([True])
+            self.scheduler_queries = []
+
+        def execute(self, *, env, scheduler_query, episode_id):
+            self.scheduler_queries.append(dict(scheduler_query))
+            return super().execute(
+                env=env,
+                scheduler_query=scheduler_query,
+                episode_id=episode_id,
+            )
+
+    adapter = TargetAwareAdapter()
+    grounder = Grounder([grounding(False)])
+    result = RoboCasaOrchestrator(
+        atomic_task_policy_adapter=adapter,
+        grounder=grounder,
+    ).run_task_plan(
+        env=object(),
+        task_plan=[call("g1", "PickPlaceCounterToSink")],
+        episode_id=0,
+    )
+
+    assert result["success"] is True
+    assert result["num_inserted_navigation_steps"] == 0
+    assert adapter.scheduler_queries[0]["grounding_result"]["grounded"] is False
+    assert adapter.scheduler_queries[0]["grounding_result"]["status"] == "navigation_required"
 
 
 def test_scheduler_inserts_navigation_then_regrounds_before_operation():
@@ -199,3 +263,291 @@ def test_operation_is_blocked_when_regrounding_after_navigation_fails():
         "GROUNDING_FAILED_AFTER_NAVIGATION"
     )
     assert adapter.atomic_tasks == ["NavigateKitchen"]
+
+
+def test_place_uses_pick_handoff_and_grounding_only_controls_navigation():
+    adapter = Adapter([True, True, True])
+    grounder = Grounder(
+        [
+            grounding(True, holding_source_object=False),
+            grounding(
+                False,
+                fixture="counter_right_main_group",
+                status="navigation_required",
+                holding_source_object=False,
+                target_entity_alias="bowl",
+                entity_role="object_receptacle",
+                destination_entity_alias="bowl",
+            ),
+            grounding(
+                True,
+                fixture="counter_right_main_group",
+                holding_source_object=False,
+                target_entity_alias="bowl",
+                entity_role="object_receptacle",
+                destination_entity_alias="bowl",
+            ),
+        ]
+    )
+    result = RoboCasaOrchestrator(
+        atomic_task_policy_adapter=adapter,
+        grounder=grounder,
+    ).run_task_plan(
+        env=object(),
+        task_plan=[pick_object_call(), place_object_call()],
+        episode_id=0,
+        max_task_retries=1,
+    )
+
+    assert result["success"] is True
+    assert adapter.atomic_tasks == ["PickObject", "NavigateKitchen", "PlaceObject"]
+    assert result["num_atomic_attempts"] == 3
+    assert result["num_inserted_navigation_steps"] == 1
+    assert result["transition_events"] == []
+    assert result["recovery_events"] == []
+    place_groundings = result["grounding_events"][1:]
+    assert [item["status"] for item in place_groundings] == [
+        "navigation_required",
+        "grounded",
+    ]
+    assert all(
+        item["scheduler_handoff"]["holding_object_alias"] == "vegetable"
+        for item in place_groundings
+    )
+
+class ScriptedAdapter:
+    def __init__(self, outcomes):
+        self.outcomes = iter(outcomes)
+        self.atomic_tasks = []
+
+    def execute(self, *, env, scheduler_query, episode_id):
+        atomic_call = scheduler_query["atomic_task_call"]
+        self.atomic_tasks.append(atomic_call["atomic_task"])
+        outcome_value = dict(next(self.outcomes))
+        success = bool(outcome_value.get("success", False))
+        failure_code = outcome_value.get("failure_code")
+        return {
+            "subgoal_id": atomic_call["subgoal_id"],
+            "atomic_task": atomic_call["atomic_task"],
+            "status": "success" if success else "failed",
+            "success": success,
+            "verifier_result": {
+                "retryable": bool(outcome_value.get("retryable", not success)),
+                "failure_code": failure_code,
+            },
+        }
+
+
+def outcome(success, failure_code=None):
+    return {
+        "success": success,
+        "failure_code": failure_code,
+        "retryable": not success,
+    }
+
+
+def test_same_skill_mode_preserves_legacy_place_retry_after_drop():
+    adapter = ScriptedAdapter(
+        [
+            outcome(True),
+            outcome(False, "OBJECT_DROPPED"),
+            outcome(True),
+        ]
+    )
+    grounder = Grounder([grounding(True), grounding(True)])
+    result = RoboCasaOrchestrator(
+        atomic_task_policy_adapter=adapter,
+        grounder=grounder,
+    ).run_task_plan(
+        env=object(),
+        task_plan=[pick_object_call(), place_object_call()],
+        episode_id=0,
+        max_task_retries=1,
+        retry_recovery_mode="same_skill",
+    )
+
+    assert result["success"] is True
+    assert result["retry_recovery_mode"] == "same_skill"
+    assert result["num_dependency_recoveries"] == 0
+    assert adapter.atomic_tasks == ["PickObject", "PlaceObject", "PlaceObject"]
+    assert result["recovery_events"] == []
+
+
+def test_dependency_recovery_regrabs_and_restarts_navigation_after_drop():
+    adapter = ScriptedAdapter(
+        [
+            outcome(True),
+            outcome(False, "OBJECT_DROPPED"),
+            outcome(True),
+            outcome(True),
+            outcome(True),
+        ]
+    )
+    grounder = Grounder(
+        [
+            grounding(True),
+            grounding(False, fixture="counter_right_main_group"),
+            grounding(False, fixture="counter_right_main_group"),
+            grounding(True, fixture="counter_right_main_group"),
+        ]
+    )
+    result = RoboCasaOrchestrator(
+        atomic_task_policy_adapter=adapter,
+        grounder=grounder,
+    ).run_task_plan(
+        env=object(),
+        task_plan=[pick_object_call(), place_object_call()],
+        episode_id=0,
+        max_task_retries=1,
+        retry_recovery_mode="dependency_recovery",
+    )
+
+    assert result["success"] is True
+    assert result["retry_recovery_mode"] == "dependency_recovery"
+    assert result["num_dependency_recoveries"] == 1
+    assert adapter.atomic_tasks == [
+        "PickObject",
+        "NavigateKitchen",
+        "PickObject",
+        "NavigateKitchen",
+        "PlaceObject",
+    ]
+    assert len(result["recovery_events"]) == 1
+    assert result["recovery_events"][0]["recovery_phase"] == "navigation"
+    assert result["recovery_events"][0]["trigger_failure_code"] == "OBJECT_DROPPED"
+    assert any(
+        event["type"] == "HOLDING_DEPENDENCY_INVALIDATED"
+        for event in result["transition_events"]
+    )
+
+
+def test_dependency_recovery_regrabs_and_regrounds_after_place_drop():
+    adapter = ScriptedAdapter(
+        [
+            outcome(True),
+            outcome(False, "OBJECT_DROPPED"),
+            outcome(True),
+            outcome(True),
+            outcome(True),
+        ]
+    )
+    grounder = Grounder(
+        [
+            grounding(True),
+            grounding(True, fixture="counter_right_main_group"),
+            grounding(False, fixture="counter_right_main_group"),
+            grounding(True, fixture="counter_right_main_group"),
+        ]
+    )
+    result = RoboCasaOrchestrator(
+        atomic_task_policy_adapter=adapter,
+        grounder=grounder,
+    ).run_task_plan(
+        env=object(),
+        task_plan=[pick_object_call(), place_object_call()],
+        episode_id=0,
+        max_task_retries=1,
+        retry_recovery_mode="dependency_recovery",
+    )
+
+    assert result["success"] is True
+    assert result["num_dependency_recoveries"] == 1
+    assert adapter.atomic_tasks == [
+        "PickObject",
+        "PlaceObject",
+        "PickObject",
+        "NavigateKitchen",
+        "PlaceObject",
+    ]
+    assert result["recovery_events"][0]["recovery_phase"] == "operation"
+    assert [
+        item["phase"] for item in result["grounding_events"]
+    ] == [
+        "before_operation",
+        "before_operation",
+        "after_drop_recovery",
+        "after_inserted_navigation",
+    ]
+
+
+def test_dependency_recovery_preserves_post_grasp_drop_failure_code():
+    adapter = ScriptedAdapter(
+        [
+            outcome(True),
+            outcome(False, "OBJECT_DROPPED_DURING_PREP"),
+            outcome(True),
+            outcome(True),
+            outcome(True),
+        ]
+    )
+    grounder = Grounder(
+        [
+            grounding(True),
+            grounding(False, fixture="counter_right_main_group"),
+            grounding(False, fixture="counter_right_main_group"),
+            grounding(True, fixture="counter_right_main_group"),
+        ]
+    )
+    result = RoboCasaOrchestrator(
+        atomic_task_policy_adapter=adapter,
+        grounder=grounder,
+    ).run_task_plan(
+        env=object(),
+        task_plan=[pick_object_call(), place_object_call()],
+        episode_id=0,
+        max_task_retries=1,
+        retry_recovery_mode="dependency_recovery",
+    )
+
+    assert result["success"] is True
+    assert result["num_dependency_recoveries"] == 1
+    assert result["recovery_events"][0]["trigger_failure_code"] == (
+        "OBJECT_DROPPED_DURING_PREP"
+    )
+    assert adapter.atomic_tasks == [
+        "PickObject",
+        "NavigateKitchen",
+        "PickObject",
+        "NavigateKitchen",
+        "PlaceObject",
+    ]
+
+
+def test_retry_recovery_mode_is_validated():
+    try:
+        RoboCasaOrchestrator(
+            atomic_task_policy_adapter=Adapter([True])
+        ).run_task_plan(
+            env=object(),
+            task_plan=[call("g1", "OpenMicrowave")],
+            episode_id=0,
+            retry_recovery_mode="unknown",
+        )
+    except ValueError as exc:
+        assert "retry_recovery_mode" in str(exc)
+    else:
+        raise AssertionError("invalid retry recovery mode should fail")
+
+def test_dependency_mode_keeps_same_skill_retry_for_pick_failure():
+    adapter = ScriptedAdapter(
+        [
+            outcome(False, "OBJECT_DROPPED"),
+            outcome(True),
+        ]
+    )
+    grounder = Grounder([grounding(True)])
+    result = RoboCasaOrchestrator(
+        atomic_task_policy_adapter=adapter,
+        grounder=grounder,
+    ).run_task_plan(
+        env=object(),
+        task_plan=[pick_object_call()],
+        episode_id=0,
+        max_task_retries=1,
+        retry_recovery_mode="dependency_recovery",
+    )
+
+    assert result["success"] is True
+    assert adapter.atomic_tasks == ["PickObject", "PickObject"]
+    assert result["num_dependency_recoveries"] == 0
+    assert result["recovery_events"] == []

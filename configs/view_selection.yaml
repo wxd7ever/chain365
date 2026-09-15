@@ -1,0 +1,99 @@
+default:
+  critic:
+    - robot0_agentview_right
+    - robot0_frontview
+  grounding:
+    - robot0_frontview
+    - robot0_agentview_left
+    - robot0_agentview_right
+  holding_verification:
+    - robot0_eye_in_hand
+    - robot0_agentview_left
+    - robot0_agentview_right
+    - robot0_frontview
+  placement_verification:
+    - robot0_agentview_right
+    - robot0_frontview
+  navigation_verification:
+    - robot0_frontview
+    - robot0_agentview_left
+  verification:
+    - robot0_agentview_right
+    - robot0_frontview
+  work_pose_refinement:
+    - robot0_topview
+    - robot0_frontview
+    - robot0_agentview_left
+    - robot0_agentview_right
+    - robot0_eye_in_hand
+
+PickObject:
+  critic:
+    - robot0_eye_in_hand
+    - robot0_agentview_left
+    - robot0_agentview_right
+  grounding:
+    - robot0_eye_in_hand
+    - robot0_topview
+  holding_verification:
+    - robot0_eye_in_hand
+    - robot0_agentview_left
+    - robot0_agentview_right
+    - robot0_frontview
+  work_pose_refinement:
+    - robot0_topview
+    - robot0_frontview
+    - robot0_eye_in_hand
+
+PlaceObject:
+  critic:
+    - robot0_eye_in_hand
+    - robot0_agentview_right
+  grounding:
+    - robot0_agentview_right
+    - robot0_frontview
+  placement_verification:
+    - robot0_agentview_right
+    - robot0_frontview
+  work_pose_refinement:
+    - robot0_topview
+    - robot0_frontview
+    - robot0_agentview_right
+
+NavigateKitchen:
+  critic:
+    - robot0_frontview
+    - robot0_agentview_left
+  navigation_verification:
+    - robot0_frontview
+    - robot0_agentview_left
+
+CloseObject:
+  verification:
+    - robot0_agentview_right
+    - robot0_frontview
+
+OpenObject:
+  verification:
+    - robot0_agentview_right
+    - robot0_frontview
+
+CloseMicrowave:
+  verification:
+    - robot0_agentview_right
+    - robot0_frontview
+
+OpenMicrowave:
+  verification:
+    - robot0_agentview_right
+    - robot0_frontview
+
+PressButton:
+  verification:
+    - robot0_eye_in_hand
+    - robot0_frontview
+
+TurnOnMicrowave:
+  verification:
+    - robot0_eye_in_hand
+    - robot0_frontview

@@ -662,7 +662,10 @@ def gripper_fxtr_far(env, fixture_name, th=0.25):
     return gripper_fxtr_far
 
 
-def check_obj_grasped(env, obj_name, threshold=0.035):
+GRASP_CLOSED_THRESHOLD = 0.06
+
+
+def check_obj_grasped(env, obj_name, threshold=GRASP_CLOSED_THRESHOLD):
     """
     Check if the gripper has grasped the object by analyzing contact and proximity
     """

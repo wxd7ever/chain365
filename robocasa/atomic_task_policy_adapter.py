@@ -33,9 +33,11 @@ class RemoteAtomicTaskPolicyAdapter:
         base_action_mode: str = "residual",
         base_residual_limit: float = 0.15,
         held_object_guard: bool = True,
+        held_object_guard_action_override: bool = True,
         held_object_hold_confirmation_steps: int = 2,
         held_object_drop_confirmation_steps: int = 2,
         success_handoff_steps: int = 30,
+        verification_mode: str | None = None,
         render: bool = True,
         video_skip: int = 2,
     ):
@@ -61,6 +63,9 @@ class RemoteAtomicTaskPolicyAdapter:
         self.base_action_mode = base_action_mode
         self.base_residual_limit = base_residual_limit
         self.held_object_guard = bool(held_object_guard)
+        self.held_object_guard_action_override = bool(
+            held_object_guard_action_override
+        )
         self.held_object_hold_confirmation_steps = int(
             held_object_hold_confirmation_steps
         )
@@ -68,6 +73,7 @@ class RemoteAtomicTaskPolicyAdapter:
             held_object_drop_confirmation_steps
         )
         self.success_handoff_steps = int(success_handoff_steps)
+        self.verification_mode = verification_mode
         self.render = render
         self.video_skip = video_skip
 
@@ -122,6 +128,9 @@ class RemoteAtomicTaskPolicyAdapter:
             base_action_mode=self.base_action_mode,
             base_residual_limit=self.base_residual_limit,
             held_object_guard=self.held_object_guard,
+            held_object_guard_action_override=(
+                self.held_object_guard_action_override
+            ),
             held_object_hold_confirmation_steps=(
                 self.held_object_hold_confirmation_steps
             ),
@@ -129,6 +138,7 @@ class RemoteAtomicTaskPolicyAdapter:
                 self.held_object_drop_confirmation_steps
             ),
             success_handoff_steps=self.success_handoff_steps,
+            verification_mode=self.verification_mode,
         )
         rollout_logs["Configured_Horizon"] = int(configured_horizon)
         rollout_logs["Horizon_Source"] = horizon_source

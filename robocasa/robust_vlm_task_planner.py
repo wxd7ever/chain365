@@ -7,10 +7,12 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 try:
+    from .atomic_task_prompt_builder import build_atomic_task_prompt
     from .atomic_task_schemas import AtomicTaskCall
     from .skill_contract_registry import apply_skill_contract
     from .vlm_task_planner import OpenAICompatibleVLMPlanner
 except ImportError:
+    from atomic_task_prompt_builder import build_atomic_task_prompt
     from atomic_task_schemas import AtomicTaskCall
     from skill_contract_registry import apply_skill_contract
     from vlm_task_planner import OpenAICompatibleVLMPlanner
@@ -343,9 +345,34 @@ def _split_pick_place_calls(
 
     expanded: list[AtomicTaskCall] = []
     changes: list[dict[str, Any]] = []
+    known_held_object: str | None = None
     for call in calls:
         if not call.atomic_task.startswith("PickPlace"):
             expanded.append(call)
+            value = call.to_dict()
+            raw_conditions = value["termination_condition"]
+            conditions = (
+                raw_conditions
+                if isinstance(raw_conditions, list)
+                else [raw_conditions]
+            )
+            if call.atomic_task == "PickObject":
+                holding = next(
+                    (
+                        item
+                        for item in conditions
+                        if str(item.get("predicate", "")).lower() == "holding"
+                        and item.get("desired_value") is True
+                    ),
+                    None,
+                )
+                known_held_object = str(
+                    (holding or {}).get("subject")
+                    or value["arguments"].get("object_id")
+                    or ""
+                ).strip() or None
+            elif call.atomic_task == "PlaceObject":
+                known_held_object = None
             continue
         value = call.to_dict()
         raw_conditions = value["termination_condition"]
@@ -382,9 +409,16 @@ def _split_pick_place_calls(
         )
         explicit_mode = str(metadata.get("pick_place_split_mode", ""))
         pick_only = explicit_mode == "pick" or (relation is None and holding is not None)
-        place_only = explicit_mode == "place" or str(
-            metadata.get("policy_proxy", "")
-        ).startswith("held_object")
+        reuse_prior_pick = bool(
+            relation is not None
+            and not pick_only
+            and known_held_object == object_id
+        )
+        place_only = (
+            explicit_mode == "place"
+            or str(metadata.get("policy_proxy", "")).startswith("held_object")
+            or reuse_prior_pick
+        )
         generated: list[AtomicTaskCall] = []
         if not place_only:
             pick_metadata = dict(metadata)
@@ -410,8 +444,8 @@ def _split_pick_place_calls(
                         "subgoal_id": unique_id(f"{call.subgoal_id}_pick"),
                         "atomic_task": "PickObject",
                         "policy_prompt": (
-                            f"Pick up the {object_name} from the {pick_arguments['source_name']}, "
-                            "lift it clear, retract to a stable carrying pose, and keep holding it."
+                            f"Pick up the {object_name} from the "
+                            f"{pick_arguments['source_name']}."
                         ),
                         "arguments": pick_arguments,
                         "termination_condition": {
@@ -446,8 +480,7 @@ def _split_pick_place_calls(
                         "subgoal_id": unique_id(f"{call.subgoal_id}_place"),
                         "atomic_task": "PlaceObject",
                         "policy_prompt": (
-                            f"Place the held {object_name} {preposition} the {destination_name}, "
-                            "release it, and move the gripper away."
+                            f"Place the {object_name} {preposition} the {destination_name}."
                         ),
                         "arguments": {
                             "held_object_id": object_id,
@@ -463,6 +496,19 @@ def _split_pick_place_calls(
                 )
             )
         expanded.extend(generated)
+        if reuse_prior_pick:
+            changes.append(
+                {
+                    "type": "reuse_prior_pick_for_place",
+                    "subgoal_id": call.subgoal_id,
+                    "object_id": object_id,
+                    "reason": "preceding plan already establishes holding(object)",
+                }
+            )
+        if any(item.atomic_task == "PlaceObject" for item in generated):
+            known_held_object = None
+        elif any(item.atomic_task == "PickObject" for item in generated):
+            known_held_object = object_id
         changes.append(
             {
                 "type": "split_pick_place",
@@ -892,6 +938,20 @@ def _normalize_execution_plan(
         enriched_call, contract_changes = apply_skill_contract(
             call, scene_context=scene_context
         )
+        if enriched_call.atomic_task in {"PickObject", "PlaceObject"}:
+            simplified_prompt = build_atomic_task_prompt(enriched_call)
+            if simplified_prompt != enriched_call.policy_prompt:
+                value = enriched_call.to_dict()
+                value["policy_prompt"] = simplified_prompt
+                enriched_call = AtomicTaskCall.from_mapping(value)
+                changes.append(
+                    {
+                        "type": "simplify_pick_place_policy_prompt",
+                        "subgoal_id": enriched_call.subgoal_id,
+                        "atomic_task": enriched_call.atomic_task,
+                        "policy_prompt": simplified_prompt,
+                    }
+                )
         contracted.append(enriched_call)
         changes.extend(contract_changes)
     return contracted, changes
@@ -947,6 +1007,7 @@ class RobustOpenAICompatibleVLMPlanner(OpenAICompatibleVLMPlanner):
             + "\nSTRICT OUTPUT RULES:\n"
             "- termination_condition MUST be a JSON object or a list of JSON objects, "
             "never a sentence or string.\n"
+            "- subgoal_id MUST be a unique non-empty JSON string, never a number.\n"
             "- Each condition object MUST contain predicate, subject, and desired_value. "
             "Use object for a destination relation such as inside/on.\n"
             "- arguments MUST be a JSON object even when empty.\n"
