@@ -346,6 +346,10 @@ post_skill_return:
 
 navigation:
   enabled: true
+  # Persist every target-aware navigation decision, including skipped and
+  # failed plans, under the episode run directory for visual inspection.
+  save_debug_artifacts: true
+  debug_artifact_subdir: navigation_planning
   enable_local_refiner: false
   local_refiner_failure_policy: use_coarse_pose
   waypoint_position_tolerance: 0.12

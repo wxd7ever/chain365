@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Any, Mapping
 
 from robocasa.atomic_task_schemas import AtomicTaskCall
+from robocasa.navigation.debug_artifacts import save_navigation_plan_artifacts
 from robocasa.post_grasp_transport import (
     PostGraspTransportController,
     resolve_object_alias,
@@ -65,6 +67,7 @@ def _navigation_summary(result: Mapping[str, Any]) -> dict[str, Any]:
             "skipped",
             "raw_candidate_count",
             "valid_candidate_count",
+            "artifacts",
         )
     } | {"execution": execution_summary}
 
@@ -160,6 +163,15 @@ class TargetAwarePolicyAdapter:
             for reason in fail_open_reasons
             if str(reason).strip()
         )
+        self.navigation_artifacts_enabled = bool(
+            navigation_config.get("save_debug_artifacts", False)
+        )
+        self.navigation_artifact_subdir = str(
+            navigation_config.get(
+                "debug_artifact_subdir", "navigation_planning"
+            )
+        ).strip() or "navigation_planning"
+        self._navigation_artifact_index = 0
         transport_config = (
             pipeline_config.get("post_grasp_transport", {})
             if isinstance(pipeline_config, Mapping)
@@ -254,6 +266,43 @@ class TargetAwarePolicyAdapter:
     @property
     def log_dir(self) -> Any:
         return getattr(self.policy_adapter, "log_dir", None)
+
+    def _save_navigation_artifacts(
+        self,
+        *,
+        call: AtomicTaskCall,
+        navigation_result: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        if not self.navigation_artifacts_enabled:
+            return None
+        log_dir = self.log_dir
+        if log_dir is None:
+            return {"saved": False, "error": "policy adapter has no log_dir"}
+        self._navigation_artifact_index += 1
+        try:
+            saved = save_navigation_plan_artifacts(
+                output_root=Path(log_dir) / self.navigation_artifact_subdir,
+                artifact_index=self._navigation_artifact_index,
+                subgoal_id=call.subgoal_id,
+                pipeline=self.navigation_pipeline,
+                navigation_result=navigation_result,
+            )
+            saved["saved"] = True
+            print(
+                "[NavigationArtifacts] {} reason={} directory={}".format(
+                    call.subgoal_id,
+                    navigation_result.get("reason"),
+                    saved["directory"],
+                )
+            )
+            return saved
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            print(
+                "[NavigationArtifacts] {} save failed: {}".format(
+                    call.subgoal_id, exc
+                )
+            )
+            return {"saved": False, "error": str(exc)}
 
     @staticmethod
     def _failure_result(
@@ -357,6 +406,7 @@ class TargetAwarePolicyAdapter:
             "navigation_reason": "DISABLED" if not self.navigation_enabled else None,
             "navigation_bypassed": False,
             "navigation_warning": None,
+            "navigation_artifacts": None,
             "post_grasp_transport_enabled": self.post_grasp_transport_enabled,
             "post_grasp_transport_required": False,
             "post_grasp_transport_success": None,
@@ -381,6 +431,7 @@ class TargetAwarePolicyAdapter:
             "post_skill_return_warning": None,
         }
         navigation_result = None
+        navigation_value = None
         if self.navigation_enabled:
             navigation_context = dict(self.context)
             grounding_result = scheduler_query.get("grounding_result")
@@ -494,6 +545,13 @@ class TargetAwarePolicyAdapter:
                 before_navigation=before_navigation,
             )
             navigation_value = navigation_result.to_dict()
+            navigation_artifacts = self._save_navigation_artifacts(
+                call=call,
+                navigation_result=navigation_value,
+            )
+            if navigation_artifacts is not None:
+                navigation_value["artifacts"] = navigation_artifacts
+                stage["navigation_artifacts"] = navigation_artifacts
             if grasp_preparation_holder:
                 stage["post_grasp_transport_required"] = True
                 stage["post_grasp_transport_success"] = bool(
@@ -851,11 +909,7 @@ class TargetAwarePolicyAdapter:
                         )
                         failure["completed_place_result"] = policy_result
                         failure["post_place_retreat_result"] = retreat
-                        failure["navigation_result"] = (
-                            navigation_result.to_dict()
-                            if navigation_result is not None
-                            else None
-                        )
+                        failure["navigation_result"] = navigation_value
                         print(
                             "[AtomicSkill] {} post_place=FAILED reason={} "
                             "next_skill_blocked=True".format(
@@ -877,11 +931,7 @@ class TargetAwarePolicyAdapter:
                         self._pending_post_grasp = None
         stage["final_base_pose"] = current_base_pose(env)
         policy_result["target_aware_stage"] = stage
-        policy_result["navigation_result"] = (
-            navigation_result.to_dict()
-            if navigation_result is not None
-            else None
-        )
+        policy_result["navigation_result"] = navigation_value
         if self.local_refiner_enabled:
             policy_result["local_pose_refinement_result"] = refinement
         self.stage_results.append(stage)

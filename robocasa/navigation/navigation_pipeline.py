@@ -379,6 +379,9 @@ class TargetAwareNavigationPipeline:
     ) -> NavigationResult:
         call = coerce_atomic_call(skill)
         context = dict(context or {})
+        # Avoid accidentally saving a prior call's map when target resolution
+        # fails before the current occupancy map can be constructed.
+        self.last_debug = {}
         try:
             resolved_target = self.target_resolver.resolve(env, call, target)
         except LookupError as exc:
