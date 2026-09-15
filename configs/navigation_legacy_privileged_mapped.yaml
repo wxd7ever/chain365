@@ -21,14 +21,14 @@ map:
   debug_articulated_map: false
 
 robot:
-  # Planning-only footprint, deliberately about 10% smaller than the physical
-  # Omron collision box for end-to-end compatibility runs. The simulator's
-  # real collision geometry is unchanged.
-  half_length: 0.32
-  half_width: 0.23
-  # Retained as the legacy fallback for external callers.
-  radius: 0.4301162634
-  safety_margin: 0.005
+  # Planning-only footprint, deliberately reduced to half of the preceding
+  # compatibility footprint for pipeline-throughput experiments. This is a
+  # collision-risky under-approximation; MuJoCo's real geometry is unchanged.
+  half_length: 0.16
+  half_width: 0.115
+  # Retained as the matching half-scale fallback for external callers.
+  radius: 0.2150581317
+  safety_margin: 0.0025
   # Collision-box center relative to the mobile-base control origin.
   # Read from robosuite's omron_mobile_base.xml (wheeled_base pos=-0.20 0 0.192).
   footprint_center_offset_xy: [-0.20, 0.0]

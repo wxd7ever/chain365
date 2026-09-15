@@ -1003,9 +1003,10 @@ def test_steam_in_microwave_4_mapped_navigation_profile_is_isolated(monkeypatch)
     assert args.pi05_held_object_guard_grasp_threshold == 0.05
     assert args.pi05_held_object_drop_stops_rollout is True
     assert navigation["map"]["resolution"] == 0.025
-    assert navigation["robot"]["half_length"] == 0.32
-    assert navigation["robot"]["half_width"] == 0.23
-    assert navigation["robot"]["safety_margin"] == 0.005
+    assert navigation["robot"]["half_length"] == 0.16
+    assert navigation["robot"]["half_width"] == 0.115
+    assert navigation["robot"]["radius"] == 0.2150581317
+    assert navigation["robot"]["safety_margin"] == 0.0025
     assert navigation["navigation"]["enabled"] is True
     assert navigation["navigation"]["enable_local_refiner"] is False
     assert navigation["post_grasp_transport"]["enabled"] is False
