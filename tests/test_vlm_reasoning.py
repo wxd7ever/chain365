@@ -9,6 +9,7 @@ import numpy as np
 from robocasa.atomic_task_schemas import AtomicTaskCall
 from robocasa.eval_vlm_pi05 import parse_args
 from robocasa.local_work_pose_refiner import OpenAICompatibleLocalPoseVLM
+from robocasa.navigation.navigation_pipeline import load_navigation_config
 from robocasa.multi_view_perception import (
     DEFAULT_REASONING_CAMERA_NAMES,
     MultiViewObservationProvider,
@@ -960,6 +961,52 @@ def test_simulator_mode_keeps_baseline_verification_frequency(monkeypatch):
     assert args.verification_mode == "skill_end"
     assert args.pi05_verify_interval == 5
     assert args.pi05_min_steps_before_verify == 10
+
+
+def test_steam_in_microwave_4_mapped_navigation_profile_is_isolated(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval_vlm_pi05.py",
+            "--long_horizon_task",
+            "pick and heat the vegetable",
+            "--plan_only",
+            "--no_env",
+            "--system_profile",
+            "steam_in_microwave_4_mapped_navigation",
+            "--verification_mode",
+            "skill_end",
+            "--pi05_atomic_task_horizon",
+            "100",
+        ],
+    )
+
+    args = parse_args()
+    navigation = load_navigation_config(args.navigation_config)
+
+    assert args.reasoning_mode == "simulator"
+    assert args.verification_mode == "periodic"
+    assert args.pi05_verify_interval == 5
+    assert args.pi05_min_steps_before_verify == 10
+    assert args.pi05_atomic_task_horizon == 600
+    assert args.pi05_success_handoff_steps == 30
+    assert args.pi05_task_retries == 3
+    assert args.retry_recovery_mode == "dependency_recovery"
+    assert args.pi05_base_action_mode == "full"
+    assert args.atomic_prompt_style == "legacy_handoff"
+    assert args.target_aware_navigation is True
+    assert args.enable_local_refiner is False
+    assert args.simulator_grounding_position_threshold_m == 0.7
+    assert args.simulator_grounding_orientation_cosine_threshold == 0.5
+    assert args.simulator_verifier_holding_threshold == 0.035
+    assert args.pi05_held_object_guard_grasp_threshold == 0.05
+    assert args.pi05_held_object_drop_stops_rollout is True
+    assert navigation["navigation"]["enabled"] is True
+    assert navigation["navigation"]["enable_local_refiner"] is False
+    assert navigation["post_grasp_transport"]["enabled"] is False
+    assert navigation["post_place_retreat"]["enabled"] is False
+    assert navigation["post_skill_return"]["enabled"] is False
 
 
 def test_periodic_verification_mode_remains_available(monkeypatch):

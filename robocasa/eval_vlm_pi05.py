@@ -79,6 +79,12 @@ except ImportError:  # Support ``python robocasa/eval_vlm_pi05.py``.
 
 
 THIS_DIR = Path(__file__).resolve().parent
+LEGACY_PRIVILEGED_MAPPED_NAVIGATION_CONFIG = (
+    DEFAULT_NAVIGATION_CONFIG.with_name(
+        "navigation_legacy_privileged_mapped.yaml"
+    )
+)
+LEGACY_PRIVILEGED_MAPPED_PROFILE = "steam_in_microwave_4_mapped_navigation"
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,6 +95,16 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--env_name", default="PickPlaceCounterToMicrowave")
+    parser.add_argument(
+        "--system_profile",
+        choices=("current", LEGACY_PRIVILEGED_MAPPED_PROFILE),
+        default="current",
+        help=(
+            "Select current behavior or reproduce the privileged "
+            "SteamInMicrowave_4 runtime while replacing only navigation with "
+            "occupancy-map candidate planning and A* execution."
+        ),
+    )
     parser.add_argument("--layout_id", type=int, default=1)
     parser.add_argument("--style_id", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1)
@@ -221,6 +237,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pi05_resize_size", type=int, default=224)
     parser.add_argument("--pi05_replan_steps", type=int, default=5)
     parser.add_argument("--pi05_atomic_task_horizon", type=int, default=300)
+    parser.add_argument("--pi05_success_handoff_steps", type=int, default=30)
+    parser.add_argument(
+        "--atomic_prompt_style",
+        choices=("concise", "legacy_handoff"),
+        default="concise",
+    )
     parser.add_argument(
         "--pi05_use_registry_horizons",
         action="store_true",
@@ -272,6 +294,24 @@ def parse_args() -> argparse.Namespace:
         "--pi05_held_object_hold_confirmation_steps", type=int, default=2
     )
     parser.add_argument(
+        "--pi05_held_object_guard_grasp_threshold", type=float
+    )
+    parser.add_argument(
+        "--pi05_held_object_drop_stops_rollout",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Stop an atomic rollout immediately after a confirmed guarded-object drop.",
+    )
+    parser.add_argument(
+        "--simulator_verifier_holding_threshold", type=float
+    )
+    parser.add_argument(
+        "--simulator_grounding_position_threshold_m", type=float
+    )
+    parser.add_argument(
+        "--simulator_grounding_orientation_cosine_threshold", type=float
+    )
+    parser.add_argument(
         "--pi05_held_object_drop_confirmation_steps", type=int, default=2
     )
     parser.add_argument("--pi05_video_skip", type=int, default=2)
@@ -279,6 +319,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--continue_on_unsuccessful", action="store_true")
     parser.add_argument("--output_root", type=Path, default=THIS_DIR / "outputs_vlm_pi05")
     args = parser.parse_args()
+
+    if args.system_profile == LEGACY_PRIVILEGED_MAPPED_PROFILE:
+        args.reasoning_mode = "simulator"
+        args.navigation_config = LEGACY_PRIVILEGED_MAPPED_NAVIGATION_CONFIG
+        args.target_aware_navigation = True
+        args.enable_local_refiner = False
+        args.local_refiner_failure_policy = "use_coarse_pose"
+        args.verification_mode = "periodic"
+        args.pi05_verify_interval = 5
+        args.pi05_min_steps_before_verify = 10
+        args.pi05_atomic_task_horizon = 600
+        args.pi05_success_handoff_steps = 30
+        args.pi05_task_retries = 3
+        args.retry_recovery_mode = "dependency_recovery"
+        args.pi05_replan_steps = 5
+        args.pi05_base_action_mode = "full"
+        args.pi05_disable_held_object_guard = False
+        args.pi05_held_object_guard_action_override = True
+        args.pi05_held_object_hold_confirmation_steps = 2
+        args.pi05_held_object_drop_confirmation_steps = 2
+        args.pi05_held_object_guard_grasp_threshold = 0.05
+        args.pi05_held_object_drop_stops_rollout = True
+        args.simulator_verifier_holding_threshold = 0.035
+        args.simulator_grounding_position_threshold_m = 0.7
+        args.simulator_grounding_orientation_cosine_threshold = 0.5
+        args.atomic_prompt_style = "legacy_handoff"
+        args.continue_on_unsuccessful = False
 
     positive = (
         "camera_size",
@@ -329,6 +396,21 @@ def parse_args() -> argparse.Namespace:
         parser.error("--pi05_min_steps_before_verify must be non-negative")
     if args.pi05_base_residual_limit < 0:
         parser.error("--pi05_base_residual_limit must be non-negative")
+    if args.pi05_success_handoff_steps < 0:
+        parser.error("--pi05_success_handoff_steps must be non-negative")
+    for name in (
+        "pi05_held_object_guard_grasp_threshold",
+        "simulator_verifier_holding_threshold",
+        "simulator_grounding_position_threshold_m",
+    ):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name} must be positive when provided")
+    orientation_threshold = args.simulator_grounding_orientation_cosine_threshold
+    if orientation_threshold is not None and not -1.0 <= orientation_threshold <= 1.0:
+        parser.error(
+            "--simulator_grounding_orientation_cosine_threshold must be in [-1, 1]"
+        )
     if args.no_env and not args.plan_only:
         parser.error("--no_env requires --plan_only")
     if not args.no_env and (args.layout_id <= 0 or args.style_id <= 0):
@@ -594,7 +676,9 @@ def main() -> int:
 
         if args.vlm_plan_json is not None:
             calls = load_vlm_task_plan(args.vlm_plan_json)
-            calls, normalizations = prepare_execution_plan(calls, context)
+            calls, normalizations = prepare_execution_plan(
+                calls, context, prompt_style=args.atomic_prompt_style
+            )
             planner_provenance = {
                 "source": "saved_plan",
                 "path": str(args.vlm_plan_json.resolve()),
@@ -611,6 +695,7 @@ def main() -> int:
                 enable_thinking=args.vlm_enable_thinking,
                 include_images=not args.vlm_text_only and observation is not None,
                 max_validation_retries=args.vlm_validation_retries,
+                prompt_style=args.atomic_prompt_style,
             )
             calls, planner_provenance = planner.plan(
                 task=args.long_horizon_task,
@@ -670,16 +755,27 @@ def main() -> int:
                 enable_thinking=args.vlm_enable_thinking,
                 include_images=False,
                 max_validation_retries=args.vlm_validation_retries,
+                prompt_style=args.atomic_prompt_style,
             )
         entity_alias_resolver = alias_resolver_client.resolve_entity_alias
         if args.reasoning_mode == "simulator":
             runtime_verifier: Any = RuntimeAtomicTaskVerifier(
-                entity_alias_resolver=entity_alias_resolver
-            )
-            runtime_grounder: Any = RoboCasaGrounder(
-                scene_context=context,
                 entity_alias_resolver=entity_alias_resolver,
+                holding_threshold=args.simulator_verifier_holding_threshold,
             )
+            grounder_options = {
+                "scene_context": context,
+                "entity_alias_resolver": entity_alias_resolver,
+            }
+            if args.simulator_grounding_position_threshold_m is not None:
+                grounder_options["position_threshold_m"] = (
+                    args.simulator_grounding_position_threshold_m
+                )
+            if args.simulator_grounding_orientation_cosine_threshold is not None:
+                grounder_options["orientation_cosine_threshold"] = (
+                    args.simulator_grounding_orientation_cosine_threshold
+                )
+            runtime_grounder: Any = RoboCasaGrounder(**grounder_options)
         else:
             grounding_vlm_client = OpenAICompatibleVisionClient(
                 base_url=args.grounding_vlm_base_url,
@@ -745,7 +841,18 @@ def main() -> int:
         write_json(
             run_dir / "reasoning_backend.json",
             {
+                "system_profile": args.system_profile,
                 "reasoning_mode": args.reasoning_mode,
+                "atomic_prompt_style": args.atomic_prompt_style,
+                "simulator_grounding_position_threshold_m": (
+                    args.simulator_grounding_position_threshold_m
+                ),
+                "simulator_grounding_orientation_cosine_threshold": (
+                    args.simulator_grounding_orientation_cosine_threshold
+                ),
+                "simulator_verifier_holding_threshold": (
+                    args.simulator_verifier_holding_threshold
+                ),
                 "runtime_grounder": type(runtime_grounder).__name__,
                 "runtime_verifier": type(runtime_verifier).__name__,
                 "verification_mode": args.verification_mode,
@@ -835,7 +942,15 @@ def main() -> int:
             held_object_drop_confirmation_steps=(
                 args.pi05_held_object_drop_confirmation_steps
             ),
+            success_handoff_steps=args.pi05_success_handoff_steps,
             verification_mode=args.verification_mode,
+            prompt_style=args.atomic_prompt_style,
+            held_object_drop_stops_rollout=(
+                args.pi05_held_object_drop_stops_rollout
+            ),
+            held_object_guard_grasp_threshold=(
+                args.pi05_held_object_guard_grasp_threshold
+            ),
             render=not args.no_video,
             video_skip=args.pi05_video_skip,
         )

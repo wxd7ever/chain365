@@ -460,10 +460,10 @@ def _object_relation(
         if predicate == "holding":
             relation_api = "check_obj_grasped"
             value = _require_boolean_state(
-                object_utils.check_obj_grasped(
-                    raw_env,
-                    subject_alias,
-                    threshold=object_utils.GRASP_CLOSED_THRESHOLD,
+                object_utils.check_obj_grasped(raw_env, subject_alias)
+                if receptacle_threshold is None
+                else object_utils.check_obj_grasped(
+                    raw_env, subject_alias, threshold=receptacle_threshold
                 ), relation_api
             )
         elif predicate in {"inside", "inserted", "on"} and object_kind == "object":
@@ -637,7 +637,10 @@ def _matching_object_aliases(chain: list[Any], object_prefix: str) -> list[str]:
 
 
 def _released(
-    chain: list[Any], subject: str, object_prefix: str | None
+    chain: list[Any],
+    subject: str,
+    object_prefix: str | None,
+    grasp_threshold: float | None = None,
 ) -> tuple[bool | None, list[dict[str, Any]]]:
     """Check that the named object, or every object in a group, is ungrasped."""
 
@@ -667,7 +670,11 @@ def _released(
             alias
             for alias in aliases
             if _require_boolean_state(
-                object_utils.check_obj_grasped(raw_env, alias),
+                object_utils.check_obj_grasped(raw_env, alias)
+                if grasp_threshold is None
+                else object_utils.check_obj_grasped(
+                    raw_env, alias, threshold=grasp_threshold
+                ),
                 "check_obj_grasped",
             )
         ]
@@ -1047,6 +1054,7 @@ class RuntimeAtomicTaskVerifier:
         *,
         default_required_consecutive_successes: int = 1,
         entity_alias_resolver: Callable[..., str | None] | None = None,
+        holding_threshold: float | None = None,
     ):
         if (
             isinstance(default_required_consecutive_successes, bool)
@@ -1062,6 +1070,11 @@ class RuntimeAtomicTaskVerifier:
             default_required_consecutive_successes
         )
         self.entity_alias_resolver = entity_alias_resolver
+        if holding_threshold is not None:
+            holding_threshold = float(holding_threshold)
+            if not np.isfinite(holding_threshold) or holding_threshold <= 0:
+                raise ValueError("holding_threshold must be positive when provided")
+        self.holding_threshold = holding_threshold
         self._alias_resolution_cache: dict[tuple[Any, ...], str] = {}
         self._consecutive_state: dict[tuple[int, str, str], dict[str, int]] = {}
 
@@ -1380,7 +1393,9 @@ class RuntimeAtomicTaskVerifier:
         value: bool | None = None
         evidence: list[dict[str, Any]] = []
         if predicate == "released":
-            value, predicate_evidence = _released(chain, subject, object_prefix)
+            value, predicate_evidence = _released(
+                chain, subject, object_prefix, self.holding_threshold
+            )
             evidence.extend(predicate_evidence)
         elif predicate == "gripper_far":
             value, predicate_evidence = _gripper_far(chain, subject, threshold)
@@ -1396,6 +1411,8 @@ class RuntimeAtomicTaskVerifier:
             )
             evidence.extend(predicate_evidence)
         elif predicate in {"inside", "inserted", "on", "holding", "object_fixture_relation"}:
+            if predicate == "holding" and receptacle_threshold is None:
+                receptacle_threshold = self.holding_threshold
             value, relation_evidence = _object_relation(
                 chain,
                 predicate,

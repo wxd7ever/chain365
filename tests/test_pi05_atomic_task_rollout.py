@@ -545,6 +545,66 @@ def test_guard_failure_does_not_stop_skill_end_rollout(monkeypatch, tmp_path):
     assert logs["Held_Object_Guard"]["dropped_step"] == 2
 
 
+def test_legacy_guard_failure_stops_rollout_immediately(monkeypatch, tmp_path):
+    class DroppingGuard:
+        def start(self):
+            pass
+
+        def apply_action(self, action, *, step_index):
+            return action
+
+        def observe(self, *, step_index):
+            if step_index != 2:
+                return None
+            return {
+                "status": "failed",
+                "goal_satisfied": False,
+                "failure_code": "OBJECT_DROPPED",
+                "retryable": True,
+                "state_evidence": [{"step_index": step_index}],
+            }
+
+        def to_dict(self):
+            return {"enabled": True, "dropped_step": 2}
+
+    monkeypatch.setattr(
+        held_object_guard,
+        "build_held_object_guard",
+        lambda **kwargs: DroppingGuard(),
+    )
+    env = FakeEnv()
+    verifier = SkillEndVerifier(success=True)
+
+    success, logs = execute_pi05_atomic_task_policy(
+        env=env,
+        client=FakeClient(),
+        atomic_task_call={
+            "subgoal_id": "place_object",
+            "atomic_task": "OpenMicrowave",
+            "policy_prompt": "Open the microwave door.",
+            "arguments": {"fixture_id": "microwave_1"},
+            "termination_condition": {
+                "predicate": "open",
+                "subject": "microwave_1",
+            },
+        },
+        verifier=verifier,
+        log_dir=tmp_path,
+        episode_id=0,
+        horizon=6,
+        replan_steps=5,
+        render=False,
+        verification_mode="skill_end",
+        held_object_drop_stops_rollout=True,
+    )
+
+    assert success is False
+    assert len(env.actions) == 2
+    assert verifier.calls == []
+    assert logs["Final_Verification"]["failure_code"] == "OBJECT_DROPPED"
+    assert logs["Held_Object_Drop_Stops_Rollout"] is True
+
+
 class SkillEndVerifier:
     def __init__(self, *, success):
         self.success = success

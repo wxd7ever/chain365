@@ -75,6 +75,46 @@ def test_place_object_prompt_is_reduced_to_the_action_only():
     assert build_atomic_task_prompt(value) == "Place the lemon wedge inside the bowl."
 
 
+def test_legacy_handoff_prompt_style_restores_august_pick_place_language():
+    pick = call(
+        atomic_task="PickObject",
+        policy_prompt="Pick up the lemon wedge from the sink.",
+        arguments={
+            "object_id": "vegetable",
+            "object_name": "lemon wedge",
+            "source_name": "sink",
+        },
+        termination_condition={
+            "predicate": "holding",
+            "subject": "vegetable",
+        },
+    )
+    place = call(
+        atomic_task="PlaceObject",
+        policy_prompt="Place the lemon wedge inside the bowl.",
+        arguments={
+            "object_id": "vegetable",
+            "object_name": "lemon wedge",
+            "destination_id": "bowl",
+            "destination_name": "bowl",
+            "destination_preposition": "inside",
+        },
+        termination_condition={
+            "predicate": "inside",
+            "subject": "vegetable",
+            "object": "bowl",
+        },
+    )
+
+    assert build_atomic_task_prompt(pick, prompt_style="legacy_handoff") == (
+        "Pick up the lemon wedge from the sink and keep holding it."
+    )
+    assert build_atomic_task_prompt(place, prompt_style="legacy_handoff") == (
+        "Place the held lemon wedge inside the bowl, release it, and move the "
+        "gripper away."
+    )
+
+
 def test_registry_template_and_argument_replacement():
     value = call(
         atomic_task="PickPlaceCounterToMicrowave",

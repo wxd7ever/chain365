@@ -361,6 +361,9 @@ def execute_pi05_atomic_task_policy(
     held_object_drop_confirmation_steps: int = 2,
     success_handoff_steps: int = 0,
     verification_mode: str | None = None,
+    prompt_style: str = "concise",
+    held_object_drop_stops_rollout: bool = False,
+    held_object_guard_grasp_threshold: float | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """Execute one atomic subgoal without resetting the RoboCasa environment.
 
@@ -387,7 +390,7 @@ def execute_pi05_atomic_task_policy(
         else AtomicTaskCall.from_mapping(atomic_task_call)
     )
     validate_atomic_task_call(call)
-    prompt = build_atomic_task_prompt(call)
+    prompt = build_atomic_task_prompt(call, prompt_style=prompt_style)
     if horizon <= 0:
         raise ValueError(f"horizon must be positive, got {horizon}")
     if replan_steps <= 0:
@@ -458,6 +461,7 @@ def execute_pi05_atomic_task_policy(
         action_override_enabled=held_object_guard_action_override,
         hold_confirmation_steps=held_object_hold_confirmation_steps,
         drop_confirmation_steps=held_object_drop_confirmation_steps,
+        grasp_threshold=held_object_guard_grasp_threshold,
     )
     object_guard.start()
 
@@ -473,6 +477,7 @@ def execute_pi05_atomic_task_policy(
     action_max = -math.inf
     atomic_task_success = False
     terminal_failure = False
+    guard_forced_stop = False
     done = False
     info: Mapping[str, Any] = {}
     last_verified_step: int | None = None
@@ -638,6 +643,22 @@ def execute_pi05_atomic_task_policy(
         if guard_failure is not None:
             validated_guard_failure = _validate_verifier_result(guard_failure)
             guard_failures.append(validated_guard_failure)
+            if held_object_drop_stops_rollout:
+                final_verification = validated_guard_failure
+                verification_history.append(validated_guard_failure)
+                last_verified_step = completed_steps
+                terminal_failure = False
+                guard_forced_stop = True
+                print(
+                    "[HeldObjectGuard] detected {} at step {}; stopping atomic "
+                    "policy rollout (legacy behavior)".format(
+                        validated_guard_failure.get(
+                            "failure_code", "OBJECT_DROPPED"
+                        ),
+                        completed_steps,
+                    )
+                )
+                break
             print(
                 "[HeldObjectGuard] detected {} at step {}; continuing atomic "
                 "policy rollout until its normal verification boundary".format(
@@ -711,7 +732,7 @@ def execute_pi05_atomic_task_policy(
             break
 
     completed_steps = len(rewards)
-    if verification_mode == "skill_end":
+    if verification_mode == "skill_end" and not guard_forced_stop:
         final_verification = _validate_verifier_result(
             verifier(
                 env=env,
@@ -836,6 +857,10 @@ def execute_pi05_atomic_task_policy(
         "Input_Image_Size": int(resize_size),
         "Action_Interface_Validated": action_contract_validated,
         "Held_Object_Guard": object_guard.to_dict(),
+        "Held_Object_Drop_Stops_Rollout": bool(
+            held_object_drop_stops_rollout
+        ),
+        "Prompt_Style": prompt_style,
         "Held_Object_Guard_Action_Override_Enabled": bool(
             getattr(object_guard, "enabled", False)
             and getattr(object_guard, "action_override_enabled", False)

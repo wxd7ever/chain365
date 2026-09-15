@@ -604,6 +604,30 @@ def relation_call(predicate, subject, destination, *, threshold=None):
     }
 
 
+def test_holding_threshold_is_isolated_per_runtime_verifier(monkeypatch):
+    from robocasa.utils import object_utils
+
+    thresholds = []
+
+    def check_grasped(env, subject, threshold):
+        thresholds.append(threshold)
+        return True
+
+    monkeypatch.setattr(object_utils, "check_obj_grasped", check_grasped)
+    call = relation_call("holding", "vegetable", None)
+
+    result = RuntimeAtomicTaskVerifier(holding_threshold=0.035)(
+        env=RelationEnv(),
+        atomic_task_call=call,
+        observation={},
+        step_index=10,
+        info={},
+    )
+
+    assert result["status"] == "success"
+    assert thresholds == [0.035]
+
+
 def test_inside_dispatches_object_receptacle_and_preserves_threshold(monkeypatch):
     from robocasa.utils import object_utils
 

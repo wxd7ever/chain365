@@ -572,6 +572,8 @@ def _apply_standard_pick_work_poses(
 def _normalize_execution_plan(
     calls: Sequence[AtomicTaskCall],
     scene_context: Mapping[str, Any],
+    *,
+    prompt_style: str = "concise",
 ) -> tuple[list[AtomicTaskCall], list[dict[str, Any]]]:
     """Apply explicit scheduler safety/default rules and report every change."""
 
@@ -939,14 +941,21 @@ def _normalize_execution_plan(
             call, scene_context=scene_context
         )
         if enriched_call.atomic_task in {"PickObject", "PlaceObject"}:
-            simplified_prompt = build_atomic_task_prompt(enriched_call)
+            simplified_prompt = build_atomic_task_prompt(
+                enriched_call, prompt_style=prompt_style
+            )
             if simplified_prompt != enriched_call.policy_prompt:
                 value = enriched_call.to_dict()
                 value["policy_prompt"] = simplified_prompt
                 enriched_call = AtomicTaskCall.from_mapping(value)
                 changes.append(
                     {
-                        "type": "simplify_pick_place_policy_prompt",
+                        "type": (
+                            "simplify_pick_place_policy_prompt"
+                            if prompt_style == "concise"
+                            else "restore_legacy_pick_place_policy_prompt"
+                        ),
+                        "prompt_style": prompt_style,
                         "subgoal_id": enriched_call.subgoal_id,
                         "atomic_task": enriched_call.atomic_task,
                         "policy_prompt": simplified_prompt,
@@ -962,11 +971,14 @@ def prepare_execution_plan(
     scene_context: Mapping[str, Any] | None = None,
     *,
     defer_navigation: bool = True,
+    prompt_style: str = "concise",
 ) -> tuple[list[AtomicTaskCall], list[dict[str, Any]]]:
     """Normalize calls and hand planner navigation decisions to the scheduler."""
 
     context = dict(scene_context or {})
-    prepared, changes = _normalize_execution_plan(calls, context)
+    prepared, changes = _normalize_execution_plan(
+        calls, context, prompt_style=prompt_style
+    )
     if defer_navigation:
         operation_calls: list[AtomicTaskCall] = []
         for call in prepared:
@@ -994,11 +1006,18 @@ def prepare_execution_plan(
 class RobustOpenAICompatibleVLMPlanner(OpenAICompatibleVLMPlanner):
     """Retry invalid plans with concrete parser feedback and the prior response."""
 
-    def __init__(self, *, max_validation_retries: int = 2, **kwargs: Any):
+    def __init__(
+        self,
+        *,
+        max_validation_retries: int = 2,
+        prompt_style: str = "concise",
+        **kwargs: Any,
+    ):
         if max_validation_retries < 0:
             raise ValueError("max_validation_retries must be non-negative")
         super().__init__(**kwargs)
         self.max_validation_retries = int(max_validation_retries)
+        self.prompt_style = str(prompt_style)
 
     def _system_prompt(self) -> str:
         base = super()._system_prompt()
@@ -1037,7 +1056,9 @@ class RobustOpenAICompatibleVLMPlanner(OpenAICompatibleVLMPlanner):
         controlled = _controlled_decomposition(task, context)
         if controlled is not None:
             calls, provenance = controlled
-            calls, normalizations = prepare_execution_plan(calls, context)
+            calls, normalizations = prepare_execution_plan(
+                calls, context, prompt_style=self.prompt_style
+            )
             if normalizations:
                 provenance["plan_normalizations"] = normalizations
             return calls, provenance
@@ -1048,7 +1069,9 @@ class RobustOpenAICompatibleVLMPlanner(OpenAICompatibleVLMPlanner):
                     images=images,
                     scene_context=context,
                 )
-                calls, normalizations = prepare_execution_plan(calls, context)
+                calls, normalizations = prepare_execution_plan(
+                    calls, context, prompt_style=self.prompt_style
+                )
                 if normalizations:
                     provenance["plan_normalizations"] = normalizations
                 provenance["validation_attempts"] = attempt_index + 1

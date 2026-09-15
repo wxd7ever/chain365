@@ -38,6 +38,9 @@ class RemoteAtomicTaskPolicyAdapter:
         held_object_drop_confirmation_steps: int = 2,
         success_handoff_steps: int = 30,
         verification_mode: str | None = None,
+        prompt_style: str = "concise",
+        held_object_drop_stops_rollout: bool = False,
+        held_object_guard_grasp_threshold: float | None = None,
         render: bool = True,
         video_skip: int = 2,
     ):
@@ -74,6 +77,15 @@ class RemoteAtomicTaskPolicyAdapter:
         )
         self.success_handoff_steps = int(success_handoff_steps)
         self.verification_mode = verification_mode
+        self.prompt_style = str(prompt_style)
+        self.held_object_drop_stops_rollout = bool(
+            held_object_drop_stops_rollout
+        )
+        self.held_object_guard_grasp_threshold = (
+            None
+            if held_object_guard_grasp_threshold is None
+            else float(held_object_guard_grasp_threshold)
+        )
         self.render = render
         self.video_skip = video_skip
 
@@ -92,7 +104,7 @@ class RemoteAtomicTaskPolicyAdapter:
             raise ValueError("scheduler_query is missing 'atomic_task_call'")
         call = AtomicTaskCall.from_mapping(scheduler_query["atomic_task_call"])
         validate_atomic_task_call(call)
-        prompt = build_atomic_task_prompt(call)
+        prompt = build_atomic_task_prompt(call, prompt_style=self.prompt_style)
         try:
             from .pi05_rollout import execute_pi05_atomic_task_policy
         except ImportError:
@@ -139,6 +151,13 @@ class RemoteAtomicTaskPolicyAdapter:
             ),
             success_handoff_steps=self.success_handoff_steps,
             verification_mode=self.verification_mode,
+            prompt_style=self.prompt_style,
+            held_object_drop_stops_rollout=(
+                self.held_object_drop_stops_rollout
+            ),
+            held_object_guard_grasp_threshold=(
+                self.held_object_guard_grasp_threshold
+            ),
         )
         rollout_logs["Configured_Horizon"] = int(configured_horizon)
         rollout_logs["Horizon_Source"] = horizon_source

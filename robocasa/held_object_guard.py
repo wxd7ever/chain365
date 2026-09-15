@@ -166,7 +166,11 @@ def _destination_condition(
     return None
 
 
-def _check_holding(raw_env: Any, object_alias: str) -> bool | None:
+def _check_holding(
+    raw_env: Any,
+    object_alias: str,
+    grasp_threshold: float | None = None,
+) -> bool | None:
     try:
         from robocasa.utils import object_utils
 
@@ -174,7 +178,11 @@ def _check_holding(raw_env: Any, object_alias: str) -> bool | None:
             object_utils.check_obj_grasped(
                 raw_env,
                 object_alias,
-                threshold=object_utils.GRASP_CLOSED_THRESHOLD,
+                threshold=(
+                    object_utils.GRASP_CLOSED_THRESHOLD
+                    if grasp_threshold is None
+                    else float(grasp_threshold)
+                ),
             )
         )
     except (
@@ -460,6 +468,7 @@ def build_held_object_guard(
     hold_confirmation_steps: int = 2,
     drop_confirmation_steps: int = 2,
     action_override_enabled: bool = False,
+    grasp_threshold: float | None = None,
 ) -> HeldObjectGuard:
     """Build a guard only for object-transfer or explicit held-object calls."""
 
@@ -500,7 +509,9 @@ def build_held_object_guard(
         enabled=True,
         object_alias=object_alias,
         destination_condition=destination,
-        holding_checker=lambda: _check_holding(raw_env, object_alias),
+        holding_checker=lambda: _check_holding(
+            raw_env, object_alias, grasp_threshold
+        ),
         destination_checker=lambda: _check_destination(raw_env, destination),
         action_override_enabled=action_override_enabled,
         hold_confirmation_steps=hold_confirmation_steps,
