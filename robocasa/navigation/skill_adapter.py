@@ -101,6 +101,48 @@ def _verifier_success(result: Mapping[str, Any]) -> bool | None:
     return None
 
 
+_PLACEMENT_RELATION_PREDICATES = {
+    "inside",
+    "inserted",
+    "on",
+    "object_fixture_relation",
+}
+
+
+def _held_object_alias(call: AtomicTaskCall) -> str | None:
+    """Return the object that a PlaceObject call expects to be holding."""
+
+    if call.atomic_task != "PlaceObject":
+        return None
+    conditions = (
+        call.termination_condition
+        if isinstance(call.termination_condition, list)
+        else [call.termination_condition]
+    )
+    for condition in conditions:
+        if not isinstance(condition, Mapping):
+            continue
+        predicate = str(condition.get("predicate", "")).strip().lower()
+        subject = condition.get("subject")
+        if (
+            predicate in _PLACEMENT_RELATION_PREDICATES
+            and isinstance(subject, str)
+            and subject.strip()
+        ):
+            return subject.strip()
+    for key in (
+        "held_object_id",
+        "object_id",
+        "source_object_id",
+        "object_name",
+        "source_object_name",
+    ):
+        value = call.arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 class TargetAwarePolicyAdapter:
     """Run optional coarse navigation and local refinement before π0.5."""
 
@@ -172,6 +214,14 @@ class TargetAwarePolicyAdapter:
             )
         ).strip() or "navigation_planning"
         self._navigation_artifact_index = 0
+        self.local_refiner_after_navigation_only = bool(
+            navigation_config.get("local_refiner_after_navigation_only", False)
+        )
+        self.local_refiner_require_transport_ready_when_holding = bool(
+            navigation_config.get(
+                "local_refiner_require_transport_ready_when_holding", False
+            )
+        )
         transport_config = (
             pipeline_config.get("post_grasp_transport", {})
             if isinstance(pipeline_config, Mapping)
@@ -419,6 +469,16 @@ class TargetAwarePolicyAdapter:
             "pre_navigation_post_place_retreat_required": False,
             "pre_navigation_post_place_retreat_success": None,
             "local_refinement_used": False,
+            "local_refinement_after_navigation_only": (
+                self.local_refiner_after_navigation_only
+            ),
+            "local_refinement_require_transport_ready_when_holding": (
+                self.local_refiner_require_transport_ready_when_holding
+            ),
+            "local_refinement_required": False,
+            "local_refinement_skip_reason": None,
+            "local_refinement_held_object_alias": None,
+            "local_refinement_transport_ready": None,
             "local_refinement_success": None,
             "local_refinement_delta": None,
             "policy_started": False,
@@ -632,7 +692,38 @@ class TargetAwarePolicyAdapter:
                     failure["navigation_result"] = navigation_value
                     return failure
 
-        if self.local_refiner_enabled:
+        refinement = None
+        run_local_refiner = self.local_refiner_enabled
+        if run_local_refiner and self.local_refiner_after_navigation_only:
+            if navigation_result is None:
+                run_local_refiner = False
+                stage["local_refinement_skip_reason"] = "NAVIGATION_NOT_AVAILABLE"
+            elif not navigation_result.success:
+                run_local_refiner = False
+                stage["local_refinement_skip_reason"] = "NAVIGATION_NOT_SUCCESSFUL"
+            elif navigation_result.skipped:
+                run_local_refiner = False
+                stage["local_refinement_skip_reason"] = (
+                    "NAVIGATION_SKIPPED_ALREADY_AT_WORK_REGION"
+                )
+
+        held_object_alias = _held_object_alias(call)
+        if held_object_alias is not None:
+            transport_ready = held_object_alias in self._transport_ready_objects
+            stage["local_refinement_held_object_alias"] = held_object_alias
+            stage["local_refinement_transport_ready"] = transport_ready
+            if (
+                run_local_refiner
+                and self.local_refiner_require_transport_ready_when_holding
+                and not transport_ready
+            ):
+                run_local_refiner = False
+                stage["local_refinement_skip_reason"] = (
+                    "HELD_OBJECT_NOT_TRANSPORT_READY"
+                )
+
+        stage["local_refinement_required"] = run_local_refiner
+        if run_local_refiner:
             stage["local_refinement_used"] = True
             refiner_before = current_base_pose(env)
             grounding_for_refiner = None
@@ -739,6 +830,13 @@ class TargetAwarePolicyAdapter:
                     return failure
         else:
             stage["local_refinement_success"] = None
+            if self.local_refiner_enabled:
+                print(
+                    "[AtomicSkill] {} refiner=SKIPPED reason={}".format(
+                        call.subgoal_id,
+                        stage["local_refinement_skip_reason"],
+                    )
+                )
 
         if self._pending_post_place_retreat is not None:
             # A skipped navigation means the next policy will deliberately take
@@ -932,7 +1030,7 @@ class TargetAwarePolicyAdapter:
         stage["final_base_pose"] = current_base_pose(env)
         policy_result["target_aware_stage"] = stage
         policy_result["navigation_result"] = navigation_value
-        if self.local_refiner_enabled:
+        if refinement is not None:
             policy_result["local_pose_refinement_result"] = refinement
         self.stage_results.append(stage)
         print(

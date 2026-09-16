@@ -226,10 +226,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--retry_recovery_mode",
-        choices=("same_skill", "dependency_recovery"),
+        choices=(
+            "same_skill",
+            "same_skill_no_drop_retry",
+            "dependency_recovery",
+        ),
         default="same_skill",
         help=(
             "same_skill preserves the original retry behavior; "
+            "same_skill_no_drop_retry retries ordinary failures but stops after "
+            "a held-object drop without rolling back; "
             "dependency_recovery re-runs the producer PickObject after "
             "OBJECT_DROPPED, then re-grounds and retries the interrupted task."
         ),
@@ -334,7 +340,8 @@ def parse_args() -> argparse.Namespace:
         args.pi05_task_retries = 3
         # Keep retries local to the current atomic skill. Do not roll the task
         # graph back to an earlier producer skill after a downstream failure.
-        args.retry_recovery_mode = "same_skill"
+        args.retry_recovery_mode = "same_skill_no_drop_retry"
+        args.local_pose_enable_thinking = False
         args.pi05_replan_steps = 5
         args.pi05_base_action_mode = "full"
         args.pi05_disable_held_object_guard = False

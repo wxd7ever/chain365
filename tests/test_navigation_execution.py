@@ -188,6 +188,26 @@ def call():
     }
 
 
+def place_call():
+    return {
+        "subgoal_id": "place_vegetable",
+        "atomic_task": "PlaceObject",
+        "arguments": {
+            "object_name": "vegetable",
+            "destination_name": "bowl",
+        },
+        "termination_condition": [
+            {
+                "predicate": "inside",
+                "subject": "vegetable",
+                "object": "bowl",
+                "desired_value": True,
+            }
+        ],
+        "policy_prompt": "Place the held vegetable in the bowl.",
+    }
+
+
 def _pose(value):
     return {"position": list(value.pose["position"]), "yaw_rad": value.pose["yaw_rad"]}
 
@@ -292,6 +312,122 @@ def test_adapter_records_refiner_delta_and_runs_existing_policy(monkeypatch):
     assert abs(stage["local_refinement_delta"]["delta_yaw_deg"] - 5.0) < 1e-9
     assert stage["policy_started"] is True
     assert stage["verifier_success"] is True
+    assert policy.calls == 1
+
+
+def test_refiner_after_navigation_only_skips_already_at_work_region(monkeypatch):
+    monkeypatch.setattr("robocasa.navigation.skill_adapter.current_base_pose", _pose)
+    policy = FakePolicy()
+    pipeline = FakePipeline(
+        NavigationResult(
+            True,
+            "ALREADY_AT_WORK_REGION",
+            target_name="bowl",
+            target_type="EXPOSED_OBJECT",
+            skipped=True,
+        )
+    )
+    pipeline.config = {
+        "navigation": {"local_refiner_after_navigation_only": True}
+    }
+    refiner = FakeRefiner(True)
+    adapter = TargetAwarePolicyAdapter(
+        policy_adapter=policy,
+        navigation_pipeline=pipeline,
+        refiner=refiner,
+        navigation_enabled=True,
+        local_refiner_enabled=True,
+    )
+
+    result = adapter.execute(
+        env=PoseEnv(), scheduler_query={"atomic_task_call": call()}, episode_id=0
+    )
+
+    stage = result["target_aware_stage"]
+    assert result["success"] is True
+    assert stage["navigation_required"] is False
+    assert stage["local_refinement_used"] is False
+    assert stage["local_refinement_required"] is False
+    assert (
+        stage["local_refinement_skip_reason"]
+        == "NAVIGATION_SKIPPED_ALREADY_AT_WORK_REGION"
+    )
+    assert refiner.atomic_task_call is None
+    assert policy.calls == 1
+
+
+def test_refiner_skips_held_place_without_transport_ready(monkeypatch):
+    monkeypatch.setattr("robocasa.navigation.skill_adapter.current_base_pose", _pose)
+    policy = FakePolicy()
+    pipeline = FakePipeline(NavigationResult(True, "SUCCESS", skipped=False))
+    pipeline.config = {
+        "navigation": {
+            "local_refiner_after_navigation_only": True,
+            "local_refiner_require_transport_ready_when_holding": True,
+        }
+    }
+    refiner = FakeRefiner(True)
+    adapter = TargetAwarePolicyAdapter(
+        policy_adapter=policy,
+        navigation_pipeline=pipeline,
+        refiner=refiner,
+        navigation_enabled=True,
+        local_refiner_enabled=True,
+    )
+
+    result = adapter.execute(
+        env=PoseEnv(),
+        scheduler_query={"atomic_task_call": place_call()},
+        episode_id=0,
+    )
+
+    stage = result["target_aware_stage"]
+    assert result["success"] is True
+    assert stage["navigation_required"] is True
+    assert stage["local_refinement_used"] is False
+    assert stage["local_refinement_held_object_alias"] == "vegetable"
+    assert stage["local_refinement_transport_ready"] is False
+    assert (
+        stage["local_refinement_skip_reason"]
+        == "HELD_OBJECT_NOT_TRANSPORT_READY"
+    )
+    assert refiner.atomic_task_call is None
+    assert policy.calls == 1
+
+
+def test_refiner_runs_after_navigation_for_transport_ready_place(monkeypatch):
+    monkeypatch.setattr("robocasa.navigation.skill_adapter.current_base_pose", _pose)
+    policy = FakePolicy()
+    pipeline = FakePipeline(NavigationResult(True, "SUCCESS", skipped=False))
+    pipeline.config = {
+        "navigation": {
+            "local_refiner_after_navigation_only": True,
+            "local_refiner_require_transport_ready_when_holding": True,
+        }
+    }
+    refiner = FakeRefiner(True)
+    adapter = TargetAwarePolicyAdapter(
+        policy_adapter=policy,
+        navigation_pipeline=pipeline,
+        refiner=refiner,
+        navigation_enabled=True,
+        local_refiner_enabled=True,
+    )
+    adapter._transport_ready_objects.add("vegetable")
+
+    result = adapter.execute(
+        env=PoseEnv(),
+        scheduler_query={"atomic_task_call": place_call()},
+        episode_id=0,
+    )
+
+    stage = result["target_aware_stage"]
+    assert result["success"] is True
+    assert stage["navigation_required"] is True
+    assert stage["local_refinement_used"] is True
+    assert stage["local_refinement_success"] is True
+    assert stage["local_refinement_transport_ready"] is True
+    assert refiner.atomic_task_call["subgoal_id"] == "place_vegetable"
     assert policy.calls == 1
 
 

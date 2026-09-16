@@ -356,6 +356,12 @@ navigation:
   # Coarse target-aware navigation first, then VLM base-pose refinement before
   # the manipulation policy. Failed refinement falls back to the coarse pose.
   enable_local_refiner: true
+  # Do not disturb an already-valid work pose. Refine only after the base
+  # actually executes a coarse global-navigation path.
+  local_refiner_after_navigation_only: true
+  # Moving the base while carrying an object is permitted only after the
+  # post-grasp controller has explicitly established a transport-ready pose.
+  local_refiner_require_transport_ready_when_holding: true
   local_refiner_failure_policy: use_coarse_pose
   waypoint_position_tolerance: 0.12
   final_position_tolerance: 0.08

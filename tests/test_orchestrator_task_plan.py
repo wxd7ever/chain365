@@ -373,6 +373,69 @@ def test_same_skill_mode_preserves_legacy_place_retry_after_drop():
     assert result["recovery_events"] == []
 
 
+def test_same_skill_no_drop_retry_stops_place_after_confirmed_drop():
+    adapter = ScriptedAdapter(
+        [
+            outcome(True),
+            outcome(False, "OBJECT_DROPPED"),
+            outcome(True),
+        ]
+    )
+    grounder = Grounder([grounding(True), grounding(True)])
+    result = RoboCasaOrchestrator(
+        atomic_task_policy_adapter=adapter,
+        grounder=grounder,
+    ).run_task_plan(
+        env=object(),
+        task_plan=[pick_object_call(), place_object_call()],
+        episode_id=0,
+        max_task_retries=3,
+        retry_recovery_mode="same_skill_no_drop_retry",
+    )
+
+    assert result["success"] is False
+    assert result["retry_recovery_mode"] == "same_skill_no_drop_retry"
+    assert result["num_dependency_recoveries"] == 0
+    assert adapter.atomic_tasks == ["PickObject", "PlaceObject"]
+    place_result = result["step_results"][1]
+    assert place_result["num_attempts"] == 1
+    assert place_result["retry_suppressed"] is True
+    assert (
+        place_result["retry_suppressed_reason"]
+        == "OBJECT_DROPPED_WITHOUT_ROLLBACK"
+    )
+    assert result["recovery_events"] == []
+
+
+def test_same_skill_no_drop_retry_never_rolls_back_missing_precondition():
+    adapter = ScriptedAdapter(
+        [
+            outcome(False, "OBJECT_NOT_GRASPED"),
+            outcome(False, "OBJECT_NOT_GRASPED"),
+        ]
+    )
+    grounder = Grounder([grounding(True), grounding(True)])
+    result = RoboCasaOrchestrator(
+        atomic_task_policy_adapter=adapter,
+        grounder=grounder,
+    ).run_task_plan(
+        env=object(),
+        task_plan=[pick_object_call(), place_object_call()],
+        episode_id=0,
+        stop_on_unsuccessful=False,
+        max_task_retries=1,
+        retry_recovery_mode="same_skill_no_drop_retry",
+    )
+
+    assert result["success"] is False
+    assert adapter.atomic_tasks == ["PickObject", "PickObject"]
+    place_result = result["step_results"][1]
+    assert place_result["failure_code"] == "PRECONDITION_NOT_SATISFIED"
+    assert place_result["rollback_subgoal_id"] is None
+    assert place_result["num_attempts"] == 0
+    assert result["recovery_events"] == []
+
+
 def test_dependency_recovery_regrabs_and_restarts_navigation_after_drop():
     adapter = ScriptedAdapter(
         [

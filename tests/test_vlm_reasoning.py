@@ -992,11 +992,12 @@ def test_steam_in_microwave_4_mapped_navigation_profile_is_isolated(monkeypatch)
     assert args.pi05_atomic_task_horizon == 600
     assert args.pi05_success_handoff_steps == 30
     assert args.pi05_task_retries == 3
-    assert args.retry_recovery_mode == "same_skill"
+    assert args.retry_recovery_mode == "same_skill_no_drop_retry"
     assert args.pi05_base_action_mode == "full"
     assert args.atomic_prompt_style == "legacy_handoff"
     assert args.target_aware_navigation is True
     assert args.enable_local_refiner is True
+    assert args.local_pose_enable_thinking is False
     assert args.simulator_grounding_position_threshold_m == 0.7
     assert args.simulator_grounding_orientation_cosine_threshold == 0.5
     assert args.simulator_verifier_holding_threshold == 0.035
@@ -1009,6 +1010,13 @@ def test_steam_in_microwave_4_mapped_navigation_profile_is_isolated(monkeypatch)
     assert navigation["robot"]["safety_margin"] == 0.0025
     assert navigation["navigation"]["enabled"] is True
     assert navigation["navigation"]["enable_local_refiner"] is True
+    assert navigation["navigation"]["local_refiner_after_navigation_only"] is True
+    assert (
+        navigation["navigation"][
+            "local_refiner_require_transport_ready_when_holding"
+        ]
+        is True
+    )
     assert navigation["post_grasp_transport"]["enabled"] is False
     assert navigation["post_place_retreat"]["enabled"] is False
     assert navigation["post_skill_return"]["enabled"] is False

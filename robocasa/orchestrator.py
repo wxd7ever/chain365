@@ -13,7 +13,11 @@ except ImportError:
 
 
 _RELATION_PREDICATES = {"inside", "inserted", "on", "object_fixture_relation"}
-_RETRY_RECOVERY_MODES = {"same_skill", "dependency_recovery"}
+_RETRY_RECOVERY_MODES = {
+    "same_skill",
+    "same_skill_no_drop_retry",
+    "dependency_recovery",
+}
 
 
 def _condition_items(call: AtomicTaskCall) -> list[Mapping[str, Any]]:
@@ -340,6 +344,16 @@ class RoboCasaOrchestrator:
                 if attempt.get("success", False) or not retryable:
                     break
                 if (
+                    retry_recovery_mode == "same_skill_no_drop_retry"
+                    and holding_dependency is not None
+                    and _is_object_drop(attempt)
+                ):
+                    attempt["retry_suppressed"] = True
+                    attempt["retry_suppressed_reason"] = (
+                        "OBJECT_DROPPED_WITHOUT_ROLLBACK"
+                    )
+                    break
+                if (
                     retry_recovery_mode == "dependency_recovery"
                     and holding_dependency is not None
                     and _is_object_drop(attempt)
@@ -488,13 +502,19 @@ class RoboCasaOrchestrator:
                         "failed_predicate": f"holding({required_holding})",
                     }
                     transition_events.append(transition)
-                    recovered, rollback_call, precondition_attempts = (
-                        retry_previous_holding_skill(
+                    recovered = False
+                    rollback_call = None
+                    precondition_attempts: list[dict[str, Any]] = []
+                    if retry_recovery_mode != "same_skill_no_drop_retry":
+                        (
+                            recovered,
+                            rollback_call,
+                            precondition_attempts,
+                        ) = retry_previous_holding_skill(
                             current_call=call,
                             current_index=index,
                             object_alias=required_holding,
                         )
-                    )
                     recovery_attempts.extend(precondition_attempts)
                     if recovered:
                         verified_holding_objects.add(required_holding)
