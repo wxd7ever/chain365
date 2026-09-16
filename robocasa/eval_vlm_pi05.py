@@ -324,7 +324,7 @@ def parse_args() -> argparse.Namespace:
         args.reasoning_mode = "simulator"
         args.navigation_config = LEGACY_PRIVILEGED_MAPPED_NAVIGATION_CONFIG
         args.target_aware_navigation = True
-        args.enable_local_refiner = False
+        args.enable_local_refiner = True
         args.local_refiner_failure_policy = "use_coarse_pose"
         args.verification_mode = "periodic"
         args.pi05_verify_interval = 5
@@ -332,7 +332,9 @@ def parse_args() -> argparse.Namespace:
         args.pi05_atomic_task_horizon = 600
         args.pi05_success_handoff_steps = 30
         args.pi05_task_retries = 3
-        args.retry_recovery_mode = "dependency_recovery"
+        # Keep retries local to the current atomic skill. Do not roll the task
+        # graph back to an earlier producer skill after a downstream failure.
+        args.retry_recovery_mode = "same_skill"
         args.pi05_replan_steps = 5
         args.pi05_base_action_mode = "full"
         args.pi05_disable_held_object_guard = False

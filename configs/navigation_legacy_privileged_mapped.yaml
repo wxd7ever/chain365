@@ -1,6 +1,7 @@
 # Compatibility profile: SteamInMicrowave_4 privileged runtime (2026-08-26).
 # Only the navigation backend differs: occupancy map + candidates + A* + base controller.
-# Local refinement and all post-skill arm-return modules are intentionally disabled.
+# VLM local work-pose refinement runs after coarse navigation; post-skill
+# arm-return modules remain intentionally disabled.
 
 map:
   # Throughput-oriented compatibility setting: use a finer 2.5 cm grid so a
@@ -352,7 +353,9 @@ navigation:
   # failed plans, under the episode run directory for visual inspection.
   save_debug_artifacts: true
   debug_artifact_subdir: navigation_planning
-  enable_local_refiner: false
+  # Coarse target-aware navigation first, then VLM base-pose refinement before
+  # the manipulation policy. Failed refinement falls back to the coarse pose.
+  enable_local_refiner: true
   local_refiner_failure_policy: use_coarse_pose
   waypoint_position_tolerance: 0.12
   final_position_tolerance: 0.08
