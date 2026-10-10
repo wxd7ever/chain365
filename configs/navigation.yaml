@@ -72,7 +72,7 @@ post_grasp_transport:
   # small closed-loop corrections caused by noisy pose observations.
   hold_mode: zero_delta
   hold_confirmation_steps: 2
-  drop_confirmation_steps: 2
+  drop_confirmation_steps: 30
   # Temporarily skip the pre-atomic-task / pre-navigation transport-ready
   # gate. Post-skill return still runs after a verified skill, and the held
   # object guard remains active while the base is moving.
@@ -114,6 +114,16 @@ post_skill_return:
   failure_policy: block
   # Every verified non-pick skill shares the exact PlaceObject return pose and
   # motion settings. PickObject remains the only carry/closed-gripper preset.
+  # Shared handoff / settled-motion criteria for every return preset.
+  motion_stability:
+    linear_velocity_threshold_m_s: 0.05
+    angular_velocity_threshold_deg_s: 20.0
+    near_target_slowdown_radius_m: 0.08
+    near_target_slowdown_radius_deg: 30.0
+    handoff_max_steps: 30
+    handoff_stable_steps: 2
+    handoff_action_tolerance: 0.006
+    simulation_timestep_s: 0.05
   default_preset: released
   task_presets:
     PickObject: carry
@@ -213,7 +223,7 @@ post_skill_return:
       hold_steps: 20
       hold_mode: zero_delta
       hold_confirmation_steps: 2
-      drop_confirmation_steps: 2
+      drop_confirmation_steps: 30
     released:
       target_position: [0.2465, -0.0040, 0.5959]
       orientation_mode: fixed
@@ -362,6 +372,24 @@ navigation:
   final_yaw_max_steps: 320
   max_translation_command: 0.55
   max_rotation_command: 0.35
+  # Face each path segment before translating, then hold that segment yaw
+  # during XY motion. This avoids long saturated lateral / reverse commands.
+  align_yaw_to_path: true
+  segment_heading_tolerance_deg: 10.0
+  segment_heading_max_steps: 240
+  # If the real footprint starts in shallow overlap, keep yaw fixed and move
+  # only through samples whose raw-map overlap never increases.
+  start_collision_recovery:
+    enabled: true
+    search_step_m: 0.025
+    execution_step_m: 0.05
+    max_distance_m: 0.30
+    max_steps_per_move: 80
+    translation_tolerance_m: 0.02
+    yaw_tolerance_deg: 3.0
+    max_translation_command: 0.20
+    require_monotonic_overlap_decrease: true
+    direction_order: [backward, left, right, forward]
   skip_facing_cosine: 0.50
   # Preserve navigation failures in diagnostics, but continue the atomic policy
   # when conservative map/path planning cannot produce a collision-free route.
@@ -377,4 +405,4 @@ navigation:
   # detection still terminates navigation through OBJECT_DROPPED.
   held_object_guard_action_override: true
   hold_confirmation_steps: 2
-  drop_confirmation_steps: 2
+  drop_confirmation_steps: 30

@@ -254,6 +254,121 @@ def test_execution_revalidates_current_map_and_replans_only_once(monkeypatch):
     assert validation["replan_error"]["code"] == "GOAL_IN_COLLISION"
 
 
+def test_start_collision_recovery_prefers_shortest_monotonic_escape():
+    config = {
+        **CONFIG,
+        "navigation": {
+            **CONFIG["navigation"],
+            "start_collision_recovery": {
+                "enabled": True,
+                "search_step_m": 0.1,
+                "execution_step_m": 0.05,
+                "max_distance_m": 0.3,
+                "direction_order": ["backward", "left", "right", "forward"],
+            },
+        },
+    }
+    value = TargetAwareNavigationPipeline(config=config, target_resolver=Resolver())
+    occupancy = OccupancyMap(
+        grid=np.zeros((40, 40), dtype=np.uint8),
+        raw_grid=np.zeros((40, 40), dtype=np.uint8),
+        clearance_m=np.ones((40, 40), dtype=float),
+        resolution=0.1,
+        origin_x=-2.0,
+        origin_y=-2.0,
+    )
+    for obstacle_y in np.arange(-0.2, 0.21, 0.1):
+        occupancy.raw_grid[
+            occupancy.world_to_grid((-0.1, float(obstacle_y)))
+        ] = 1
+
+    recovery = value._plan_start_collision_recovery(
+        occupancy, base_xy=(0.0, 0.0), yaw=0.0
+    )
+
+    assert recovery is not None
+    assert recovery["direction"] == "backward"
+    overlaps = [
+        recovery["initial_overlap_cells"],
+        *[
+            sample["overlap_cells"]
+            for sample in recovery["search_samples"]
+        ],
+    ]
+    assert overlaps[-1] == 0
+    assert overlaps == sorted(overlaps, reverse=True)
+    assert recovery["execution_points"][-1][0] < 0.0
+
+
+def test_start_collision_prepares_carry_pose_before_escape_and_only_once(
+    monkeypatch,
+):
+    config = {
+        **CONFIG,
+        "navigation": {
+            **CONFIG["navigation"],
+            "start_collision_recovery": {"enabled": True},
+        },
+    }
+    occupied_builder = Builder()
+    start_center = (-2.2, 0.0)
+    start_cell = occupied_builder.map.world_to_grid(start_center)
+    occupied_builder.map.grid[start_cell] = 1
+    occupied_builder.map.raw_grid[start_cell] = 1
+    free_map = Builder().map
+
+    class SequenceBuilder:
+        def __init__(self):
+            self.calls = 0
+
+        def build(self, *args, **kwargs):
+            self.calls += 1
+            return occupied_builder.map if self.calls <= 2 else free_map
+
+    builder = SequenceBuilder()
+    value = TargetAwareNavigationPipeline(config=config, target_resolver=Resolver())
+    value.map_builder = builder
+    events = []
+
+    def prepare():
+        events.append("carry")
+        return {
+            "module": "POST_SKILL_RETURN",
+            "success": True,
+            "return_ready": True,
+            "object_alias": "bowl",
+        }
+
+    def recover(**kwargs):
+        events.append("escape")
+        assert kwargs["occupancy_map"] is occupied_builder.map
+        return (
+            True,
+            "START_COLLISION_RECOVERED",
+            free_map,
+            {"position": [-2.0, 0.0, 0.7], "yaw_rad": 0.0},
+            {"success": True, "reason": "START_COLLISION_RECOVERED"},
+        )
+
+    def navigate(*args, **kwargs):
+        events.append("navigate")
+        return {"success": True, "failure_code": None, "steps": 2}
+
+    monkeypatch.setattr(value, "_recover_start_collision", recover)
+    monkeypatch.setattr(value.base_navigator, "navigate_path", navigate)
+
+    result = value.navigate_to_manipulation_target(
+        FakeEnv(), call(), before_navigation=prepare
+    )
+
+    assert result.success
+    assert result.reason == "SUCCESS"
+    assert events == ["carry", "escape", "navigate"]
+    assert builder.calls == 3
+    assert result.diagnostics["navigation_preparation"]["return_ready"]
+    assert result.diagnostics["start_collision_recovery"]["success"]
+
+
 def test_pipeline_skips_preparation_when_navigation_is_not_required(
     monkeypatch,
 ):
@@ -336,8 +451,8 @@ def test_navigation_guard_starts_latched_and_protects_gripper(monkeypatch):
     env = FakeEnv()
     env.objects = {"bowl": object()}
     monkeypatch.setattr(
-        "robocasa.navigation.navigation_pipeline.object_utils.check_obj_grasped",
-        lambda raw_env, alias: alias == "bowl",
+        "robocasa.navigation.navigation_pipeline.check_two_finger_grasp",
+        lambda raw_env, alias: (alias == "bowl", {"source": "test"}),
     )
     value = TargetAwareNavigationPipeline(config=config)
 

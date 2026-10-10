@@ -36,10 +36,27 @@ except ImportError:  # Direct execution from the robocasa script directory.
 
 
 _JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+_LEGACY_PICK_PLACE_PREFIX = "PickPlace"
+
+
+def _is_legacy_pick_place_task(task: str) -> bool:
+    """Return whether ``task`` is a legacy combined pick-and-place skill."""
+
+    return str(task).startswith(_LEGACY_PICK_PLACE_PREFIX)
+
+
+def _planner_available_atomic_tasks() -> set[str]:
+    """Expose decomposed transfers to new plans while retaining legacy runtime tasks."""
+
+    return {
+        task
+        for task in load_available_atomic_tasks()
+        if not _is_legacy_pick_place_task(task)
+    }
 
 
 def _planner_catalog() -> dict[str, str]:
-    available = load_available_atomic_tasks()
+    available = _planner_available_atomic_tasks()
     templates = load_atomic_task_prompts()
     return {
         task: templates[task][0] if task in templates else ""
@@ -221,7 +238,17 @@ class OpenAICompatibleVLMPlanner:
             "natural names in policy_prompt. Supported predicates are "
             "open, closed, powered, inside, on, holding, inserted, pressed, turned, and "
             "fixture_state. For relations use subject for the movable object and object "
-            "for the destination. NEVER emit NavigateKitchen or navigation_pose. Plan "
+            "for the destination. For every movable-object transfer, emit a PickObject "
+            "call followed by a PlaceObject call. NEVER emit a legacy combined atomic "
+            "task whose name starts with PickPlace, and do not add an intermediate "
+            "placement unless the user explicitly requests it. Do not restore the scene "
+            "to its initial state. Opening a cabinet, drawer, refrigerator, or other "
+            "fixture to access an object does NOT imply closing it afterward. Emit a "
+            "Close task only when the user explicitly requests closure or when a later "
+            "requested operation requires closure as a functional or safety precondition "
+            "(for example, close a microwave before turning it on). Otherwise leave the "
+            "opened fixture open and omit the unnecessary Close task. NEVER emit "
+            "NavigateKitchen or navigation_pose. Plan "
             "only manipulation / fixture-operation skills. The runtime scheduler grounds "
             "each operation target against the current scene and inserts NavigateKitchen "
             "only when the robot is not already at that target. Do not reset the scene.\n"
@@ -276,6 +303,19 @@ class OpenAICompatibleVLMPlanner:
         finally:
             self._sync_client_diagnostics()
         calls = parse_vlm_task_plan(response_value)
+        legacy_tasks = sorted(
+            {
+                call.atomic_task
+                for call in calls
+                if _is_legacy_pick_place_task(call.atomic_task)
+            }
+        )
+        if legacy_tasks:
+            raise ValueError(
+                "VLM plan used legacy combined PickPlace task(s): "
+                f"{', '.join(legacy_tasks)}. Use separate PickObject and "
+                "PlaceObject calls instead."
+            )
         provenance = {
             "base_url": self.base_url,
             "endpoint": self.endpoint,

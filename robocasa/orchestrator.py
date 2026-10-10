@@ -318,6 +318,7 @@ class RoboCasaOrchestrator:
             scheduler_context: Mapping[str, Any] | None = None,
         ) -> tuple[dict[str, Any], int]:
             attempt_results: list[dict[str, Any]] = []
+            successful_place_navigation: dict[str, Any] | None = None
             for attempt_index in range(max_task_retries + 1):
                 attempt_episode_id: int | str = base_episode_id
                 if attempt_index:
@@ -329,6 +330,30 @@ class RoboCasaOrchestrator:
                 }
                 if scheduler_context is not None:
                     scheduler_query.update(dict(scheduler_context))
+                if (
+                    attempt_index > 0
+                    and retry_recovery_mode == "same_skill_no_drop_retry"
+                ):
+                    previous_stage = attempt_results[-1].get("target_aware_stage")
+                    previous_navigation_result: dict[str, Any] = {}
+                    if isinstance(previous_stage, Mapping):
+                        navigation_result = previous_stage.get("navigation_result")
+                        if isinstance(navigation_result, Mapping):
+                            previous_navigation_result = dict(navigation_result)
+                    scheduler_query["retry_from_current_pose"] = {
+                        "subgoal_id": call.subgoal_id,
+                        "source_attempt_index": attempt_index - 1,
+                        "navigation_result": previous_navigation_result,
+                    }
+                if (
+                    attempt_index > 0
+                    and call.atomic_task == "PlaceObject"
+                    and successful_place_navigation is not None
+                    and "retry_from_current_pose" not in scheduler_query
+                ):
+                    scheduler_query["reuse_successful_navigation"] = dict(
+                        successful_place_navigation
+                    )
                 attempt = self.run_atomic_task_call(
                     env=env,
                     scheduler_query=scheduler_query,
@@ -336,6 +361,23 @@ class RoboCasaOrchestrator:
                 )
                 attempt["attempt_index"] = attempt_index
                 attempt_results.append(attempt)
+                stage = attempt.get("target_aware_stage")
+                if (
+                    call.atomic_task == "PlaceObject"
+                    and isinstance(stage, Mapping)
+                    and bool(stage.get("navigation_required", False))
+                    and bool(stage.get("navigation_success", False))
+                ):
+                    navigation_result = stage.get("navigation_result")
+                    successful_place_navigation = {
+                        "subgoal_id": call.subgoal_id,
+                        "source_attempt_index": attempt_index,
+                        "navigation_result": (
+                            dict(navigation_result)
+                            if isinstance(navigation_result, Mapping)
+                            else {}
+                        ),
+                    }
                 verifier_result = attempt.get("verifier_result")
                 retryable = bool(
                     isinstance(verifier_result, Mapping)

@@ -27,7 +27,7 @@ try:
         DEFAULT_CONFIG_PATH as DEFAULT_NAVIGATION_CONFIG,
         load_navigation_config,
     )
-    from .openpi_client import OpenPIWebsocketClient
+    from .policy_backend import create_remote_policy_client
     from .oracle_logging import OracleLoggingGrounder, OracleLoggingVerifier
     from .orchestrator import RoboCasaOrchestrator
     from .pi05_env import POLICY_CAMERA_NAMES, create_pi05_env
@@ -44,6 +44,11 @@ try:
     from .vlm_client import OpenAICompatibleVisionClient
     from .vlm_grounding import VLMRoboCasaGrounder
     from .vlm_task_planner import load_vlm_task_plan
+    from .xr1_policy_client import (
+        DEFAULT_XR1_HOST,
+        DEFAULT_XR1_MODEL_PATH,
+        DEFAULT_XR1_PORT,
+    )
 except ImportError:  # Support ``python robocasa/eval_vlm_pi05.py``.
     from atomic_task_policy_adapter import RemoteAtomicTaskPolicyAdapter
     from atomic_task_verifier import RuntimeAtomicTaskVerifier
@@ -59,7 +64,7 @@ except ImportError:  # Support ``python robocasa/eval_vlm_pi05.py``.
         DEFAULT_CONFIG_PATH as DEFAULT_NAVIGATION_CONFIG,
         load_navigation_config,
     )
-    from openpi_client import OpenPIWebsocketClient
+    from policy_backend import create_remote_policy_client
     from oracle_logging import OracleLoggingGrounder, OracleLoggingVerifier
     from orchestrator import RoboCasaOrchestrator
     from pi05_env import POLICY_CAMERA_NAMES, create_pi05_env
@@ -76,6 +81,11 @@ except ImportError:  # Support ``python robocasa/eval_vlm_pi05.py``.
     from vlm_client import OpenAICompatibleVisionClient
     from vlm_grounding import VLMRoboCasaGrounder
     from vlm_task_planner import load_vlm_task_plan
+    from xr1_policy_client import (
+        DEFAULT_XR1_HOST,
+        DEFAULT_XR1_MODEL_PATH,
+        DEFAULT_XR1_PORT,
+    )
 
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -184,7 +194,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local_pose_model")
     parser.add_argument("--local_pose_api_key")
     parser.add_argument("--local_pose_timeout_s", type=float)
-    parser.add_argument("--local_pose_max_tokens", type=int, default=8192)
+    parser.add_argument("--local_pose_max_tokens", type=int, default=12288)
     parser.add_argument(
         "--local_pose_enable_thinking",
         action=argparse.BooleanOptionalAction,
@@ -203,6 +213,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--local_pose_max_decisions", type=int, default=8)
     parser.add_argument(
+        "--local_pose_translation_distance_m", type=float, default=0.10
+    )
+    parser.add_argument("--local_pose_rotation_angle_deg", type=float, default=8.0)
+    parser.add_argument(
+        "--local_pose_medium_translation_distance_m", type=float, default=0.06
+    )
+    parser.add_argument(
+        "--local_pose_fine_translation_distance_m", type=float, default=0.03
+    )
+    parser.add_argument(
+        "--local_pose_medium_rotation_angle_deg", type=float, default=4.0
+    )
+    parser.add_argument("--local_pose_fine_rotation_angle_deg", type=float, default=2.0)
+    parser.add_argument("--local_pose_motion_max_steps", type=int, default=300)
+    parser.add_argument("--local_pose_stall_window_steps", type=int, default=50)
+    parser.add_argument(
+        "--local_pose_partial_progress_ratio", type=float, default=0.75
+    )
+    parser.add_argument("--local_pose_max_motion_recoveries", type=int, default=1)
+    parser.add_argument(
         "--plan_only",
         action="store_true",
         help="Create/reset the environment and save the VLM plan, but do not connect to pi0.5.",
@@ -212,6 +242,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="VLM API smoke test without scene images/context; requires --plan_only.",
     )
+    parser.add_argument(
+        "--policy_backend",
+        choices=("pi05", "xr1"),
+        default="pi05",
+        help="Remote manipulation policy backend; planner and verifier are unchanged.",
+    )
+    parser.add_argument("--xr1_host", default=DEFAULT_XR1_HOST)
+    parser.add_argument("--xr1_port", type=int, default=DEFAULT_XR1_PORT)
+    parser.add_argument("--xr1_model_path", default=DEFAULT_XR1_MODEL_PATH)
+    parser.add_argument("--xr1_connect_timeout_s", type=float, default=15.0)
+    parser.add_argument("--xr1_infer_timeout_s", type=float, default=120.0)
+    parser.add_argument("--xr1_obs_history", type=int, default=4)
+    parser.add_argument("--xr1_obs_interval", type=int, default=2)
+    parser.add_argument("--xr1_replan_steps", type=int, default=16)
+    parser.add_argument("--xr1_crop_ratio", type=float, default=0.95)
     parser.add_argument("--pi05_host", default="172.16.36.10")
     parser.add_argument("--pi05_port", type=int, default=8000)
     parser.add_argument("--pi05_api_key")
@@ -243,7 +288,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pi05_resize_size", type=int, default=224)
     parser.add_argument("--pi05_replan_steps", type=int, default=5)
     parser.add_argument("--pi05_atomic_task_horizon", type=int, default=300)
-    parser.add_argument("--pi05_success_handoff_steps", type=int, default=30)
+    parser.add_argument(
+        "--pi05_success_handoff_steps",
+        type=int,
+        default=5,
+        help=(
+            "Additional simulator steps for confirming a stable Pick success "
+            "after the verifier first succeeds. This is independent of "
+            "--pi05_held_object_drop_confirmation_steps."
+        ),
+    )
     parser.add_argument(
         "--atomic_prompt_style",
         choices=("concise", "legacy_handoff"),
@@ -312,13 +366,22 @@ def parse_args() -> argparse.Namespace:
         "--simulator_verifier_holding_threshold", type=float
     )
     parser.add_argument(
+        "--simulator_verifier_pick_min_lift_m",
+        type=float,
+        default=0.04,
+        help=(
+            "Minimum object-center height increase required for privileged "
+            "PickObject success; set a positive value in meters."
+        ),
+    )
+    parser.add_argument(
         "--simulator_grounding_position_threshold_m", type=float
     )
     parser.add_argument(
         "--simulator_grounding_orientation_cosine_threshold", type=float
     )
     parser.add_argument(
-        "--pi05_held_object_drop_confirmation_steps", type=int, default=2
+        "--pi05_held_object_drop_confirmation_steps", type=int, default=30
     )
     parser.add_argument("--pi05_video_skip", type=int, default=2)
     parser.add_argument("--no_video", action="store_true")
@@ -330,26 +393,33 @@ def parse_args() -> argparse.Namespace:
         args.reasoning_mode = "simulator"
         args.navigation_config = LEGACY_PRIVILEGED_MAPPED_NAVIGATION_CONFIG
         args.target_aware_navigation = True
-        args.enable_local_refiner = True
+        # Keep the current mapped-navigation baseline coarse-navigation-only.
+        # An explicit --enable_local_refiner still opts back into VLM pose
+        # refinement for a dedicated ablation run.
+        if args.enable_local_refiner is None:
+            args.enable_local_refiner = False
         args.local_refiner_failure_policy = "use_coarse_pose"
         args.verification_mode = "periodic"
         args.pi05_verify_interval = 5
         args.pi05_min_steps_before_verify = 10
         args.pi05_atomic_task_horizon = 600
-        args.pi05_success_handoff_steps = 30
+        args.pi05_success_handoff_steps = 5
         args.pi05_task_retries = 3
         # Keep retries local to the current atomic skill. Do not roll the task
         # graph back to an earlier producer skill after a downstream failure.
         args.retry_recovery_mode = "same_skill_no_drop_retry"
-        args.local_pose_enable_thinking = False
+        args.local_pose_enable_thinking = True
         args.pi05_replan_steps = 5
         args.pi05_base_action_mode = "full"
         args.pi05_disable_held_object_guard = False
         args.pi05_held_object_guard_action_override = True
         args.pi05_held_object_hold_confirmation_steps = 2
-        args.pi05_held_object_drop_confirmation_steps = 2
+        args.pi05_held_object_drop_confirmation_steps = 30
         args.pi05_held_object_guard_grasp_threshold = 0.05
-        args.pi05_held_object_drop_stops_rollout = True
+        # During atomic manipulation, keep monitoring and recording object
+        # drops without interrupting the policy rollout. Target-aware base
+        # navigation has its own held-object guard and still stops immediately.
+        args.pi05_held_object_drop_stops_rollout = False
         args.simulator_verifier_holding_threshold = 0.035
         args.simulator_grounding_position_threshold_m = 0.7
         args.simulator_grounding_orientation_cosine_threshold = 0.5
@@ -362,6 +432,12 @@ def parse_args() -> argparse.Namespace:
         "vlm_max_tokens",
         "grounding_vlm_max_tokens",
         "verifier_vlm_max_tokens",
+        "xr1_port",
+        "xr1_connect_timeout_s",
+        "xr1_infer_timeout_s",
+        "xr1_obs_history",
+        "xr1_obs_interval",
+        "xr1_replan_steps",
         "pi05_port",
         "pi05_connect_timeout_s",
         "pi05_infer_timeout_s",
@@ -375,6 +451,10 @@ def parse_args() -> argparse.Namespace:
     for name in positive:
         if getattr(args, name) <= 0:
             parser.error(f"--{name} must be positive")
+    if not args.xr1_host.strip() or not args.xr1_model_path.strip():
+        parser.error("--xr1_host and --xr1_model_path must be non-empty")
+    if not 0 < args.xr1_crop_ratio <= 1:
+        parser.error("--xr1_crop_ratio must be in (0, 1]")
     for module in ("grounding", "verifier"):
         for field in ("base_url", "model", "api_key", "timeout_s"):
             name = f"{module}_vlm_{field}"
@@ -410,6 +490,7 @@ def parse_args() -> argparse.Namespace:
     for name in (
         "pi05_held_object_guard_grasp_threshold",
         "simulator_verifier_holding_threshold",
+        "simulator_verifier_pick_min_lift_m",
         "simulator_grounding_position_threshold_m",
     ):
         value = getattr(args, name)
@@ -452,6 +533,47 @@ def parse_args() -> argparse.Namespace:
         parser.error("navigation local_refiner_failure_policy must be use_coarse_pose or abort")
     if args.local_pose_max_tokens <= 0 or args.local_pose_max_decisions <= 0:
         parser.error("local-pose token and decision limits must be positive")
+    local_pose_positive = {
+        "--local_pose_translation_distance_m": args.local_pose_translation_distance_m,
+        "--local_pose_rotation_angle_deg": args.local_pose_rotation_angle_deg,
+        "--local_pose_medium_translation_distance_m": (
+            args.local_pose_medium_translation_distance_m
+        ),
+        "--local_pose_fine_translation_distance_m": (
+            args.local_pose_fine_translation_distance_m
+        ),
+        "--local_pose_medium_rotation_angle_deg": (
+            args.local_pose_medium_rotation_angle_deg
+        ),
+        "--local_pose_fine_rotation_angle_deg": args.local_pose_fine_rotation_angle_deg,
+        "--local_pose_motion_max_steps": args.local_pose_motion_max_steps,
+        "--local_pose_stall_window_steps": args.local_pose_stall_window_steps,
+    }
+    invalid_local_pose = [
+        name for name, value in local_pose_positive.items() if value <= 0
+    ]
+    if invalid_local_pose:
+        parser.error(f"{', '.join(invalid_local_pose)} must be positive")
+    if not (
+        args.local_pose_translation_distance_m
+        >= args.local_pose_medium_translation_distance_m
+        >= args.local_pose_fine_translation_distance_m
+    ):
+        parser.error(
+            "local-pose translation scales must satisfy coarse >= medium >= fine"
+        )
+    if not (
+        args.local_pose_rotation_angle_deg
+        >= args.local_pose_medium_rotation_angle_deg
+        >= args.local_pose_fine_rotation_angle_deg
+    ):
+        parser.error(
+            "local-pose rotation scales must satisfy coarse >= medium >= fine"
+        )
+    if not 0.0 < args.local_pose_partial_progress_ratio <= 1.0:
+        parser.error("--local_pose_partial_progress_ratio must be in (0, 1]")
+    if args.local_pose_max_motion_recoveries < 0:
+        parser.error("--local_pose_max_motion_recoveries must be non-negative")
     args.local_pose_base_url = args.local_pose_base_url or args.vlm_base_url
     args.local_pose_model = args.local_pose_model or args.vlm_model
     args.local_pose_api_key = (
@@ -739,19 +861,10 @@ def main() -> int:
                 frame_stride=args.pi05_video_skip,
             )
 
-        client = OpenPIWebsocketClient(
-            host=args.pi05_host,
-            port=args.pi05_port,
-            api_key=args.pi05_api_key,
-            connect_timeout_s=args.pi05_connect_timeout_s,
-            infer_timeout_s=args.pi05_infer_timeout_s,
-            max_retries=args.pi05_max_retries,
+        client, policy_metadata_name, policy_metadata = create_remote_policy_client(
+            args=args, initial_observation=observation, env=env
         )
-        write_json(
-            run_dir / "pi05_server.json",
-            {"uri": client.uri, "server_metadata": client.server_metadata},
-        )
-        print(f"[Pi05] Connected to {client.uri}")
+        write_json(run_dir / policy_metadata_name, policy_metadata)
         alias_resolver_client = planner
         if alias_resolver_client is None:
             # Saved plans stay offline unless an identifier cannot be grounded locally.
@@ -771,6 +884,9 @@ def main() -> int:
             runtime_verifier: Any = RuntimeAtomicTaskVerifier(
                 entity_alias_resolver=entity_alias_resolver,
                 holding_threshold=args.simulator_verifier_holding_threshold,
+                pick_min_lift_delta_m=(
+                    args.simulator_verifier_pick_min_lift_m
+                ),
             )
             grounder_options = {
                 "scene_context": context,
@@ -828,7 +944,11 @@ def main() -> int:
             runtime_grounder = vlm_grounder
             if args.reasoning_mode == "vlm_with_oracle_logging":
                 simulator_verifier = RuntimeAtomicTaskVerifier(
-                    entity_alias_resolver=entity_alias_resolver
+                    entity_alias_resolver=entity_alias_resolver,
+                    holding_threshold=args.simulator_verifier_holding_threshold,
+                    pick_min_lift_delta_m=(
+                        args.simulator_verifier_pick_min_lift_m
+                    ),
                 )
                 simulator_grounder = RoboCasaGrounder(
                     scene_context=context,
@@ -862,6 +982,9 @@ def main() -> int:
                 "simulator_verifier_holding_threshold": (
                     args.simulator_verifier_holding_threshold
                 ),
+                "simulator_verifier_pick_min_lift_m": (
+                    args.simulator_verifier_pick_min_lift_m
+                ),
                 "runtime_grounder": type(runtime_grounder).__name__,
                 "runtime_verifier": type(runtime_verifier).__name__,
                 "verification_mode": args.verification_mode,
@@ -886,6 +1009,7 @@ def main() -> int:
                     if args.reasoning_mode != "simulator"
                     else None
                 ),
+                "policy_backend": args.policy_backend,
                 "policy_camera_names": list(POLICY_CAMERA_NAMES),
                 "target_aware_navigation": args.target_aware_navigation,
                 "navigation_config": str(args.navigation_config),
@@ -928,7 +1052,11 @@ def main() -> int:
             verifier=runtime_verifier,
             log_dir=run_dir,
             resize_size=args.pi05_resize_size,
-            replan_steps=args.pi05_replan_steps,
+            replan_steps=(
+                args.xr1_replan_steps
+                if args.policy_backend == "xr1"
+                else args.pi05_replan_steps
+            ),
             atomic_task_horizon=args.pi05_atomic_task_horizon,
             use_registry_horizons=args.pi05_use_registry_horizons,
             verify_interval=args.pi05_verify_interval,
@@ -959,6 +1087,9 @@ def main() -> int:
             ),
             held_object_guard_grasp_threshold=(
                 args.pi05_held_object_guard_grasp_threshold
+            ),
+            held_object_guard_pick_min_lift_m=(
+                args.simulator_verifier_pick_min_lift_m
             ),
             render=not args.no_video,
             video_skip=args.pi05_video_skip,
@@ -997,6 +1128,20 @@ def main() -> int:
                     ),
                     image_size=args.camera_size,
                     max_decisions=args.local_pose_max_decisions,
+                    translation_distance_m=args.local_pose_translation_distance_m,
+                    rotation_angle_deg=args.local_pose_rotation_angle_deg,
+                    medium_translation_distance_m=(
+                        args.local_pose_medium_translation_distance_m
+                    ),
+                    fine_translation_distance_m=(
+                        args.local_pose_fine_translation_distance_m
+                    ),
+                    medium_rotation_angle_deg=args.local_pose_medium_rotation_angle_deg,
+                    fine_rotation_angle_deg=args.local_pose_fine_rotation_angle_deg,
+                    motion_max_steps=args.local_pose_motion_max_steps,
+                    stall_window_steps=args.local_pose_stall_window_steps,
+                    partial_progress_ratio=args.local_pose_partial_progress_ratio,
+                    max_motion_recoveries=args.local_pose_max_motion_recoveries,
                     held_object_guard=True,
                 )
             adapter = TargetAwarePolicyAdapter(

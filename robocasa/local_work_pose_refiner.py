@@ -160,6 +160,165 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
+def _token_count(value: Any) -> int | None:
+    """Return one non-negative token count without accepting booleans."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not np.isfinite(value) or value < 0:
+        return None
+    return int(value)
+
+
+def _first_token_count(*values: Any) -> int | None:
+    for value in values:
+        count = _token_count(value)
+        if count is not None:
+            return count
+    return None
+
+
+def _response_text_lengths(raw_http_response: str | None) -> tuple[int, int]:
+    """Return visible-output and reasoning character counts for diagnostics."""
+
+    if not isinstance(raw_http_response, str) or not raw_http_response.strip():
+        return 0, 0
+    try:
+        response = json.loads(raw_http_response)
+    except json.JSONDecodeError:
+        return 0, 0
+    choices = response.get("choices") if isinstance(response, Mapping) else None
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):
+        return 0, 0
+    choice = choices[0]
+    message = choice.get("message")
+    if not isinstance(message, Mapping):
+        visible = choice.get("text")
+        return (len(visible) if isinstance(visible, str) else 0), 0
+
+    def text_length(value: Any) -> int:
+        if isinstance(value, str):
+            return len(value)
+        if isinstance(value, Mapping):
+            return sum(
+                text_length(value.get(key))
+                for key in ("text", "output_text", "content", "value")
+                if key in value
+            )
+        if isinstance(value, (list, tuple)):
+            return sum(text_length(item) for item in value)
+        return 0
+
+    visible_chars = text_length(message.get("content"))
+    reasoning_chars = max(
+        text_length(message.get("reasoning_content")),
+        text_length(message.get("reasoning")),
+    )
+    return visible_chars, reasoning_chars
+
+
+def _vlm_usage_breakdown(
+    usage: Mapping[str, Any] | None,
+    *,
+    raw_http_response: str | None,
+    finish_reason: Any,
+) -> dict[str, Any]:
+    """Normalize OpenAI/vLLM usage and separate reasoning when provided."""
+
+    usage = usage if isinstance(usage, Mapping) else {}
+    completion_details = usage.get("completion_tokens_details")
+    if not isinstance(completion_details, Mapping):
+        completion_details = {}
+    output_details = usage.get("output_tokens_details")
+    if not isinstance(output_details, Mapping):
+        output_details = {}
+
+    input_tokens = _first_token_count(
+        usage.get("prompt_tokens"), usage.get("input_tokens")
+    )
+    completion_tokens = _first_token_count(
+        usage.get("completion_tokens"), usage.get("output_tokens")
+    )
+    total_tokens = _token_count(usage.get("total_tokens"))
+    reasoning_tokens = _first_token_count(
+        usage.get("reasoning_tokens"),
+        completion_details.get("reasoning_tokens"),
+        output_details.get("reasoning_tokens"),
+    )
+    visible_output_tokens = None
+    if completion_tokens is not None and reasoning_tokens is not None:
+        visible_output_tokens = max(0, completion_tokens - reasoning_tokens)
+
+    visible_chars, reasoning_chars = _response_text_lengths(raw_http_response)
+    if reasoning_tokens is not None:
+        dominant = (
+            "reasoning"
+            if reasoning_tokens > (visible_output_tokens or 0)
+            else "visible_output"
+        )
+    elif reasoning_chars > max(256, visible_chars * 2):
+        dominant = "reasoning_inferred_from_response_chars"
+    elif input_tokens is not None and completion_tokens is not None:
+        dominant = "input" if input_tokens > completion_tokens else "completion_unseparated"
+    else:
+        dominant = "unknown"
+
+    return {
+        "finish_reason": None if finish_reason is None else str(finish_reason),
+        "input_tokens": input_tokens,
+        "completion_tokens": completion_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "visible_output_tokens": visible_output_tokens,
+        "total_tokens": total_tokens,
+        "server_reported_reasoning_tokens": reasoning_tokens is not None,
+        "visible_output_chars": visible_chars,
+        "reasoning_chars": reasoning_chars,
+        "dominant_usage": dominant,
+    }
+
+
+def _summarize_vlm_usage(decisions: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    rounds = [
+        (int(item.get("decision_index", index)), dict(item["vlm_usage_breakdown"]))
+        for index, item in enumerate(decisions)
+        if isinstance(item.get("vlm_usage_breakdown"), Mapping)
+    ]
+    finish_reason_counts: dict[str, int] = {}
+    for _, item in rounds:
+        key = str(item.get("finish_reason") or "unknown")
+        finish_reason_counts[key] = finish_reason_counts.get(key, 0) + 1
+
+    token_fields = (
+        "input_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "visible_output_tokens",
+        "total_tokens",
+    )
+    totals: dict[str, int | None] = {}
+    for field in token_fields:
+        values = [item.get(field) for _, item in rounds]
+        known = [int(value) for value in values if isinstance(value, int)]
+        totals[field] = sum(known) if known and len(known) == len(values) else None
+    totals["visible_output_chars"] = sum(
+        int(item.get("visible_output_chars") or 0) for _, item in rounds
+    )
+    totals["reasoning_chars"] = sum(
+        int(item.get("reasoning_chars") or 0) for _, item in rounds
+    )
+    return {
+        "num_requests": len(rounds),
+        "finish_reason_counts": finish_reason_counts,
+        "server_reasoning_usage_available_for_all_requests": bool(rounds)
+        and all(bool(item.get("server_reported_reasoning_tokens")) for _, item in rounds),
+        "totals": totals,
+        "rounds": [
+            {"decision_index": decision_index, **item}
+            for decision_index, item in rounds
+        ],
+    }
+
+
 def _as_rgb_uint8(image: Any) -> np.ndarray:
     array = np.asarray(image)
     if array.ndim != 3:
@@ -378,7 +537,9 @@ def _validate_decision(value: Any) -> dict[str, Any]:
     operation_ready = value.get("operation_ready", False)
     if not isinstance(target_visible, bool) or not isinstance(operation_ready, bool):
         raise RuntimeError("target_visible and operation_ready must be booleans")
-    reason = str(value.get("reason", "")).strip()
+    reason = re.sub(r"\s+", " ", str(value.get("reason", "")).strip())
+    if len(reason) > 240:
+        reason = reason[:237].rstrip() + "..."
     return {
         "action": action,
         "action_source": action_source,
@@ -497,30 +658,31 @@ class OpenAICompatibleLocalPoseVLM:
             raise ValueError("local-pose VLM requires at least one camera image")
 
         user_prompt = (
-            "Judge the robot work pose for the operation below along three independent "
-            "axes in the ROBOT BASE frame. distance_alignment is TOO_FAR, ALIGNED, "
-            "TOO_CLOSE, or UNRESOLVED; lateral_alignment is TARGET_LEFT, ALIGNED, "
-            "TARGET_RIGHT, or UNRESOLVED; yaw_alignment is TURN_LEFT, ALIGNED, "
-            "TURN_RIGHT, or UNRESOLVED. Distance means manipulation reachability, not "
-            "image centeredness. A visible or centered target is not proof of reachability; "
-            "when uncertain between ALIGNED and TOO_FAR, prefer TOO_FAR. Follow strict "
-            "priority yaw -> lateral -> distance and choose exactly one action from "
-            "FORWARD_SMALL, BACKWARD_SMALL, STRAFE_LEFT_SMALL, STRAFE_RIGHT_SMALL, "
-            "TURN_LEFT_SMALL, TURN_RIGHT_SMALL, STOP, UNRESOLVED. operation_ready=true "
-            "and STOP require target_visible=true, all axes ALIGNED, and strong visual "
-            "evidence of comfortable arm reachability. Reassess from these fresh images; "
-            "previous_corrections have already executed. For robot0_topview use the exact "
-            "calibration: image RIGHT=robot FORWARD, image UP=robot LEFT, image "
-            "LEFT=robot BACKWARD, image DOWN=robot RIGHT. Context:\n"
+            "From the fresh images, choose only the next single base correction for the "
+            "current atomic operation. Judge three ROBOT BASE-frame relations: "
+            "distance_alignment={TOO_FAR, ALIGNED, TOO_CLOSE, UNRESOLVED}; "
+            "lateral_alignment={TARGET_LEFT, ALIGNED, TARGET_RIGHT, UNRESOLVED}; "
+            "yaw_alignment={TURN_LEFT, ALIGNED, TURN_RIGHT, UNRESOLVED}. Distance means "
+            "comfortable manipulation reach, not image centeredness. Select one action "
+            "using yaw -> lateral -> distance priority from {FORWARD_SMALL, "
+            "BACKWARD_SMALL, STRAFE_LEFT_SMALL, STRAFE_RIGHT_SMALL, TURN_LEFT_SMALL, "
+            "TURN_RIGHT_SMALL, STOP, UNRESOLVED}. STOP requires clear evidence that the "
+            "target is visible and all axes are aligned. If visual evidence is insufficient, "
+            "use UNRESOLVED under the existing protocol. Do not analyze the complete task, "
+            "later skills, or hypothetical action sequences. History records completed "
+            "motion only. Top-view calibration: image RIGHT=robot FORWARD, image "
+            "UP=robot LEFT, image LEFT=robot BACKWARD, image DOWN=robot RIGHT. Context:\n"
             + json.dumps(_jsonable(context), ensure_ascii=False)
         )
         system_prompt = (
-            "You are a conservative RoboCasa local work-pose controller. Return exactly "
-            "one JSON object with keys distance_alignment, lateral_alignment, "
-            "yaw_alignment, action, confidence, target_visible, operation_ready, reason. "
-            "Never output arm commands. confidence must be numeric in [0,1]. Enforce "
-            "yaw -> lateral -> distance priority. Use UNRESOLVED when the views cannot "
-            "support a judgment, and do not declare reachability from visual centering."
+            "You are a one-step RoboCasa local work-pose controller. Inspect only the "
+            "current images and current atomic operation. Do not reconstruct the full task, "
+            "plan future skills, or repeatedly debate alternatives. Return exactly one JSON "
+            "object with keys distance_alignment, lateral_alignment, yaw_alignment, action, "
+            "confidence, target_visible, operation_ready, reason. Never output arm commands. "
+            "confidence must be numeric in [0,1]. If evidence is insufficient, set the "
+            "uncertain relation to UNRESOLVED, action=UNRESOLVED, and "
+            "operation_ready=false. Keep reason to one visual observation under 15 words."
         )
         try:
             decision = self._vision_client.query_json(
@@ -782,15 +944,15 @@ class LocalWorkPoseRefiner:
         settle_steps: int = 2,
         translation_command: float = 0.20,
         rotation_command: float = 0.25,
-        translation_distance_m: float = 0.30,
-        rotation_angle_deg: float = 25.0,
-        medium_translation_distance_m: float = 0.12,
-        fine_translation_distance_m: float = 0.05,
-        medium_rotation_angle_deg: float = 10.0,
-        fine_rotation_angle_deg: float = 5.0,
+        translation_distance_m: float = 0.10,
+        rotation_angle_deg: float = 8.0,
+        medium_translation_distance_m: float = 0.06,
+        fine_translation_distance_m: float = 0.03,
+        medium_rotation_angle_deg: float = 4.0,
+        fine_rotation_angle_deg: float = 2.0,
         held_translation_distance_m: float = 0.01,
         held_rotation_angle_deg: float = 1.0,
-        motion_max_steps: int = 2000,
+        motion_max_steps: int = 300,
         translation_tolerance_m: float = 0.015,
         rotation_tolerance_deg: float = 1.0,
         max_total_translation_m: float = 1.20,
@@ -798,11 +960,11 @@ class LocalWorkPoseRefiner:
         max_invalid_stops: int = 2,
         rotation_translation_drift_limit_m: float = 0.08,
         translation_rotation_drift_limit_deg: float = 5.0,
-        stall_window_steps: int = 100,
+        stall_window_steps: int = 50,
         stall_translation_epsilon_m: float = 0.001,
         stall_rotation_epsilon_deg: float = 0.2,
         partial_progress_ratio: float = 0.75,
-        max_motion_recoveries: int = 2,
+        max_motion_recoveries: int = 1,
         max_fine_axis_reversals: int = 3,
         min_confidence: float = 0.55,
         held_object_guard: bool = True,
@@ -910,13 +1072,10 @@ class LocalWorkPoseRefiner:
 
     def _step_profile(self, axis: str, level: int, held_mode: bool) -> dict[str, Any]:
         level = max(0, min(2, int(level)))
-        if held_mode:
-            return {
-                "scale": "held_fine",
-                "level": 2,
-                "translation_m": self.held_translation_distance_m,
-                "rotation_deg": self.held_rotation_angle_deg,
-            }
+        # Holding an object changes the guard / gripper behavior, but no longer
+        # forces every correction to the legacy 1 cm / 1 degree step. Use the
+        # same coarse-to-fine schedule as an empty-gripper refinement so the
+        # VLM receives consistent action semantics in both modes.
         translation_scales = (
             self.translation_distance_m,
             self.medium_translation_distance_m,
@@ -988,23 +1147,15 @@ class LocalWorkPoseRefiner:
             raise ValueError(f"{action_name!r} is not an executable base action")
 
         initial_pose = _read_base_pose(env, observation)
-        translation_distance = (
-            self.held_translation_distance_m
-            if held_mode
-            else float(
-                self.translation_distance_m
-                if translation_distance_override_m is None
-                else translation_distance_override_m
-            )
+        translation_distance = float(
+            self.translation_distance_m
+            if translation_distance_override_m is None
+            else translation_distance_override_m
         )
-        rotation_angle_deg = (
-            self.held_rotation_angle_deg
-            if held_mode
-            else float(
-                self.rotation_angle_deg
-                if rotation_angle_override_deg is None
-                else rotation_angle_override_deg
-            )
+        rotation_angle_deg = float(
+            self.rotation_angle_deg
+            if rotation_angle_override_deg is None
+            else rotation_angle_override_deg
         )
         target_pose = _target_base_pose(
             initial_pose,
@@ -1025,11 +1176,11 @@ class LocalWorkPoseRefiner:
         )
         effective_translation_tolerance_m = min(
             self.translation_tolerance_m,
-            max(0.005, 0.10 * translation_distance),
+            max(0.0025, 0.05 * translation_distance),
         )
         effective_rotation_tolerance_deg = min(
             self.rotation_tolerance_deg,
-            max(0.5, 0.10 * rotation_angle_deg),
+            max(0.25, 0.05 * rotation_angle_deg),
         )
 
         object_alias = guard.to_dict().get("object_alias") if held_mode else None
@@ -1048,9 +1199,12 @@ class LocalWorkPoseRefiner:
         convergence_mode: str | None = None
         done = False
 
-        # Stall detection compares actual base poses at the start/end of each window.
-        # This is deliberately independent of target-error improvement.
+        # Stall detection checks both physical pose motion and improvement of the
+        # requested-axis target error over each bounded window.
         window_start_pose = dict(initial_pose)
+        window_start_primary_error = requested_primary
+        last_window_primary_improvement: float | None = None
+        stall_trigger: str | None = None
 
         for motion_step in range(1, self.motion_max_steps + 1):
             pose = _read_base_pose(env, observation)
@@ -1172,6 +1326,22 @@ class LocalWorkPoseRefiner:
                     window_translation <= self.stall_translation_epsilon_m
                     and window_rotation_deg <= self.stall_rotation_epsilon_deg
                 )
+                if action_name in _TRANSLATION_ACTIONS:
+                    primary_improvement = window_start_primary_error - primary_error
+                    progress_epsilon = self.stall_translation_epsilon_m
+                else:
+                    primary_improvement = math.degrees(
+                        window_start_primary_error - primary_error
+                    )
+                    progress_epsilon = self.stall_rotation_epsilon_deg
+                last_window_primary_improvement = float(primary_improvement)
+                insufficient_primary_progress = primary_improvement <= progress_epsilon
+                trace_entry["window_translation_m"] = window_translation
+                trace_entry["window_rotation_deg"] = window_rotation_deg
+                trace_entry["window_primary_improvement"] = primary_improvement
+                trace_entry["insufficient_primary_progress"] = (
+                    insufficient_primary_progress
+                )
 
                 completion_ratio = 0.0
                 if requested_primary > 1e-12:
@@ -1179,7 +1349,12 @@ class LocalWorkPoseRefiner:
                         0.0, min(1.0, 1.0 - primary_error / requested_primary)
                     )
 
-                if physically_stalled:
+                if physically_stalled or insufficient_primary_progress:
+                    stall_trigger = (
+                        "physical_pose_stall"
+                        if physically_stalled
+                        else "primary_error_not_improving"
+                    )
                     # Near-target actuator deadzones are accepted as partial completion;
                     # the next VLM observation closes the remaining error.
                     if completion_ratio >= self.partial_progress_ratio:
@@ -1188,6 +1363,7 @@ class LocalWorkPoseRefiner:
                     else:
                         failure_code = "LOCAL_POSE_MOTION_STALLED"
                 window_start_pose = dict(current_pose)
+                window_start_primary_error = primary_error
 
             if guard_failure is not None:
                 failure_code = str(
@@ -1278,7 +1454,7 @@ class LocalWorkPoseRefiner:
             "requested_rotation_deg": requested_rotation_deg,
             "translation_tolerance_m": effective_translation_tolerance_m,
             "rotation_tolerance_deg": effective_rotation_tolerance_deg,
-            "step_scale": step_scale or ("held_fine" if held_mode else "coarse"),
+            "step_scale": step_scale or "coarse",
             "rotation_translation_drift_limit_m": (
                 self.rotation_translation_drift_limit_m
             ),
@@ -1293,6 +1469,8 @@ class LocalWorkPoseRefiner:
             "steps": len(trace),
             "converged": converged and failure_code is None,
             "convergence_mode": convergence_mode,
+            "stall_trigger": stall_trigger,
+            "last_window_primary_improvement": last_window_primary_improvement,
             "failure_code": failure_code,
             "trace": trace,
         }
@@ -1382,11 +1560,20 @@ class LocalWorkPoseRefiner:
                 "arguments": call.arguments,
                 "grounding_result": _sanitise_grounding_for_vlm(grounding_result),
                 "decision_index": decision_index,
-                "previous_actions": executed_actions,
+                "recent_actions": executed_actions[-3:],
                 "held_mode": held_mode,
                 "view_selection_purpose": "work_pose_refinement",
-                "available_camera_names": list(self.camera_names),
                 "selected_camera_names": list(selected_camera_names),
+                "cumulative_state": {
+                    "executed_action_count": len(executed_actions),
+                    "total_translation_m": round(total_translation_m, 4),
+                    "total_rotation_deg": round(total_rotation_deg, 3),
+                    "motion_recovery_count": motion_recovery_count,
+                    "action_distribution": {
+                        name: executed_actions.count(name)
+                        for name in sorted(set(executed_actions))
+                    },
+                },
                 "correction_scales": {
                     "translation_m": {
                         "coarse": self.translation_distance_m,
@@ -1409,17 +1596,13 @@ class LocalWorkPoseRefiner:
                     },
                     "axis_reversal_counts": dict(axis_reversal_counts),
                     "instruction": (
-                        "Reassess all axes from images. If one axis has been corrected "
-                        "repeatedly while another remains misaligned, do not keep choosing "
-                        "the repeated axis without strong fresh visual evidence. Direction "
-                        "reversals indicate overshoot; the controller will automatically "
-                        "reduce the step size."
+                        "Use fresh images. Repeated axes become smaller; reversals mean "
+                        "possible overshoot."
                     ),
                 },
                 "previous_corrections": [
                     {
                         "action": item.get("action"),
-                        "reason": item.get("reason"),
                         "distance_alignment": item.get("distance_alignment"),
                         "lateral_alignment": item.get("lateral_alignment"),
                         "yaw_alignment": item.get("yaw_alignment"),
@@ -1448,7 +1631,7 @@ class LocalWorkPoseRefiner:
                             "final_yaw_error_deg"
                         ),
                     }
-                    for item in decisions
+                    for item in decisions[-2:]
                     if item.get("motion")
                 ],
                 "last_validation_error": last_validation_error,
@@ -1483,6 +1666,11 @@ class LocalWorkPoseRefiner:
                     "http_status": http_status,
                     "vlm_finish_reason": finish_reason,
                     "vlm_usage": usage,
+                    "vlm_usage_breakdown": _vlm_usage_breakdown(
+                        usage,
+                        raw_http_response=raw_http_response,
+                        finish_reason=finish_reason,
+                    ),
                     "camera_names": list(images),
                     "base_pose_before": _read_base_pose(env, observation),
                     "executed_env_steps": 0,
@@ -1526,6 +1714,11 @@ class LocalWorkPoseRefiner:
                     "http_status": http_status,
                     "vlm_finish_reason": finish_reason,
                     "vlm_usage": usage,
+                    "vlm_usage_breakdown": _vlm_usage_breakdown(
+                        usage,
+                        raw_http_response=raw_http_response,
+                        finish_reason=finish_reason,
+                    ),
                     "camera_names": list(images),
                     "base_pose_before": _read_base_pose(env, observation),
                     "executed_env_steps": 0,
@@ -1562,6 +1755,11 @@ class LocalWorkPoseRefiner:
                 "http_status": http_status,
                 "vlm_finish_reason": finish_reason,
                 "vlm_usage": usage,
+                "vlm_usage_breakdown": _vlm_usage_breakdown(
+                    usage,
+                    raw_http_response=raw_http_response,
+                    finish_reason=finish_reason,
+                ),
                 "camera_names": list(images),
                 "base_pose_before": _read_base_pose(env, observation),
                 "executed_env_steps": 0,
@@ -1581,13 +1779,23 @@ class LocalWorkPoseRefiner:
             if decision["action"] == "UNRESOLVED":
                 failure_code = "LOCAL_POSE_UNRESOLVED"
                 break
-            # Repeating the same discrete direction is valid after a fresh visual
-            # observation. A 30-degree correction may legitimately require three
-            # consecutive 10-degree TURN_LEFT_SMALL actions. Safety is enforced by
-            # motion budgets, cross-axis drift limits, and oscillation detection.
+            # A repeated direction remains valid when it is the only reported
+            # misalignment. If the previous relative command converged and another
+            # reported axis is still wrong, correct that axis before repeating it.
+            record["proposed_action"] = decision["action"]
             record["same_as_previous_action"] = bool(
                 executed_actions and decision["action"] == executed_actions[-1]
             )
+            if record["same_as_previous_action"] and decisions[-2].get(
+                "motion", {}
+            ).get("converged"):
+                alternative = _alternative_alignment_action(
+                    decision, decision["action"], {decision["action"]}
+                )
+                if alternative is not None:
+                    decision["action"] = alternative
+                    record["action"] = alternative
+                    record["action_override"] = "skip_completed_action_repeat"
             if decision["action"] == "STOP":
                 valid_stop = bool(
                     decision["operation_ready"] and decision["target_visible"]
@@ -1718,15 +1926,18 @@ class LocalWorkPoseRefiner:
                 if (
                     motion_failure in recoverable_motion_failures
                     and motion_recovery_count < self.max_motion_recoveries
+                    and decision_index + 1 < self.max_decisions
                 ):
                     motion_recovery_count += 1
-                    record["motion_recovery"] = "reobserve"
+                    axis_scale_levels[action_axis] = min(
+                        2,
+                        max(axis_scale_levels[action_axis], selected_level + 1),
+                    )
+                    record["motion_recovery"] = "reobserve_with_smaller_scale"
                     last_validation_error = (
-                        f"Previous correction {decision['action']} ended with "
-                        f"{motion_failure}. The base is now at the reported final pose. "
-                        "Reassess the fresh camera views; choose the correction supported "
-                        "by the current images rather than assuming the prior command "
-                        "completed exactly."
+                        f"{decision['action']} ended {motion_failure} at "
+                        f"{float(motion.get('primary_completion_ratio', 0.0)):.0%} "
+                        "completion. Reassess current images."
                     )
                     continue
                 failure_code = motion_failure
@@ -1739,6 +1950,7 @@ class LocalWorkPoseRefiner:
             failure_code = "LOCAL_POSE_MAX_DECISIONS"
         if not success and failure_code is not None:
             status = "failed"
+        vlm_usage_summary = _summarize_vlm_usage(decisions)
         result = {
             "module": "LOCAL_WORK_POSE_REFINER",
             "status": status,
@@ -1767,6 +1979,7 @@ class LocalWorkPoseRefiner:
                 "max_translation_m": self.max_total_translation_m,
                 "max_rotation_deg": self.max_total_rotation_deg,
             },
+            "vlm_usage_summary": vlm_usage_summary,
             "adaptive_refinement": {
                 "translation_scales_m": {
                     "coarse": self.translation_distance_m,
@@ -1788,6 +2001,10 @@ class LocalWorkPoseRefiner:
             "held_object_guard": guard.to_dict(),
             "artifact_dir": str(output_dir),
         }
+        (output_dir / "vlm_usage_summary.json").write_text(
+            json.dumps(_jsonable(vlm_usage_summary), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
         (output_dir / "result.json").write_text(
             json.dumps(_jsonable(result), indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",

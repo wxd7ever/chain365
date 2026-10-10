@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROBOCASA_DIR))
 
 from atomic_task_schemas import AtomicTaskCall  # noqa: E402
 from robust_vlm_task_planner import (  # noqa: E402
+    _annotate_interchangeable_object_groups,
     _controlled_decomposition,
     _normalize_execution_plan,
     _validate_execution_plan,
@@ -126,6 +127,53 @@ def test_existing_pick_object_also_gets_standard_pick_work_pose():
         change["type"] == "apply_standard_pick_work_pose"
         for change in changes
     )
+
+
+def test_normalizer_repairs_agent_subject_pick_holding_condition():
+    calls = [
+        AtomicTaskCall.from_mapping(
+            {
+                "subgoal_id": "pick_tomato_from_sink",
+                "atomic_task": "PickObject",
+                "policy_prompt": "Pick up the tomato from the sink.",
+                "arguments": {
+                    "object_name": "vegetable",
+                    "source_name": "sink_island_group",
+                },
+                "termination_condition": [
+                    {
+                        "predicate": "holding",
+                        "subject": "robot",
+                        "desired_value": "vegetable",
+                    }
+                ],
+            }
+        )
+    ]
+    context = {
+        "fixtures": [
+            {"alias": "sink_island_group", "natural_name": "sink"}
+        ],
+        "objects": [
+            {"alias": "vegetable", "natural_name": "tomato"}
+        ],
+    }
+
+    normalized, changes = _normalize_execution_plan(calls, context)
+
+    assert normalized[0].termination_condition == [
+        {
+            "predicate": "holding",
+            "subject": "vegetable",
+            "desired_value": True,
+        }
+    ]
+    assert any(
+        change["type"] == "normalize_pick_holding_condition"
+        and change["subject"] == "vegetable"
+        for change in changes
+    )
+    _validate_execution_plan(normalized, context)
 
 
 def test_composite_place_reuses_preceding_pick_of_same_object():
@@ -422,6 +470,152 @@ def test_validation_rejects_unrequested_fixture_family():
         _validate_execution_plan(calls, context)
 
 
+def _object_call(
+    *,
+    subgoal_id: str,
+    atomic_task: str,
+    object_alias: str,
+    destination_alias: str | None = None,
+) -> AtomicTaskCall:
+    if atomic_task == "PickObject":
+        return AtomicTaskCall.from_mapping(
+            {
+                "subgoal_id": subgoal_id,
+                "atomic_task": atomic_task,
+                "policy_prompt": f"Pick up the {object_alias}.",
+                "arguments": {"object_id": object_alias},
+                "termination_condition": {
+                    "predicate": "holding",
+                    "subject": object_alias,
+                    "desired_value": True,
+                },
+            }
+        )
+    assert atomic_task == "PlaceObject"
+    assert destination_alias is not None
+    return AtomicTaskCall.from_mapping(
+        {
+            "subgoal_id": subgoal_id,
+            "atomic_task": atomic_task,
+            "policy_prompt": (
+                f"Place the {object_alias} on the {destination_alias}."
+            ),
+            "arguments": {
+                "held_object_id": object_alias,
+                "destination_id": destination_alias,
+            },
+            "termination_condition": {
+                "predicate": "on",
+                "subject": object_alias,
+                "object": destination_alias,
+                "desired_value": True,
+            },
+        }
+    )
+
+
+def _holding_flow_context() -> dict:
+    return {
+        "fixtures": [
+            {"alias": "counter", "natural_name": "counter"},
+            {"alias": "dining_counter", "natural_name": "dining counter"},
+            {"alias": "cabinet", "natural_name": "cabinet"},
+        ],
+        "objects": [
+            {"alias": "bread", "natural_name": "bread"},
+            {"alias": "basket", "natural_name": "basket"},
+        ],
+    }
+
+
+def test_validation_accepts_matching_pick_then_place():
+    calls = [
+        _object_call(
+            subgoal_id="pick_basket",
+            atomic_task="PickObject",
+            object_alias="basket",
+        ),
+        _object_call(
+            subgoal_id="place_basket",
+            atomic_task="PlaceObject",
+            object_alias="basket",
+            destination_alias="dining_counter",
+        ),
+    ]
+
+    _validate_execution_plan(calls, _holding_flow_context())
+
+
+def test_validation_rejects_place_without_preceding_pick():
+    calls = [
+        _object_call(
+            subgoal_id="place_basket",
+            atomic_task="PlaceObject",
+            object_alias="basket",
+            destination_alias="dining_counter",
+        )
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match=r"PlaceObject\(basket\).*preceding unmatched PickObject\(basket\)",
+    ):
+        _validate_execution_plan(calls, _holding_flow_context())
+
+
+def test_validation_rejects_place_of_different_object_than_held():
+    calls = [
+        _object_call(
+            subgoal_id="pick_bread",
+            atomic_task="PickObject",
+            object_alias="bread",
+        ),
+        _object_call(
+            subgoal_id="place_basket",
+            atomic_task="PlaceObject",
+            object_alias="basket",
+            destination_alias="dining_counter",
+        ),
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match=r"PlaceObject\(basket\).*establishes holding\(bread\)",
+    ):
+        _validate_execution_plan(calls, _holding_flow_context())
+
+
+def test_fixture_operation_between_pick_and_place_preserves_holding_state():
+    calls = [
+        _object_call(
+            subgoal_id="pick_basket",
+            atomic_task="PickObject",
+            object_alias="basket",
+        ),
+        AtomicTaskCall.from_mapping(
+            {
+                "subgoal_id": "close_cabinet",
+                "atomic_task": "CloseCabinet",
+                "policy_prompt": "Close the cabinet.",
+                "arguments": {"fixture_id": "cabinet"},
+                "termination_condition": {
+                    "predicate": "closed",
+                    "subject": "cabinet",
+                    "desired_value": True,
+                },
+            }
+        ),
+        _object_call(
+            subgoal_id="place_basket",
+            atomic_task="PlaceObject",
+            object_alias="basket",
+            destination_alias="dining_counter",
+        ),
+    ]
+
+    _validate_execution_plan(calls, _holding_flow_context())
+
+
 def test_controlled_place_equal_ice_cubes_decomposes_to_four_counted_calls():
     context = {
         "env_name": "PlaceEqualIceCubes",
@@ -602,3 +796,84 @@ def test_normalizer_skips_navigation_to_initialized_object():
     )
     assert skipped["fixture"] == "counter_main_group"
     assert skipped["object"] == "blender_jug"
+
+
+def test_french_door_open_prompt_explicitly_requires_both_doors():
+    call = AtomicTaskCall.from_mapping(
+        {
+            "subgoal_id": "open_fridge",
+            "atomic_task": "OpenFridge",
+            "policy_prompt": "Open the fridge door.",
+            "arguments": {
+                "fixture_name": "fridge",
+                "door_name": "fridge_main_group",
+            },
+            "termination_condition": {
+                "predicate": "open",
+                "subject": "fridge_main_group",
+                "desired_value": True,
+            },
+        }
+    )
+    context = {
+        "fixtures": [
+            {
+                "alias": "fridge_main_group",
+                "name": "fridge_main_group",
+                "natural_name": "fridge",
+                "type": "FridgeFrenchDoor",
+            }
+        ],
+        "objects": [],
+    }
+
+    normalized, changes = _normalize_execution_plan([call], context)
+
+    assert normalized[0].policy_prompt == "Open both doors of the fridge."
+    change = next(
+        item
+        for item in changes
+        if item.get("type") == "require_both_french_fridge_doors"
+    )
+    assert change["fixture_id"] == "fridge_main_group"
+
+
+def test_make_ice_lemonade_marks_both_ice_cubes_interchangeable():
+    calls = [
+        _object_call(
+            subgoal_id="pick_ice_cube",
+            atomic_task="PickObject",
+            object_alias="ice_cube1",
+        ),
+        _object_call(
+            subgoal_id="place_ice_cube",
+            atomic_task="PlaceObject",
+            object_alias="ice_cube1",
+            destination_alias="glass_cup",
+        ),
+    ]
+    calls[0] = AtomicTaskCall.from_mapping(
+        {**calls[0].to_dict(), "policy_prompt": "Pick up an ice cube."}
+    )
+    calls[1] = AtomicTaskCall.from_mapping(
+        {**calls[1].to_dict(), "policy_prompt": "Place the ice cube in the glass cup."}
+    )
+    prepared, changes = _annotate_interchangeable_object_groups(
+        calls,
+        {
+            "env_name": "MakeIceLemonade",
+            "objects": [
+                {"alias": "ice_cube1"},
+                {"alias": "ice_cube2"},
+                {"alias": "glass_cup"},
+            ],
+        },
+    )
+
+    assert len(changes) == 2
+    for call in prepared:
+        assert call.metadata["interchangeable_object_canonical"] == "ice_cube1"
+        assert call.metadata["interchangeable_object_candidates"] == [
+            "ice_cube1",
+            "ice_cube2",
+        ]

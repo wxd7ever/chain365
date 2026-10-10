@@ -19,6 +19,9 @@ CONFIG = {
     "waypoint_max_steps": 10,
     "final_position_max_steps": 10,
     "final_yaw_max_steps": 10,
+    "align_yaw_to_path": True,
+    "segment_heading_tolerance_deg": 10.0,
+    "segment_heading_max_steps": 10,
     "max_translation_command": 0.5,
     "max_rotation_command": 0.5,
 }
@@ -29,7 +32,7 @@ class PoseEnv:
         self.pose = {"position": [0.0, 0.0, 0.7], "yaw_rad": 0.0}
 
 
-def test_base_navigator_executes_xy_then_final_yaw(monkeypatch):
+def test_base_navigator_holds_segment_yaw_then_executes_final_yaw(monkeypatch):
     env = PoseEnv()
     calls = []
 
@@ -56,10 +59,56 @@ def test_base_navigator_executes_xy_then_final_yaw(monkeypatch):
     assert result.total_waypoints == 2
     assert result.position_error == 0.0
     assert result.yaw_error == 0.0
-    assert [item["yaw_tolerance_deg"] for item in calls] == [180.0, 180.0, 10.0]
+    assert [item["yaw_tolerance_deg"] for item in calls] == [10.0, 10.0, 10.0]
     assert calls[0]["target"]["yaw_rad"] == 0.0
     assert calls[1]["target"]["yaw_rad"] == 0.0
     assert calls[2]["target"]["yaw_rad"] == math.pi / 2
+
+
+def test_base_navigator_turns_to_each_path_segment_before_translation(monkeypatch):
+    env = PoseEnv()
+    calls = []
+
+    def current(value):
+        return {
+            "position": list(value.pose["position"]),
+            "yaw_rad": value.pose["yaw_rad"],
+        }
+
+    def move(value, target, **kwargs):
+        calls.append({"target": target, **kwargs})
+        value.pose = {
+            "position": list(target["position"]),
+            "yaw_rad": float(target["yaw_rad"]),
+        }
+        return {"success": True, "steps": 2, "guard_failure": None}
+
+    monkeypatch.setattr("robocasa.navigation.base_navigator.current_base_pose", current)
+    monkeypatch.setattr("robocasa.navigation.base_navigator.move_base_to_pose", move)
+
+    result = BaseNavigator(CONFIG).execute_path(
+        env=env,
+        path_world=[(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)],
+        goal_yaw=math.pi,
+    )
+
+    assert result.success
+    assert result.reached_waypoints == 2
+    assert len(calls) == 5
+    assert calls[0]["target"]["position"][:2] == [0.0, 0.0]
+    assert math.isclose(calls[0]["target"]["yaw_rad"], math.pi / 2)
+    assert calls[1]["target"]["position"][:2] == [0.0, 1.0]
+    assert math.isclose(calls[1]["target"]["yaw_rad"], math.pi / 2)
+    assert calls[2]["target"]["position"][:2] == [0.0, 1.0]
+    assert math.isclose(calls[2]["target"]["yaw_rad"], 0.0)
+    assert calls[3]["target"]["position"][:2] == [1.0, 1.0]
+    assert math.isclose(calls[3]["target"]["yaw_rad"], 0.0)
+    assert math.isclose(calls[4]["target"]["yaw_rad"], math.pi)
+    assert [
+        item["stage"]
+        for item in result.waypoint_traces
+        if item.get("stage") == "segment_heading"
+    ] == ["segment_heading", "segment_heading"]
 
 
 def test_base_navigator_retries_one_stalled_waypoint(monkeypatch):
@@ -88,6 +137,47 @@ def test_base_navigator_retries_one_stalled_waypoint(monkeypatch):
     assert result.success
     assert call_count == 3
     assert [item["attempt"] for item in result.waypoint_traces[:2]] == [1, 2]
+
+
+def test_final_waypoint_uses_outer_acceptance_tolerance(monkeypatch):
+    env = PoseEnv()
+    calls = []
+
+    monkeypatch.setattr(
+        "robocasa.navigation.base_navigator.current_base_pose",
+        lambda value: {
+            "position": list(value.pose["position"]),
+            "yaw_rad": value.pose["yaw_rad"],
+        },
+    )
+
+    def move(value, target, **kwargs):
+        calls.append({"target": target, **kwargs})
+        if len(calls) == 1:
+            value.pose = {
+                "position": [0.925, 0.0, target["position"][2]],
+                "yaw_rad": float(target["yaw_rad"]),
+            }
+            return {"success": False, "steps": 10, "guard_failure": None}
+        value.pose = {
+            "position": list(target["position"]),
+            "yaw_rad": float(target["yaw_rad"]),
+        }
+        return {"success": True, "steps": 2, "guard_failure": None}
+
+    monkeypatch.setattr("robocasa.navigation.base_navigator.move_base_to_pose", move)
+    result = BaseNavigator(CONFIG).execute_path(
+        env=env,
+        path_world=[(0.0, 0.0), (1.0, 0.0)],
+        goal_yaw=0.0,
+    )
+
+    assert result.success
+    assert len(calls) == 2
+    translation_trace = result.waypoint_traces[0]
+    assert math.isclose(translation_trace["distance_after_m"], 0.075)
+    assert translation_trace["controller_tolerance_m"] == 0.07
+    assert translation_trace["tolerance_m"] == 0.08
 
 
 def test_base_navigator_stops_when_post_waypoint_guard_reports_drop(monkeypatch):
@@ -231,6 +321,115 @@ def test_adapter_navigation_failure_prevents_policy(monkeypatch):
     assert result["target_aware_stage"]["policy_started"] is False
     assert result["target_aware_stage"]["local_refinement_used"] is False
     assert policy.calls == 0
+
+
+def test_place_retry_handoff_skips_second_global_navigation(monkeypatch):
+    monkeypatch.setattr("robocasa.navigation.skill_adapter.current_base_pose", _pose)
+
+    class CountingPipeline(FakePipeline):
+        def __init__(self):
+            super().__init__(
+                NavigationResult(
+                    True,
+                    "SUCCESS",
+                    target_name="microwave",
+                    target_type="FIXTURE",
+                    selected_goal={"x": 1.0, "y": 2.0, "yaw": 0.5},
+                    skipped=False,
+                )
+            )
+            self.navigation_calls = 0
+
+        def navigate_to_manipulation_target(self, *args, **kwargs):
+            self.navigation_calls += 1
+            return super().navigate_to_manipulation_target(*args, **kwargs)
+
+    policy = FakePolicy()
+    pipeline = CountingPipeline()
+    adapter = TargetAwarePolicyAdapter(
+        policy_adapter=policy,
+        navigation_pipeline=pipeline,
+        navigation_enabled=True,
+        local_refiner_enabled=False,
+    )
+    env = PoseEnv()
+    first = adapter.execute(
+        env=env,
+        scheduler_query={"atomic_task_call": place_call()},
+        episode_id="attempt0",
+    )
+    first_stage = first["target_aware_stage"]
+    second = adapter.execute(
+        env=env,
+        scheduler_query={
+            "atomic_task_call": place_call(),
+            "reuse_successful_navigation": {
+                "subgoal_id": "place_vegetable",
+                "source_attempt_index": 0,
+                "navigation_result": first_stage["navigation_result"],
+            },
+        },
+        episode_id="attempt1",
+    )
+
+    assert pipeline.navigation_calls == 1
+    assert policy.calls == 2
+    assert second["success"] is True
+    second_stage = second["target_aware_stage"]
+    assert second_stage["navigation_reused"] is True
+    assert second_stage["navigation_required"] is False
+    assert second_stage["navigation_reason"] == "REUSED_SUCCESSFUL_NAVIGATION"
+    assert second_stage["navigation_reuse_source_attempt_index"] == 0
+
+
+def test_same_skill_retry_uses_current_pose_without_global_navigation(monkeypatch):
+    monkeypatch.setattr("robocasa.navigation.skill_adapter.current_base_pose", _pose)
+
+    class CountingPipeline(FakePipeline):
+        def __init__(self):
+            super().__init__(NavigationResult(True, "SUCCESS", skipped=False))
+            self.navigation_calls = 0
+
+        def navigate_to_manipulation_target(self, *args, **kwargs):
+            self.navigation_calls += 1
+            return super().navigate_to_manipulation_target(*args, **kwargs)
+
+    policy = FakePolicy()
+    pipeline = CountingPipeline()
+    adapter = TargetAwarePolicyAdapter(
+        policy_adapter=policy,
+        navigation_pipeline=pipeline,
+        navigation_enabled=True,
+        local_refiner_enabled=False,
+    )
+    result = adapter.execute(
+        env=PoseEnv(),
+        scheduler_query={
+            "atomic_task_call": call(),
+            "retry_from_current_pose": {
+                "subgoal_id": "pick_bowl",
+                "source_attempt_index": 0,
+                "navigation_result": {
+                    "success": False,
+                    "reason": "MOTION_STALLED",
+                    "target_name": "bowl",
+                    "target_type": "EXPOSED_OBJECT",
+                    "selected_goal": {"x": 1.0, "y": 2.0, "yaw": 0.5},
+                },
+            },
+        },
+        episode_id="attempt1",
+    )
+
+    assert result["success"] is True
+    assert pipeline.navigation_calls == 0
+    assert policy.calls == 1
+    stage = result["target_aware_stage"]
+    assert stage["navigation_reused"] is True
+    assert stage["navigation_required"] is False
+    assert stage["navigation_reason"] == "RETRY_FROM_CURRENT_POSE"
+    assert stage["navigation_reuse_source_attempt_index"] == 0
+    assert stage["navigation_result"]["retry_from_current_pose"] is True
 
 
 def test_adapter_continues_policy_after_configured_navigation_collision(monkeypatch):
@@ -392,6 +591,43 @@ def test_refiner_skips_held_place_without_transport_ready(monkeypatch):
         == "HELD_OBJECT_NOT_TRANSPORT_READY"
     )
     assert refiner.atomic_task_call is None
+    assert policy.calls == 1
+
+
+def test_refiner_runs_for_held_place_when_transport_gate_disabled(monkeypatch):
+    monkeypatch.setattr("robocasa.navigation.skill_adapter.current_base_pose", _pose)
+    policy = FakePolicy()
+    pipeline = FakePipeline(NavigationResult(True, "SUCCESS", skipped=False))
+    pipeline.config = {
+        "navigation": {
+            "local_refiner_after_navigation_only": True,
+            "local_refiner_require_transport_ready_when_holding": False,
+        }
+    }
+    refiner = FakeRefiner(True)
+    adapter = TargetAwarePolicyAdapter(
+        policy_adapter=policy,
+        navigation_pipeline=pipeline,
+        refiner=refiner,
+        navigation_enabled=True,
+        local_refiner_enabled=True,
+    )
+
+    result = adapter.execute(
+        env=PoseEnv(),
+        scheduler_query={"atomic_task_call": place_call()},
+        episode_id=0,
+    )
+
+    stage = result["target_aware_stage"]
+    assert result["success"] is True
+    assert stage["navigation_required"] is True
+    assert stage["local_refinement_used"] is True
+    assert stage["local_refinement_success"] is True
+    assert stage["local_refinement_held_object_alias"] == "vegetable"
+    assert stage["local_refinement_transport_ready"] is False
+    assert stage["local_refinement_skip_reason"] is None
+    assert refiner.atomic_task_call["subgoal_id"] == "place_vegetable"
     assert policy.calls == 1
 
 
@@ -612,6 +848,109 @@ def test_adapter_prepares_verified_pick_before_following_navigation(monkeypatch)
     stage = place_result["target_aware_stage"]
     assert stage["post_grasp_transport_required"] is True
     assert stage["transport_ready"] is True
+
+
+def test_adapter_defers_standard_carry_pose_until_following_navigation(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "robocasa.navigation.skill_adapter.current_base_pose", _pose
+    )
+    monkeypatch.setattr(
+        "robocasa.navigation.skill_adapter.resolve_object_alias",
+        lambda env, call: "bowl",
+    )
+    events = []
+
+    class ReturnController:
+        def prepare(self, **kwargs):
+            assert kwargs["skill_verified"] is True
+            assert kwargs["atomic_task_call"].atomic_task == "PickObject"
+            events.append("carry")
+            return {
+                "module": "POST_SKILL_RETURN",
+                "success": True,
+                "return_ready": True,
+                "object_alias": "bowl",
+                "preset": "carry",
+            }
+
+    class Pipeline:
+        config = {
+            "post_skill_return": {
+                "enabled": True,
+                "defer_until_navigation": True,
+                "enforce_result": True,
+                "failure_policy": "block",
+            }
+        }
+
+        def navigate_to_manipulation_target(
+            self, env, atomic_call, *, before_navigation=None, **kwargs
+        ):
+            if atomic_call.atomic_task == "PickObject":
+                assert before_navigation is None
+                return NavigationResult(
+                    True,
+                    "ALREADY_AT_WORK_REGION",
+                    target_name="bowl",
+                    skipped=True,
+                )
+            assert before_navigation is not None
+            preparation = before_navigation()
+            assert preparation["navigation_safe"] is True
+            assert preparation["return_ready"] is True
+            events.append("navigate")
+            return NavigationResult(
+                True,
+                "SUCCESS",
+                target_name="microwave",
+                target_type="FIXTURE",
+                skipped=False,
+            )
+
+    adapter = TargetAwarePolicyAdapter(
+        policy_adapter=FakePolicy(),
+        navigation_pipeline=Pipeline(),
+        post_skill_return_controller=ReturnController(),
+        navigation_enabled=True,
+        local_refiner_enabled=False,
+    )
+    pick_result = adapter.execute(
+        env=PoseEnv(),
+        scheduler_query={"atomic_task_call": call()},
+        episode_id="pick",
+    )
+
+    assert pick_result["success"]
+    assert events == []
+    assert adapter._pending_post_grasp is not None
+
+    place = {
+        "subgoal_id": "place_bowl",
+        "atomic_task": "PlaceObject",
+        "arguments": {
+            "held_object_id": "bowl",
+            "destination_id": "microwave",
+        },
+        "termination_condition": {
+            "predicate": "inside",
+            "subject": "bowl",
+            "object": "microwave",
+            "desired_value": True,
+        },
+        "policy_prompt": "Place the bowl in the microwave.",
+    }
+    place_result = adapter.execute(
+        env=PoseEnv(),
+        scheduler_query={"atomic_task_call": place},
+        episode_id="place",
+    )
+
+    assert place_result["success"]
+    assert events == ["carry", "navigate"]
+    assert adapter._pending_post_grasp is None
+    assert place_result["target_aware_stage"]["transport_ready"] is True
 
 
 def test_target_aware_adapter_retracts_after_verified_place(monkeypatch):
@@ -908,3 +1247,146 @@ def test_failed_post_place_retreat_preserves_place_and_retries_before_navigation
         "retreat_ready",
         "pre_navigation_retreat",
     ]
+
+
+
+def test_confirmed_post_skill_drop_blocks_even_when_return_not_enforced(monkeypatch):
+    monkeypatch.setattr(
+        "robocasa.navigation.skill_adapter.current_base_pose", _pose
+    )
+    monkeypatch.setattr(
+        "robocasa.navigation.skill_adapter.resolve_object_alias",
+        lambda env, call: "bowl",
+    )
+
+    class Pipeline:
+        config = {
+            "post_skill_return": {
+                "enabled": True,
+                "enforce_result": False,
+                "failure_policy": "warn",
+            }
+        }
+
+        def navigate_to_manipulation_target(self, *args, **kwargs):
+            return NavigationResult(True, "ALREADY_AT_WORK_REGION", skipped=True)
+
+    class DroppedReturnController:
+        def prepare(self, **kwargs):
+            return {
+                "success": False,
+                "return_ready": False,
+                "transport_ready": False,
+                "navigation_safe": False,
+                "object_alias": "bowl",
+                "failure_code": "OBJECT_DROPPED_DURING_PREP",
+                "pre_lift": {
+                    "first_drop_step": 75,
+                    "guard_failure": {
+                        "failure_code": "OBJECT_DROPPED",
+                        "step_index": 75,
+                    },
+                },
+            }
+
+    adapter = TargetAwarePolicyAdapter(
+        policy_adapter=FakePolicy(),
+        navigation_pipeline=Pipeline(),
+        post_skill_return_controller=DroppedReturnController(),
+        navigation_enabled=True,
+        local_refiner_enabled=False,
+    )
+    adapter._transport_ready_objects.add("bowl")
+
+    result = adapter.execute(
+        env=PoseEnv(),
+        scheduler_query={"atomic_task_call": call()},
+        episode_id=0,
+    )
+
+    assert result["success"] is False
+    assert result["failure_code"] == "OBJECT_DROPPED_DURING_PREP"
+    assert "bowl" not in adapter._transport_ready_objects
+    stage = result["target_aware_stage"]
+    assert stage["transport_ready"] is False
+    assert stage["transport_ready_cleared_after_drop"] is True
+
+
+def test_interchangeable_pick_binds_selected_object_for_following_place(monkeypatch):
+    monkeypatch.setattr("robocasa.navigation.skill_adapter.current_base_pose", _pose)
+
+    class BindingPolicy:
+        def __init__(self):
+            self.log_dir = "/tmp"
+            self.calls = []
+
+        def execute(self, *, scheduler_query, **kwargs):
+            current = scheduler_query["atomic_task_call"]
+            self.calls.append(current)
+            evidence = []
+            if current["atomic_task"] == "PickObject":
+                evidence.append(
+                    {
+                        "source": "interchangeable_object_pick",
+                        "selected_object_alias": "ice_cube2",
+                    }
+                )
+            return {
+                "success": True,
+                "status": "success",
+                "verifier_result": {
+                    "status": "success",
+                    "goal_satisfied": True,
+                    "retryable": False,
+                    "state_evidence": evidence,
+                },
+            }
+
+    metadata = {
+        "interchangeable_object_canonical": "ice_cube1",
+        "interchangeable_object_candidates": ["ice_cube1", "ice_cube2"],
+    }
+    pick = {
+        "subgoal_id": "pick_ice_cube",
+        "atomic_task": "PickObject",
+        "arguments": {"object_name": "ice_cube1"},
+        "termination_condition": {
+            "predicate": "holding", "subject": "ice_cube1",
+            "desired_value": True,
+        },
+        "policy_prompt": "Pick up an ice cube.",
+        "metadata": metadata,
+    }
+    place = {
+        "subgoal_id": "place_ice_cube",
+        "atomic_task": "PlaceObject",
+        "arguments": {
+            "held_object_id": "ice_cube1", "destination_name": "glass_cup"
+        },
+        "termination_condition": {
+            "predicate": "inside", "subject": "ice_cube1",
+            "object": "glass_cup", "desired_value": True,
+        },
+        "policy_prompt": "Place the ice cube in the glass cup.",
+        "metadata": metadata,
+    }
+    policy = BindingPolicy()
+    adapter = TargetAwarePolicyAdapter(
+        policy_adapter=policy,
+        navigation_pipeline=FakePipeline(NavigationResult(True, "DISABLED", skipped=True)),
+        navigation_enabled=False,
+        local_refiner_enabled=False,
+    )
+    env = PoseEnv()
+
+    pick_result = adapter.execute(
+        env=env, scheduler_query={"atomic_task_call": pick}, episode_id="pick"
+    )
+    adapter.execute(
+        env=env, scheduler_query={"atomic_task_call": place}, episode_id="place"
+    )
+
+    assert pick_result["bound_interchangeable_object_alias"] == "ice_cube2"
+    bound_place = policy.calls[1]
+    assert bound_place["arguments"]["held_object_id"] == "ice_cube2"
+    assert bound_place["termination_condition"]["subject"] == "ice_cube2"

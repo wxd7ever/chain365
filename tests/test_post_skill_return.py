@@ -175,3 +175,125 @@ def test_fixed_orientation_return_translates_before_rotating(monkeypatch):
     assert result["handoff"]["trajectory_type"] == (
         "staged_translation_then_orientation"
     )
+
+
+
+def test_pick_return_passes_actual_action_across_policy_lift_and_retract(monkeypatch):
+    pose = {
+        "position": [0.55, 0.10, 0.20],
+        "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+        "frame": "robot_base",
+    }
+    policy_action = [0.03, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0, 0, 0, 0, 1.0]
+    lift_action = [0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0, 0, 0, 0, 1.0]
+    retract_action = [0.0] * 12
+    retract_action[6] = 1.0
+    retract_action[11] = 1.0
+    motions = []
+
+    monkeypatch.setattr(
+        "robocasa.post_skill_return.current_eef_pose", lambda env: dict(pose)
+    )
+    monkeypatch.setattr(
+        "robocasa.post_skill_return.resolve_object_alias",
+        lambda env, call: "vegetable",
+    )
+    monkeypatch.setattr(
+        "robocasa.post_skill_return._raw_task_env", lambda env: object()
+    )
+    monkeypatch.setattr(
+        "robocasa.post_skill_return._holding", lambda raw, alias: True
+    )
+    monkeypatch.setattr(
+        "robocasa.post_skill_return._object_snapshot",
+        lambda raw, alias: {"alias": alias},
+    )
+    monkeypatch.setattr(
+        "robocasa.post_skill_return.build_held_object_guard",
+        lambda **kwargs: object(),
+    )
+
+    def move(env, target, **kwargs):
+        motions.append(kwargs)
+        pose.update(target)
+        last = lift_action if len(motions) == 1 else retract_action
+        return {
+            "success": True,
+            "guard_failure": None,
+            "steps": 4,
+            "last_applied_action": last,
+        }
+
+    monkeypatch.setattr("robocasa.post_skill_return.move_eef_to_pose", move)
+    result = _controller().prepare(
+        env=object(),
+        atomic_task_call=_call("PickObject"),
+        initial_applied_action=policy_action,
+        simulation_step_offset=600,
+    )
+
+    assert result["success"] is True
+    assert motions[0]["initial_applied_action"] == policy_action
+    assert motions[0]["simulation_step_offset"] == 600
+    assert motions[1]["initial_applied_action"] == lift_action
+    assert motions[1]["simulation_step_offset"] == 604
+    assert motions[1]["start_guard"] is False
+    assert result["total_motion_steps"] == 8
+
+
+def test_confirmed_drop_during_lift_skips_retract_and_transport_ready(monkeypatch):
+    pose = {
+        "position": [0.55, 0.10, 0.20],
+        "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+        "frame": "robot_base",
+    }
+    motions = []
+    monkeypatch.setattr(
+        "robocasa.post_skill_return.current_eef_pose", lambda env: dict(pose)
+    )
+    monkeypatch.setattr(
+        "robocasa.post_skill_return.resolve_object_alias",
+        lambda env, call: "vegetable",
+    )
+    monkeypatch.setattr(
+        "robocasa.post_skill_return._raw_task_env", lambda env: object()
+    )
+    monkeypatch.setattr(
+        "robocasa.post_skill_return._holding", lambda raw, alias: True
+    )
+    monkeypatch.setattr(
+        "robocasa.post_skill_return._object_snapshot",
+        lambda raw, alias: {"alias": alias},
+    )
+    monkeypatch.setattr(
+        "robocasa.post_skill_return.build_held_object_guard",
+        lambda **kwargs: object(),
+    )
+
+    def move(env, target, **kwargs):
+        motions.append(kwargs)
+        return {
+            "success": False,
+            "failure_code": "OBJECT_DROPPED_DURING_EXPERT_HANDOFF",
+            "end_reason": "OBJECT_DROPPED",
+            "guard_failure": {
+                "failure_code": "OBJECT_DROPPED",
+                "step_index": 603,
+                "evidence": {"holding": False},
+            },
+            "first_drop_step": 603,
+            "steps": 3,
+            "last_applied_action": [0.0] * 12,
+        }
+
+    monkeypatch.setattr("robocasa.post_skill_return.move_eef_to_pose", move)
+    result = _controller().prepare(
+        env=object(), atomic_task_call=_call("PickObject")
+    )
+
+    assert len(motions) == 1
+    assert result["success"] is False
+    assert result["transport_ready"] is False
+    assert result["navigation_safe"] is False
+    assert result["failure_code"] == "OBJECT_DROPPED_DURING_PREP"
+    assert result["pre_lift"]["first_drop_step"] == 603

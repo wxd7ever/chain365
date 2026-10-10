@@ -80,6 +80,97 @@ class FakeVerifier:
         }
 
 
+def test_gripper_action_override_is_scoped_to_pick_object(monkeypatch, tmp_path):
+    captured = []
+
+    def guard_factory(**kwargs):
+        captured.append(
+            (
+                kwargs["atomic_task_call"].atomic_task,
+                kwargs["action_override_enabled"],
+            )
+        )
+        return held_object_guard.HeldObjectGuard(enabled=False)
+
+    class AlreadySuccessfulVerifier:
+        def __call__(self, **kwargs):
+            return {
+                "status": "success",
+                "goal_satisfied": True,
+                "failure_code": None,
+                "retryable": False,
+                "state_evidence": [],
+            }
+
+    monkeypatch.setattr(
+        held_object_guard,
+        "build_held_object_guard",
+        guard_factory,
+    )
+    calls = (
+        {
+            "subgoal_id": "pick",
+            "atomic_task": "PickObject",
+            "policy_prompt": "Pick the vegetable.",
+            "arguments": {"object_id": "vegetable"},
+            "termination_condition": {
+                "predicate": "holding",
+                "subject": "vegetable",
+            },
+        },
+        {
+            "subgoal_id": "place",
+            "atomic_task": "PlaceObject",
+            "policy_prompt": "Place the vegetable in the bowl.",
+            "arguments": {
+                "object_id": "vegetable",
+                "destination_id": "bowl",
+            },
+            "termination_condition": {
+                "predicate": "inside",
+                "subject": "vegetable",
+                "object": "bowl",
+            },
+        },
+    )
+
+    logs_by_task = {}
+    for episode_id, call in enumerate(calls):
+        success, logs = execute_pi05_atomic_task_policy(
+            env=FakeEnv(),
+            client=FakeClient(),
+            atomic_task_call=call,
+            verifier=AlreadySuccessfulVerifier(),
+            log_dir=tmp_path,
+            episode_id=episode_id,
+            horizon=5,
+            render=False,
+            verification_mode="periodic",
+            held_object_guard=True,
+            held_object_guard_action_override=True,
+        )
+        assert success is True
+        logs_by_task[call["atomic_task"]] = logs
+
+    assert captured == [("PickObject", True), ("PlaceObject", False)]
+    assert (
+        logs_by_task["PickObject"][
+            "Held_Object_Guard_Action_Override_Configured"
+        ]
+        is True
+    )
+    assert (
+        logs_by_task["PlaceObject"][
+            "Held_Object_Guard_Action_Override_Enabled"
+        ]
+        is False
+    )
+    assert (
+        logs_by_task["PlaceObject"]["Held_Object_Guard_Action_Override_Scope"]
+        == "PickObject_only"
+    )
+
+
 class SimplePeriodicCritic:
     critic_only = True
 
@@ -434,6 +525,94 @@ def test_success_handoff_continues_policy_with_extra_budget(tmp_path):
     assert logs["Final_Verification"]["status"] == "success"
 
 
+def test_pick_handoff_restarts_after_confirmed_drop(monkeypatch, tmp_path):
+    class DroppingGuard:
+        enabled = True
+        action_override_enabled = False
+
+        def start(self):
+            pass
+
+        def apply_action(self, action, *, step_index):
+            return action
+
+        def observe(self, *, step_index):
+            if step_index != 4:
+                return None
+            return {
+                "status": "failed",
+                "goal_satisfied": False,
+                "failure_code": "OBJECT_DROPPED",
+                "retryable": True,
+                "state_evidence": [{"step_index": step_index}],
+            }
+
+        def to_dict(self):
+            return {"enabled": True, "dropped_step": 4}
+
+    class HoldingVerifier:
+        def __init__(self):
+            self.steps = []
+
+        def __call__(self, **kwargs):
+            step = kwargs["step_index"]
+            self.steps.append(step)
+            success = step >= 2
+            return {
+                "status": "success" if success else "uncertain",
+                "goal_satisfied": success,
+                "failure_code": None,
+                "retryable": not success,
+                "state_evidence": [{"step": step}],
+            }
+
+    monkeypatch.setattr(
+        held_object_guard,
+        "build_held_object_guard",
+        lambda **kwargs: DroppingGuard(),
+    )
+    env = FakeEnv()
+    verifier = HoldingVerifier()
+    success, logs = execute_pi05_atomic_task_policy(
+        env=env,
+        client=FakeClient(),
+        atomic_task_call={
+            "subgoal_id": "pick_object",
+            "atomic_task": "PickObject",
+            "policy_prompt": "Pick up the vegetable.",
+            "arguments": {"object_id": "vegetable"},
+            "termination_condition": {
+                "predicate": "holding",
+                "subject": "vegetable",
+            },
+        },
+        verifier=verifier,
+        log_dir=tmp_path,
+        episode_id=0,
+        horizon=10,
+        replan_steps=5,
+        verify_interval=2,
+        min_steps_before_verify=0,
+        render=False,
+        success_handoff_steps=3,
+        verification_mode="periodic",
+    )
+
+    assert success is True
+    assert len(env.actions) == 7
+    assert verifier.steps == [0, 2, 4, 6, 7]
+    assert logs["First_Success_Step"] == 4
+    assert logs["Handoff_Target_Step"] == 7
+    assert logs["Pick_Stability_Enabled"] is True
+    assert logs["Pick_Stability_Required_Steps"] == 3
+    assert logs["Pick_Stability_Reset_Count"] == 1
+    reset = logs["Pick_Stability_Resets"][0]
+    assert reset["step"] == 4
+    assert reset["source"] == "held_object_guard"
+    assert reset["previous_first_success_step"] == 2
+    assert reset["previous_handoff_target_step"] == 5
+
+
 def test_task_start_success_skips_policy_and_is_also_final_verification(tmp_path):
     class AlreadySatisfiedVerifier:
         def __init__(self):
@@ -609,6 +788,10 @@ class SkillEndVerifier:
     def __init__(self, *, success):
         self.success = success
         self.calls = []
+        self.start_calls = []
+
+    def start_atomic_task(self, **kwargs):
+        self.start_calls.append(kwargs)
 
     def __call__(self, **kwargs):
         self.calls.append(kwargs)
@@ -652,6 +835,8 @@ def test_skill_end_runs_full_horizon_and_verifies_exactly_once(tmp_path):
     assert success is True
     assert len(env.actions) == 600
     assert len(verifier.calls) == 1
+    assert len(verifier.start_calls) == 1
+    assert verifier.start_calls[0]["atomic_task_call"].subgoal_id == "pick_object"
     final_call = verifier.calls[0]
     assert final_call["step_index"] == 600
     assert final_call["info"]["verification_phase"] == "skill_end"
@@ -696,3 +881,60 @@ def test_skill_end_failure_remains_retryable_after_full_horizon(tmp_path):
     assert logs["Final_Verification"]["failure_code"] == "VLM_CRITIC_FAILURE"
     assert logs["Final_Verification"]["retryable"] is True
     assert logs["Terminal_Failure"] is False
+
+
+
+def test_rollout_logs_last_action_after_base_mode_and_guard(tmp_path):
+    class OneStepClient:
+        def infer(self, payload):
+            action = np.zeros((1, 12), dtype=np.float32)
+            action[0, :6] = [0.02, -0.01, 0.03, 0.0, 0.0, 0.0]
+            action[0, 6] = -1.0
+            action[0, 7:10] = 0.5
+            action[0, 11] = 1.0
+            return {"actions": action}
+
+    class EndVerifier:
+        def __call__(self, **kwargs):
+            return {
+                "status": "success",
+                "goal_satisfied": True,
+                "failure_code": None,
+                "retryable": False,
+                "state_evidence": [],
+            }
+
+    env = FakeEnv()
+    success, logs = execute_pi05_atomic_task_policy(
+        env=env,
+        client=OneStepClient(),
+        atomic_task_call={
+            "subgoal_id": "place",
+            "atomic_task": "PlaceObject",
+            "policy_prompt": "Place the object.",
+            "arguments": {"object_id": "vegetable", "destination_id": "bowl"},
+            "termination_condition": {
+                "predicate": "inside",
+                "subject": "vegetable",
+                "object": "bowl",
+            },
+        },
+        verifier=EndVerifier(),
+        log_dir=tmp_path,
+        episode_id=0,
+        horizon=1,
+        replan_steps=1,
+        render=False,
+        held_object_guard=False,
+        base_action_mode="residual",
+        base_residual_limit=0.15,
+        verification_mode="skill_end",
+    )
+
+    assert success is True
+    assert np.allclose(logs["Last_Applied_Action"], env.actions[-1])
+    assert np.allclose(logs["Last_Applied_Action"][7:10], [0.15] * 3)
+    assert logs["Last_Applied_Action_Mode"] == 1.0
+    assert logs["Last_Applied_Action_Semantics"] == (
+        "normalized_robocasa365_after_base_mode_and_guard"
+    )

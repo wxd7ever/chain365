@@ -301,7 +301,7 @@ class PostGraspTransportController:
             cfg.get("hold_confirmation_steps", 2)
         )
         self.drop_confirmation_steps = int(
-            cfg.get("drop_confirmation_steps", 2)
+            cfg.get("drop_confirmation_steps", 30)
         )
         self.log_dir = Path(log_dir) if log_dir is not None else None
         self._log_index = 0

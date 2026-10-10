@@ -60,6 +60,92 @@ def test_parse_vlm_plan_rejects_invented_alias():
         parse_vlm_task_plan(value)
 
 
+def test_planner_prompt_does_not_restore_opened_fixtures_by_default():
+    planner = OpenAICompatibleVLMPlanner(
+        base_url="http://vlm.invalid/v1",
+        model="qwen-vl",
+        api_key=None,
+        include_images=False,
+    )
+
+    prompt = planner._system_prompt()
+
+    assert "Do not restore the scene to its initial state" in prompt
+    assert "does NOT imply closing it afterward" in prompt
+    assert "only when the user explicitly requests closure" in prompt
+    assert "close a microwave before turning it on" in prompt
+    assert "omit the unnecessary Close task" in prompt
+
+
+def test_planner_catalog_hides_legacy_pick_place_tasks():
+    catalog = vlm_task_planner._planner_catalog()
+
+    assert "PickObject" in catalog
+    assert "PlaceObject" in catalog
+    assert "CloseMicrowave" in catalog
+    assert not any(task.startswith("PickPlace") for task in catalog)
+
+
+def test_saved_plan_parser_retains_legacy_pick_place_compatibility():
+    value = {
+        "atomic_task_calls": [
+            {
+                "subgoal_id": "legacy_transfer",
+                "atomic_task": "PickPlaceSinkToCounter",
+                "policy_prompt": "Move the vegetable from the sink to the counter.",
+                "arguments": {},
+                "termination_condition": {
+                    "predicate": "on",
+                    "subject": "vegetable",
+                    "object": "counter",
+                },
+            }
+        ]
+    }
+
+    calls = parse_vlm_task_plan(value)
+    assert calls[0].atomic_task == "PickPlaceSinkToCounter"
+
+
+def test_new_planner_rejects_legacy_pick_place_response():
+    planner = OpenAICompatibleVLMPlanner(
+        base_url="http://vlm.invalid/v1",
+        model="qwen-vl",
+        api_key=None,
+        include_images=False,
+    )
+
+    class FakeSharedClient:
+        endpoint = "http://vlm.invalid/v1/chat/completions"
+        last_response_text = "legacy"
+        last_raw_http_response = "legacy"
+        last_parsed_response = None
+        last_http_status = 200
+        last_finish_reason = "stop"
+        last_usage = None
+
+        def query_json(self, **kwargs):
+            return {
+                "atomic_task_calls": [
+                    {
+                        "subgoal_id": "legacy_transfer",
+                        "atomic_task": "PickPlaceCounterToMicrowave",
+                        "policy_prompt": "Put the bowl in the microwave.",
+                        "arguments": {},
+                        "termination_condition": {
+                            "predicate": "inside",
+                            "subject": "bowl",
+                            "object": "microwave",
+                        },
+                    }
+                ]
+            }
+
+    planner._vlm_client = FakeSharedClient()
+    with pytest.raises(ValueError, match="separate PickObject and PlaceObject"):
+        planner.plan(task="Put the bowl in the microwave.")
+
+
 def test_openai_compatible_request_and_response(monkeypatch):
     response_body = {
         "choices": [

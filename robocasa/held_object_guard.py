@@ -6,8 +6,27 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
+try:
+    from .pick_motion_verification import (
+        capture_pick_motion_baseline,
+        check_two_finger_grasp,
+        evaluate_pick_motion,
+    )
+except ImportError:
+    from pick_motion_verification import (
+        capture_pick_motion_baseline,
+        check_two_finger_grasp,
+        evaluate_pick_motion,
+    )
 
-_RELATION_PREDICATES = {"inside", "inserted", "on", "object_fixture_relation"}
+
+_RELATION_PREDICATES = {
+    "dishwasher_rack_contact",
+    "inside",
+    "inserted",
+    "on",
+    "object_fixture_relation",
+}
 _GRIPPER_ACTION_INDEX = 6
 _CLOSE_GRIPPER_ACTION = 1.0
 
@@ -136,6 +155,48 @@ def _guarded_object_alias(
     return None
 
 
+def _interchangeable_object_candidates(
+    raw_env: Any, call: Any, canonical: str
+) -> list[str]:
+    metadata = getattr(call, "metadata", {})
+    raw_candidates = (
+        metadata.get("interchangeable_object_candidates", ())
+        if isinstance(metadata, Mapping)
+        else ()
+    )
+    if isinstance(raw_candidates, (str, bytes)) or not isinstance(
+        raw_candidates, Sequence
+    ):
+        return [canonical]
+    objects = getattr(raw_env, "objects", {})
+    candidates = list(
+        dict.fromkeys(
+            str(alias).strip()
+            for alias in raw_candidates
+            if str(alias).strip() in objects
+        )
+    )
+    return candidates if canonical in candidates else [canonical]
+
+
+def _selected_interchangeable_alias(
+    result: Mapping[str, Any], candidates: Sequence[str]
+) -> str | None:
+    evidence = result.get("state_evidence", ())
+    if not isinstance(evidence, Sequence) or isinstance(evidence, (str, bytes)):
+        return None
+    valid = set(candidates)
+    for item in reversed(evidence):
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("source") != "interchangeable_object_pick":
+            continue
+        selected = str(item.get("selected_object_alias") or "").strip()
+        if selected in valid:
+            return selected
+    return None
+
+
 def _destination_condition(
     raw_env: Any,
     object_alias: str,
@@ -197,6 +258,19 @@ def _check_holding(
         return None
 
 
+def _object_center_z(raw_env: Any, object_alias: str) -> float | None:
+    """Return an object center height for Pick lift gating."""
+
+    try:
+        body_id = raw_env.obj_body_id[object_alias]
+        position = np.asarray(raw_env.sim.data.body_xpos[body_id], dtype=float)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return None
+    if position.shape != (3,) or not np.isfinite(position).all():
+        return None
+    return float(position[2])
+
+
 def _check_destination(raw_env: Any, condition: Mapping[str, Any] | None) -> bool | None:
     if condition is None:
         return None
@@ -207,6 +281,14 @@ def _check_destination(raw_env: Any, condition: Mapping[str, Any] | None) -> boo
         subject = str(condition["subject"])
         destination = str(condition["object"])
         destination_kind = str(condition["object_kind"])
+        if predicate == "dishwasher_rack_contact":
+            fixture = raw_env.fixtures[destination]
+            checker = getattr(fixture, "check_rack_contact", None)
+            if not callable(checker):
+                raise AttributeError(
+                    f"fixture {destination!r} has no callable check_rack_contact"
+                )
+            return bool(checker(raw_env, subject))
         if destination_kind == "object":
             kwargs = {}
             if condition.get("threshold") is not None:
@@ -249,13 +331,23 @@ class HeldObjectGuard:
         destination_condition: Mapping[str, Any] | None = None,
         holding_checker: Callable[[], bool | None] | None = None,
         destination_checker: Callable[[], bool | None] | None = None,
+        lift_delta_checker: Callable[[], float | None] | None = None,
+        minimum_lift_delta_m: float | None = None,
+        pick_readiness_checker: Callable[[], bool | None] | None = None,
+        pick_readiness_mode: str = "vertical_lift",
+        activation_requires_verifier_success: bool = False,
+        verifier_object_selector: Callable[[Mapping[str, Any]], str | None] | None = None,
         action_override_enabled: bool = False,
         hold_confirmation_steps: int = 2,
-        drop_confirmation_steps: int = 2,
+        drop_confirmation_steps: int = 30,
         reason: str = "",
     ):
         if hold_confirmation_steps <= 0 or drop_confirmation_steps <= 0:
             raise ValueError("held-object confirmation steps must be positive")
+        if minimum_lift_delta_m is not None:
+            minimum_lift_delta_m = float(minimum_lift_delta_m)
+            if not np.isfinite(minimum_lift_delta_m) or minimum_lift_delta_m <= 0:
+                raise ValueError("minimum_lift_delta_m must be positive when provided")
         self.enabled = bool(enabled)
         self.object_alias = object_alias
         self.destination_condition = (
@@ -263,6 +355,14 @@ class HeldObjectGuard:
         )
         self.holding_checker = holding_checker
         self.destination_checker = destination_checker
+        self.lift_delta_checker = lift_delta_checker
+        self.minimum_lift_delta_m = minimum_lift_delta_m
+        self.pick_readiness_checker = pick_readiness_checker
+        self.pick_readiness_mode = str(pick_readiness_mode)
+        self.activation_requires_verifier_success = bool(
+            activation_requires_verifier_success
+        )
+        self.verifier_object_selector = verifier_object_selector
         self.action_override_enabled = bool(action_override_enabled)
         self.hold_confirmation_steps = int(hold_confirmation_steps)
         self.drop_confirmation_steps = int(drop_confirmation_steps)
@@ -277,6 +377,8 @@ class HeldObjectGuard:
         self.drop_active = False
         self.drop_event_count = 0
         self.gripper_override_count = 0
+        self.verifier_confirmed = False
+        self.verifier_confirmed_step: int | None = None
         self.events: list[dict[str, Any]] = []
         self.trace: list[dict[str, Any]] = []
         self._pending_action: dict[str, Any] | None = None
@@ -290,6 +392,102 @@ class HeldObjectGuard:
         if not self.enabled or self.destination_checker is None:
             return None
         return self.destination_checker()
+
+    def _lift_delta(self) -> float | None:
+        if self.minimum_lift_delta_m is None:
+            return None
+        if not self.enabled or self.lift_delta_checker is None:
+            return None
+        value = self.lift_delta_checker()
+        if value is None:
+            return None
+        value = float(value)
+        return value if np.isfinite(value) else None
+
+    def _lift_ready(self, lift_delta: float | None) -> bool:
+        if self.pick_readiness_checker is not None:
+            try:
+                readiness = self.pick_readiness_checker()
+            except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+                return False
+            return readiness is True
+        if self.minimum_lift_delta_m is None:
+            return True
+        return bool(
+            lift_delta is not None
+            and lift_delta >= self.minimum_lift_delta_m
+        )
+
+    def confirm_verifier_result(
+        self, result: Mapping[str, Any], *, step_index: int
+    ) -> bool:
+        """Activate a Pick guard after the verifier confirms Pick success.
+
+        Ordinary support-surface Picks inherit the verifier decision and do not
+        reintroduce a finger-contact gate. Cabinet and drawer Picks retain the
+        existing two-finger-contact plus extraction requirement.
+        """
+
+        if not self.enabled or not self.activation_requires_verifier_success:
+            return self.latched
+        if self.latched:
+            return True
+        if (
+            not isinstance(result, Mapping)
+            or result.get("status") != "success"
+            or result.get("goal_satisfied") is False
+        ):
+            return False
+        if self.verifier_object_selector is not None:
+            selected_alias = self.verifier_object_selector(result)
+            if selected_alias:
+                previous_alias = self.object_alias
+                self.object_alias = selected_alias
+                if selected_alias != previous_alias:
+                    self.events.append(
+                        {
+                            "step_index": int(step_index),
+                            "event": "guard_bound_to_verified_object",
+                            "from_object": previous_alias,
+                            "object": selected_alias,
+                        }
+                    )
+        holding = self._holding()
+        lift_delta = self._lift_delta()
+        lift_ready = self._lift_ready(lift_delta)
+        self.verifier_confirmed = True
+        self.verifier_confirmed_step = int(step_index)
+        holding_required = (
+            self.pick_readiness_mode == "cabinet_or_drawer_extraction"
+        )
+        if (holding_required and holding is not True) or not lift_ready:
+            self.events.append(
+                {
+                    "step_index": int(step_index),
+                    "event": "verifier_success_guard_activation_rejected",
+                    "object": self.object_alias,
+                    "two_finger_contact": holding,
+                    "pick_motion_ready": lift_ready,
+                    "lift_delta_m": lift_delta,
+                }
+            )
+            return False
+        self.latched = True
+        self.holding_consecutive = self.hold_confirmation_steps
+        self.latched_step = int(step_index)
+        self.events.append(
+            {
+                "step_index": int(step_index),
+                "event": "verifier_confirmed_grasp_latched",
+                "object": self.object_alias,
+                "two_finger_contact": holding,
+                "two_finger_contact_required": holding_required,
+                "pick_motion_ready": True,
+                "lift_delta_m": lift_delta,
+                "minimum_lift_delta_m": self.minimum_lift_delta_m,
+            }
+        )
+        return True
 
     def _allow_release(self, step_index: int) -> None:
         if self.release_allowed:
@@ -309,9 +507,13 @@ class HeldObjectGuard:
             return
         destination = self._destination()
         holding = self._holding()
+        lift_delta = self._lift_delta()
+        lift_ready = self._lift_ready(lift_delta)
         if destination is True:
             self._allow_release(0)
-        elif holding is True:
+        elif self.activation_requires_verifier_success:
+            return
+        elif holding is True and lift_ready:
             self.latched = True
             self.holding_consecutive = self.hold_confirmation_steps
             self.latched_step = 0
@@ -320,6 +522,18 @@ class HeldObjectGuard:
                     "step_index": 0,
                     "event": "initial_grasp_latched",
                     "object": self.object_alias,
+                    "lift_delta_m": lift_delta,
+                    "minimum_lift_delta_m": self.minimum_lift_delta_m,
+                }
+            )
+        elif holding is True and not lift_ready:
+            self.events.append(
+                {
+                    "step_index": 0,
+                    "event": "initial_grasp_waiting_for_lift",
+                    "object": self.object_alias,
+                    "lift_delta_m": lift_delta,
+                    "minimum_lift_delta_m": self.minimum_lift_delta_m,
                 }
             )
 
@@ -354,12 +568,20 @@ class HeldObjectGuard:
             return None
         holding = self._holding()
         destination = self._destination()
+        lift_delta = self._lift_delta()
+        lift_ready = self._lift_ready(lift_delta)
         if destination is True:
             self._allow_release(step_index)
 
-        if not self.latched and not self.release_allowed:
+        if (
+            not self.latched
+            and not self.release_allowed
+            and not self.activation_requires_verifier_success
+        ):
             self.holding_consecutive = (
-                self.holding_consecutive + 1 if holding is True else 0
+                self.holding_consecutive + 1
+                if holding is True and lift_ready
+                else 0
             )
             if self.holding_consecutive >= self.hold_confirmation_steps:
                 self.latched = True
@@ -370,6 +592,8 @@ class HeldObjectGuard:
                         "event": "grasp_latched",
                         "object": self.object_alias,
                         "holding_consecutive": self.holding_consecutive,
+                        "lift_delta_m": lift_delta,
+                        "minimum_lift_delta_m": self.minimum_lift_delta_m,
                     }
                 )
 
@@ -392,6 +616,14 @@ class HeldObjectGuard:
         trace.update(
             {
                 "holding": holding,
+                "lift_delta_m": lift_delta,
+                "pick_readiness_mode": self.pick_readiness_mode,
+                "minimum_lift_delta_m": self.minimum_lift_delta_m,
+                "lift_ready": lift_ready,
+                "activation_requires_verifier_success": (
+                    self.activation_requires_verifier_success
+                ),
+                "verifier_confirmed": self.verifier_confirmed,
                 "destination_satisfied": destination,
                 "latched": self.latched,
                 "release_allowed": self.release_allowed,
@@ -444,6 +676,14 @@ class HeldObjectGuard:
             "reason": self.reason,
             "object_alias": self.object_alias,
             "destination_condition": self.destination_condition,
+            "minimum_lift_delta_m": self.minimum_lift_delta_m,
+            "pick_readiness_mode": self.pick_readiness_mode,
+            "lift_gate_enabled": self.minimum_lift_delta_m is not None,
+            "activation_requires_verifier_success": (
+                self.activation_requires_verifier_success
+            ),
+            "verifier_confirmed": self.verifier_confirmed,
+            "verifier_confirmed_step": self.verifier_confirmed_step,
             "hold_confirmation_steps": self.hold_confirmation_steps,
             "drop_confirmation_steps": self.drop_confirmation_steps,
             "latched": self.latched,
@@ -466,9 +706,10 @@ def build_held_object_guard(
     atomic_task_call: Any,
     enabled: bool = True,
     hold_confirmation_steps: int = 2,
-    drop_confirmation_steps: int = 2,
+    drop_confirmation_steps: int = 30,
     action_override_enabled: bool = False,
     grasp_threshold: float | None = None,
+    pick_min_lift_delta_m: float | None = None,
 ) -> HeldObjectGuard:
     """Build a guard only for object-transfer or explicit held-object calls."""
 
@@ -505,14 +746,87 @@ def build_held_object_guard(
             reason="could_not_resolve_guarded_object",
         )
     destination = _destination_condition(raw_env, object_alias, conditions)
+    is_pick = str(getattr(atomic_task_call, "atomic_task", "")) == "PickObject"
+    minimum_lift_delta_m = (
+        pick_min_lift_delta_m
+        if is_pick
+        else None
+    )
+    candidate_aliases = _interchangeable_object_candidates(
+        raw_env, atomic_task_call, object_alias
+    )
+    active = {"alias": object_alias}
+    pick_motion_baselines = {
+        alias: capture_pick_motion_baseline(
+            raw_env=raw_env,
+            object_alias=alias,
+            atomic_task_call=atomic_task_call,
+        )
+        for alias in candidate_aliases
+    } if minimum_lift_delta_m is not None else {}
+
+    def active_baseline() -> Mapping[str, Any] | None:
+        return pick_motion_baselines.get(active["alias"])
+
+    def lift_delta_checker() -> float | None:
+        baseline = active_baseline()
+        if baseline is None:
+            return None
+        current_z = _object_center_z(raw_env, active["alias"])
+        if current_z is None:
+            return None
+        return float(current_z - float(baseline["initial_center_z_m"]))
+
+    def pick_readiness_checker() -> bool | None:
+        baseline = active_baseline()
+        if baseline is None or minimum_lift_delta_m is None:
+            return None
+        ready, _ = evaluate_pick_motion(
+            raw_env=raw_env,
+            object_alias=active["alias"],
+            baseline=baseline,
+            minimum_delta_m=float(minimum_lift_delta_m),
+        )
+        return ready
+
+    def holding_checker() -> bool | None:
+        if is_pick:
+            value, _ = check_two_finger_grasp(raw_env, active["alias"])
+            return value
+        return _check_holding(raw_env, active["alias"], grasp_threshold)
+
+    def verifier_object_selector(result: Mapping[str, Any]) -> str | None:
+        selected = _selected_interchangeable_alias(result, candidate_aliases)
+        if selected is not None:
+            active["alias"] = selected
+        return selected
+
+    pick_motion_baseline = active_baseline()
+    pick_readiness_mode = (
+        "cabinet_or_drawer_extraction"
+        if pick_motion_baseline is not None
+        and pick_motion_baseline.get("source_is_cabinet_or_drawer")
+        else "support_surface_departure"
+    )
+
     return HeldObjectGuard(
         enabled=True,
         object_alias=object_alias,
         destination_condition=destination,
-        holding_checker=lambda: _check_holding(
-            raw_env, object_alias, grasp_threshold
-        ),
+        holding_checker=holding_checker,
         destination_checker=lambda: _check_destination(raw_env, destination),
+        lift_delta_checker=(
+            lift_delta_checker if minimum_lift_delta_m is not None else None
+        ),
+        minimum_lift_delta_m=minimum_lift_delta_m,
+        pick_readiness_checker=(
+            pick_readiness_checker if pick_motion_baseline is not None else None
+        ),
+        pick_readiness_mode=pick_readiness_mode,
+        activation_requires_verifier_success=is_pick,
+        verifier_object_selector=(
+            verifier_object_selector if len(candidate_aliases) > 1 else None
+        ),
         action_override_enabled=action_override_enabled,
         hold_confirmation_steps=hold_confirmation_steps,
         drop_confirmation_steps=drop_confirmation_steps,

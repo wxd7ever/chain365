@@ -22,19 +22,21 @@ map:
   debug_articulated_map: false
 
 robot:
-  # Planning-only footprint, deliberately reduced to half of the preceding
-  # compatibility footprint for pipeline-throughput experiments. This is a
-  # collision-risky under-approximation; MuJoCo's real geometry is unchanged.
-  half_length: 0.16
-  half_width: 0.115
-  # Retained as the matching half-scale fallback for external callers.
-  radius: 0.2150581317
-  safety_margin: 0.0025
+  # Use the real Omron collision-box half-size. The earlier half-scale
+  # compatibility footprint admitted routes that the MuJoCo robot could not
+  # physically execute and was a major source of MOTION_STALLED failures.
+  half_length: 0.35
+  half_width: 0.25
+  # Retained as the legacy fallback for external callers.
+  radius: 0.4301162634
+  safety_margin: 0.01
   # Collision-box center relative to the mobile-base control origin.
   # Read from robosuite's omron_mobile_base.xml (wheeled_base pos=-0.20 0 0.192).
   footprint_center_offset_xy: [-0.20, 0.0]
 
 candidate_generation:
+  # Refiner-free baseline: navigate directly into the nominal manipulation
+  # range expected by the policy.
   min_distance: 0.50
   preferred_distance: 0.70
   max_distance: 0.95
@@ -42,6 +44,7 @@ candidate_generation:
   angular_step_deg: 10
 
 fixture_candidate:
+  # Without local refinement, stop directly in the fixture work range.
   min_distance: 0.45
   preferred_distance: 0.70
   max_distance: 1.00
@@ -57,7 +60,7 @@ candidate_scoring:
   clearance_saturation_m: 1.00
 
 post_grasp_transport:
-  enabled: false
+  enabled: true
   # Base-relative Cartesian motion executed only before a required global
   # navigation while holding an object.
   lift_height: 0.10
@@ -79,11 +82,10 @@ post_grasp_transport:
   # small closed-loop corrections caused by noisy pose observations.
   hold_mode: zero_delta
   hold_confirmation_steps: 2
-  drop_confirmation_steps: 2
-  # Temporarily skip the pre-atomic-task / pre-navigation transport-ready
-  # gate. Post-skill return still runs after a verified skill, and the held
-  # object guard remains active while the base is moving.
-  enforce_before_navigation: false
+  drop_confirmation_steps: 30
+  # The next required navigation must first establish this safety-based carry
+  # posture. Exact Cartesian convergence is diagnostic rather than mandatory.
+  enforce_before_navigation: true
 
 post_place_retreat:
   enabled: false
@@ -113,14 +115,26 @@ post_place_retreat:
 # through the existing Cartesian controller; joints are never reset directly.
 # Pick keeps the gripper closed. Other completed skills return with it open.
 post_skill_return:
-  # Execute the return motion and retain diagnostics, but do not let its
-  # ready/failure result override an already verified atomic-task result.
+  # The legacy mapped-navigation profile uses post_grasp_transport for Pick
+  # handoff because it accepts achieved safe lift / compactness without
+  # requiring exact convergence to a fixed EEF pose.
   enforce_result: false
   enabled: false
+  defer_until_navigation: false
   # Compatibility policy used only when enforce_result is true.
   failure_policy: block
   # Every verified non-pick skill shares the exact PlaceObject return pose and
   # motion settings. PickObject remains the only carry/closed-gripper preset.
+  # Shared handoff / settled-motion criteria for the deferred carry transition.
+  motion_stability:
+    linear_velocity_threshold_m_s: 0.05
+    angular_velocity_threshold_deg_s: 20.0
+    near_target_slowdown_radius_m: 0.08
+    near_target_slowdown_radius_deg: 30.0
+    handoff_max_steps: 30
+    handoff_stable_steps: 2
+    handoff_action_tolerance: 0.006
+    simulation_timestep_s: 0.05
   default_preset: released
   task_presets:
     PickObject: carry
@@ -220,7 +234,7 @@ post_skill_return:
       hold_steps: 20
       hold_mode: zero_delta
       hold_confirmation_steps: 2
-      drop_confirmation_steps: 2
+      drop_confirmation_steps: 30
     released:
       target_position: [0.2465, -0.0040, 0.5959]
       orientation_mode: fixed
@@ -353,15 +367,18 @@ navigation:
   # failed plans, under the episode run directory for visual inspection.
   save_debug_artifacts: true
   debug_artifact_subdir: navigation_planning
-  # Coarse target-aware navigation first, then VLM base-pose refinement before
-  # the manipulation policy. Failed refinement falls back to the coarse pose.
-  enable_local_refiner: true
+  # Current baseline: execute manipulation directly from the selected coarse
+  # navigation pose. Dedicated ablations can override this from the CLI with
+  # --enable_local_refiner.
+  enable_local_refiner: false
   # Do not disturb an already-valid work pose. Refine only after the base
   # actually executes a coarse global-navigation path.
   local_refiner_after_navigation_only: true
-  # Moving the base while carrying an object is permitted only after the
-  # post-grasp controller has explicitly established a transport-ready pose.
-  local_refiner_require_transport_ready_when_holding: true
+  # Keep the legacy pipeline simple: after an actual successful coarse
+  # navigation, let the VLM refine the work pose even while carrying an object.
+  # Held-object monitoring remains active during base motion, but transport
+  # readiness is not a prerequisite for invoking the refiner.
+  local_refiner_require_transport_ready_when_holding: false
   local_refiner_failure_policy: use_coarse_pose
   waypoint_position_tolerance: 0.12
   final_position_tolerance: 0.08
@@ -377,6 +394,24 @@ navigation:
   final_yaw_max_steps: 320
   max_translation_command: 0.55
   max_rotation_command: 0.35
+  # Face each path segment before translating, then hold that segment yaw
+  # during XY motion. This avoids long saturated lateral / reverse commands.
+  align_yaw_to_path: true
+  segment_heading_tolerance_deg: 10.0
+  segment_heading_max_steps: 240
+  # If the real footprint starts in shallow overlap, keep yaw fixed and move
+  # only through samples whose raw-map overlap never increases.
+  start_collision_recovery:
+    enabled: true
+    search_step_m: 0.025
+    execution_step_m: 0.05
+    max_distance_m: 0.30
+    max_steps_per_move: 80
+    translation_tolerance_m: 0.02
+    yaw_tolerance_deg: 3.0
+    max_translation_command: 0.20
+    require_monotonic_overlap_decrease: true
+    direction_order: [backward, left, right, forward]
   skip_facing_cosine: 0.50
   # Preserve navigation failures in diagnostics, but continue the atomic policy
   # when conservative map/path planning cannot produce a collision-free route.
@@ -387,4 +422,4 @@ navigation:
   # detection still terminates navigation through OBJECT_DROPPED.
   held_object_guard_action_override: true
   hold_confirmation_steps: 2
-  drop_confirmation_steps: 2
+  drop_confirmation_steps: 30

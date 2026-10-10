@@ -141,7 +141,7 @@ def parse_args():
         "--pi05_held_object_hold_confirmation_steps", type=int, default=2
     )
     parser.add_argument(
-        "--pi05_held_object_drop_confirmation_steps", type=int, default=2
+        "--pi05_held_object_drop_confirmation_steps", type=int, default=30
     )
     parser.add_argument(
         "--skip_navigation",

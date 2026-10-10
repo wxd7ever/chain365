@@ -35,12 +35,13 @@ class RemoteAtomicTaskPolicyAdapter:
         held_object_guard: bool = True,
         held_object_guard_action_override: bool = True,
         held_object_hold_confirmation_steps: int = 2,
-        held_object_drop_confirmation_steps: int = 2,
-        success_handoff_steps: int = 30,
+        held_object_drop_confirmation_steps: int = 30,
+        success_handoff_steps: int = 5,
         verification_mode: str | None = None,
         prompt_style: str = "concise",
         held_object_drop_stops_rollout: bool = False,
         held_object_guard_grasp_threshold: float | None = None,
+        held_object_guard_pick_min_lift_m: float | None = 0.04,
         render: bool = True,
         video_skip: int = 2,
     ):
@@ -85,6 +86,17 @@ class RemoteAtomicTaskPolicyAdapter:
             None
             if held_object_guard_grasp_threshold is None
             else float(held_object_guard_grasp_threshold)
+        )
+        if held_object_guard_pick_min_lift_m is not None:
+            held_object_guard_pick_min_lift_m = float(
+                held_object_guard_pick_min_lift_m
+            )
+            if held_object_guard_pick_min_lift_m <= 0:
+                raise ValueError(
+                    "held_object_guard_pick_min_lift_m must be positive when provided"
+                )
+        self.held_object_guard_pick_min_lift_m = (
+            held_object_guard_pick_min_lift_m
         )
         self.render = render
         self.video_skip = video_skip
@@ -158,6 +170,9 @@ class RemoteAtomicTaskPolicyAdapter:
             held_object_guard_grasp_threshold=(
                 self.held_object_guard_grasp_threshold
             ),
+            held_object_guard_pick_min_lift_m=(
+                self.held_object_guard_pick_min_lift_m
+            ),
         )
         rollout_logs["Configured_Horizon"] = int(configured_horizon)
         rollout_logs["Horizon_Source"] = horizon_source
@@ -178,5 +193,7 @@ class RemoteAtomicTaskPolicyAdapter:
             "status": status,
             "success": bool(success),
             "rollout_logs": rollout_logs,
+            "last_applied_action": rollout_logs.get("Last_Applied_Action"),
+            "last_applied_action_mode": rollout_logs.get("Last_Applied_Action_Mode"),
             "verifier_result": verifier_result,
         }

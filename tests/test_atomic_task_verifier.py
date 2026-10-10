@@ -628,6 +628,350 @@ def test_holding_threshold_is_isolated_per_runtime_verifier(monkeypatch):
     assert thresholds == [0.035]
 
 
+
+
+def test_french_door_fridge_requires_every_door_joint_open():
+    class FrenchDoorFixture(RelationFixture):
+        def __init__(self):
+            super().__init__("fridge")
+            self._fridge_door_joint_names = ["left_door", "right_door"]
+            self.joint_state = {"left_door": 0.95, "right_door": 0.20}
+
+        def get_joint_state(self, env, joint_names):
+            assert set(joint_names) == set(self._fridge_door_joint_names)
+            return {name: self.joint_state[name] for name in joint_names}
+
+        def is_open(self, env):
+            raise AssertionError("French-door verification must inspect both joints")
+
+    env = RelationEnv()
+    fridge = FrenchDoorFixture()
+    env.fixtures = {"fridge_main_group": fridge}
+    call = relation_call("open", "fridge_main_group", None)
+
+    one_door = RuntimeAtomicTaskVerifier()(
+        env=env,
+        atomic_task_call=call,
+        observation={},
+        step_index=10,
+        info={},
+    )
+    assert one_door["status"] == "uncertain"
+    evidence = next(
+        item
+        for item in one_door["state_evidence"]
+        if item.get("source") == "french_door_joint_state"
+    )
+    assert evidence["all_doors_open"] is False
+    assert evidence["door_joint_state"] == {
+        "left_door": 0.95,
+        "right_door": 0.20,
+    }
+
+    fridge.joint_state["right_door"] = 0.95
+    both_doors = RuntimeAtomicTaskVerifier()(
+        env=env,
+        atomic_task_call=call,
+        observation={},
+        step_index=15,
+        info={},
+    )
+    assert both_doors["status"] == "success"
+
+
+def test_dishwasher_rack_contact_uses_fixture_api():
+    class DishwasherFixture(RelationFixture):
+        def __init__(self):
+            super().__init__("dishwasher")
+            self.calls = []
+
+        def check_rack_contact(self, env, object_alias):
+            self.calls.append((env, object_alias))
+            return env.on_rack
+
+    env = RelationEnv()
+    dishwasher = DishwasherFixture()
+    env.fixtures = {"dishwasher_main_group": dishwasher}
+    env.on_rack = True
+    result = RuntimeAtomicTaskVerifier()(
+        env=env,
+        atomic_task_call=relation_call(
+            "dishwasher_rack_contact",
+            "vegetable",
+            "dishwasher_main_group",
+        ),
+        observation={},
+        step_index=10,
+        info={},
+    )
+
+    assert result["status"] == "success"
+    assert dishwasher.calls == [(env, "vegetable")]
+    evidence = next(
+        item
+        for item in result["state_evidence"]
+        if item.get("source") == "simulator_relation"
+    )
+    assert evidence["relation_api"] == "check_rack_contact"
+
+
+def test_pick_requires_leaving_support_and_ignores_gripper_contact(monkeypatch):
+    from robocasa.utils import object_utils
+
+    class SupportFixture:
+        name = "counter_main_group"
+        nat_lang = "counter"
+
+    class PickEnv:
+        def __init__(self):
+            self.support = SupportFixture()
+            self.fixtures = {"counter_main_group": self.support}
+            self.objects = {"vegetable": object()}
+            self.gripper = object()
+            self.robots = [
+                type("PickRobot", (), {"gripper": {"right": self.gripper}})()
+            ]
+            self.grasped = True
+            self.support_contact = True
+            self.obj_body_id = {"vegetable": 0}
+            data = type(
+                "PickData",
+                (),
+                {"body_xpos": np.asarray([[0.0, 0.0, 0.80]], dtype=float)},
+            )()
+            self.sim = type("PickSim", (), {"data": data})()
+
+        def _check_grasp(self, gripper, obj):
+            return (
+                self.grasped
+                and gripper is self.gripper
+                and obj is self.objects["vegetable"]
+            )
+
+    monkeypatch.setattr(
+        object_utils, "check_obj_grasped", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(
+        object_utils,
+        "check_obj_fixture_contact",
+        lambda env, object_alias, fixture: (
+            env.support_contact and fixture is env.support
+        ),
+    )
+    call = {
+        "subgoal_id": "pick_vegetable",
+        "atomic_task": "PickObject",
+        "policy_prompt": "Pick up the vegetable.",
+        "arguments": {"object_id": "vegetable"},
+        "termination_condition": {
+            "predicate": "holding",
+            "subject": "vegetable",
+            "object": None,
+            "desired_value": True,
+        },
+    }
+    env = PickEnv()
+    verifier = RuntimeAtomicTaskVerifier(pick_min_lift_delta_m=0.04)
+    verifier.start_atomic_task(
+        env=env, atomic_task_call=call, observation={}
+    )
+
+    env.sim.data.body_xpos[0, 2] = 0.83
+    not_lifted = verifier(
+        env=env,
+        atomic_task_call=call,
+        observation={},
+        step_index=10,
+        info={"verification_mode": "periodic"},
+    )
+
+    assert not_lifted["status"] == "uncertain"
+    assert not_lifted["failure_code"] == "OBJECT_NOT_CLEAR_OF_SUPPORT"
+    lift_evidence = next(
+        item
+        for item in not_lifted["state_evidence"]
+        if item.get("source") == "pick_lift_verification"
+    )
+    assert np.isclose(lift_evidence["lift_delta_m"], 0.03)
+    assert lift_evidence["verification_mode"] == "support_surface_departure"
+    assert lift_evidence["left_support_surface"] is False
+    assert lift_evidence["value"] is False
+
+    env.sim.data.body_xpos[0, 2] = 0.85
+    env.support_contact = False
+    lifted = verifier(
+        env=env,
+        atomic_task_call=call,
+        observation={},
+        step_index=15,
+        info={"verification_mode": "periodic"},
+    )
+
+    assert lifted["status"] == "uncertain"
+    assert lifted["state_evidence"][-1]["source"] == "consecutive_stability"
+    assert lifted["state_evidence"][-1]["consecutive_successes"] == 1
+    lifted = verifier(
+        env=env,
+        atomic_task_call=call,
+        observation={},
+        step_index=16,
+        info={"verification_mode": "periodic"},
+    )
+    assert lifted["status"] == "success"
+    lift_evidence = next(
+        item
+        for item in lifted["state_evidence"]
+        if item.get("source") == "pick_lift_verification"
+    )
+    assert np.isclose(lift_evidence["lift_delta_m"], 0.05)
+    assert lift_evidence["value"] is True
+
+    env.grasped = False
+    succeeds_without_finger_contact = verifier(
+        env=env,
+        atomic_task_call=call,
+        observation={},
+        step_index=17,
+        info={"verification_mode": "periodic"},
+    )
+    assert succeeds_without_finger_contact["status"] == "success"
+    bypass = next(
+        item
+        for item in succeeds_without_finger_contact["state_evidence"]
+        if item.get("source") == "pick_holding_bypassed"
+    )
+    assert bypass["value"] is True
+
+    # A retry keeps the original support baseline even though the object is now
+    # clear of the counter. It therefore remains verifiable without grasp input.
+    verifier.start_atomic_task(
+        env=env, atomic_task_call=call, observation={}
+    )
+    env.sim.data.body_xpos[0, 2] = 0.86
+    retry = verifier(
+        env=env,
+        atomic_task_call=call,
+        observation={},
+        step_index=10,
+        info={"verification_mode": "skill_end"},
+    )
+    assert retry["status"] == "success"
+
+
+def test_cabinet_pick_accepts_horizontal_extraction_and_retry_outside(monkeypatch):
+    from robocasa.utils import object_utils
+
+    state = {"inside": True, "holding": True}
+
+    class CabinetFixture:
+        name = "cabinet_main_group"
+        nat_lang = "cabinet"
+
+    class CabinetPickEnv:
+        def __init__(self):
+            self.fixtures = {"cabinet_main_group": CabinetFixture()}
+            self.objects = {"bread": object()}
+            self.gripper = object()
+            self.robots = [
+                type("PickRobot", (), {"gripper": {"right": self.gripper}})()
+            ]
+            self.obj_body_id = {"bread": 0}
+            data = type(
+                "CabinetPickData",
+                (),
+                {"body_xpos": np.asarray([[0.0, 0.0, 1.45]], dtype=float)},
+            )()
+            self.sim = type("CabinetPickSim", (), {"data": data})()
+
+        def _check_grasp(self, gripper, obj):
+            return bool(
+                state["holding"]
+                and gripper is self.gripper
+                and obj is self.objects["bread"]
+            )
+
+    monkeypatch.setattr(
+        object_utils,
+        "check_obj_grasped",
+        lambda *args, **kwargs: state["holding"],
+    )
+    monkeypatch.setattr(
+        object_utils,
+        "obj_inside_of",
+        lambda *args, **kwargs: state["inside"],
+    )
+    call = {
+        "subgoal_id": "pick_bread",
+        "atomic_task": "PickObject",
+        "policy_prompt": "Pick up the bread from the cabinet.",
+        "arguments": {
+            "object_id": "bread",
+            "source_name": "cabinet_main_group",
+        },
+        "termination_condition": {
+            "predicate": "holding",
+            "subject": "bread",
+            "desired_value": True,
+        },
+    }
+    env = CabinetPickEnv()
+    verifier = RuntimeAtomicTaskVerifier(pick_min_lift_delta_m=0.04)
+    verifier.start_atomic_task(
+        env=env, atomic_task_call=call, observation={}
+    )
+
+    still_inside = verifier(
+        env=env,
+        atomic_task_call=call,
+        observation={},
+        step_index=10,
+        info={"verification_mode": "skill_end"},
+    )
+    assert still_inside["status"] == "uncertain"
+    assert still_inside["failure_code"] == "OBJECT_NOT_EXTRACTED"
+
+    env.sim.data.body_xpos[0, 0] = 0.05
+    state["inside"] = False
+    extracted = verifier(
+        env=env,
+        atomic_task_call=call,
+        observation={},
+        step_index=20,
+        info={"verification_mode": "skill_end"},
+    )
+    assert extracted["status"] == "success"
+    evidence = next(
+        item
+        for item in extracted["state_evidence"]
+        if item.get("source") == "pick_lift_verification"
+    )
+    assert evidence["verification_mode"] == "cabinet_or_drawer_extraction"
+    assert evidence["object_left_source_region"] is True
+    assert evidence["horizontal_extraction_satisfied"] is True
+    assert np.isclose(evidence["lift_delta_m"], 0.0)
+
+    # A retry must not demand another 4 cm rise when the bread is already held
+    # and has already left its declared cabinet source.
+    verifier.start_atomic_task(
+        env=env, atomic_task_call=call, observation={}
+    )
+    retry = verifier(
+        env=env,
+        atomic_task_call=call,
+        observation={},
+        step_index=0,
+        info={"verification_mode": "skill_end"},
+    )
+    assert retry["status"] == "success"
+    retry_evidence = next(
+        item
+        for item in retry["state_evidence"]
+        if item.get("source") == "pick_lift_verification"
+    )
+    assert retry_evidence["holding_at_attempt_start"] is True
+    assert retry_evidence["already_outside_source_at_attempt_start"] is True
+
+
 def test_inside_dispatches_object_receptacle_and_preserves_threshold(monkeypatch):
     from robocasa.utils import object_utils
 
@@ -1195,3 +1539,119 @@ def test_navigation_reference_object_without_live_placement_fails_fast():
         "has no live placement" in item.get("error", "")
         for item in result["state_evidence"]
     )
+
+
+class InterchangeableObjectEnv:
+    def __init__(self):
+        self.fixtures = {}
+        self.objects = {
+            "ice_cube1": object(),
+            "ice_cube2": object(),
+            "ice_bowl": object(),
+            "glass_cup": object(),
+        }
+        self.obj_body_id = {"ice_cube1": 0, "ice_cube2": 1}
+        data = type(
+            "InterchangeableData",
+            (),
+            {
+                "body_xpos": np.asarray(
+                    [[0.0, 0.0, 0.80], [0.05, 0.0, 0.80]], dtype=float
+                )
+            },
+        )()
+        self.sim = type("InterchangeableSim", (), {"data": data})()
+        self.gripper = object()
+        self.robots = [
+            type("InterchangeableRobot", (), {"gripper": {"right": self.gripper}})()
+        ]
+
+    def check_contact(self, first, second):
+        return False
+
+    def _check_grasp(self, gripper, obj):
+        return False
+
+
+def interchangeable_metadata():
+    return {
+        "interchangeable_object_group": "ice_cube",
+        "interchangeable_object_canonical": "ice_cube1",
+        "interchangeable_object_candidates": ["ice_cube1", "ice_cube2"],
+    }
+
+
+def test_pick_accepts_any_declared_interchangeable_object(monkeypatch):
+    from robocasa.utils import object_utils
+
+    monkeypatch.setattr(
+        object_utils, "check_obj_in_receptacle", lambda *args, **kwargs: False
+    )
+    env = InterchangeableObjectEnv()
+    call = {
+        "subgoal_id": "pick_ice_cube",
+        "atomic_task": "PickObject",
+        "policy_prompt": "Pick up an ice cube.",
+        "arguments": {"object_name": "ice_cube1", "source_name": "ice_bowl"},
+        "termination_condition": {
+            "predicate": "holding",
+            "subject": "ice_cube1",
+            "desired_value": True,
+        },
+        "metadata": interchangeable_metadata(),
+    }
+    verifier = RuntimeAtomicTaskVerifier(pick_min_lift_delta_m=0.04)
+    verifier.start_atomic_task(env=env, atomic_task_call=call, observation={})
+    env.sim.data.body_xpos[1, 2] += 0.05
+
+    result = verifier(
+        env=env, atomic_task_call=call, observation={}, step_index=20,
+        info={"verification_mode": "skill_end"},
+    )
+
+    assert result["status"] == "success"
+    selected = next(
+        item for item in result["state_evidence"]
+        if item.get("source") == "interchangeable_object_pick"
+    )
+    assert selected["selected_object_alias"] == "ice_cube2"
+    assert selected["candidate_results"] == {
+        "ice_cube1": False, "ice_cube2": True
+    }
+
+
+def test_place_accepts_any_declared_interchangeable_object(monkeypatch):
+    from robocasa.utils import object_utils
+
+    monkeypatch.setattr(
+        object_utils,
+        "check_obj_in_receptacle",
+        lambda env, subject, destination, th=None: (
+            subject == "ice_cube2" and destination == "glass_cup"
+        ),
+    )
+    call = {
+        "subgoal_id": "place_ice_cube",
+        "atomic_task": "PlaceObject",
+        "policy_prompt": "Place the ice cube in the glass cup.",
+        "arguments": {"object_name": "ice_cube1", "destination_name": "glass_cup"},
+        "termination_condition": {
+            "predicate": "inside",
+            "subject": "ice_cube1",
+            "object": "glass_cup",
+            "desired_value": True,
+        },
+        "metadata": interchangeable_metadata(),
+    }
+
+    result = RuntimeAtomicTaskVerifier()(
+        env=InterchangeableObjectEnv(), atomic_task_call=call, observation={},
+        step_index=20, info={"verification_mode": "skill_end"},
+    )
+
+    assert result["status"] == "success"
+    selected = next(
+        item for item in result["state_evidence"]
+        if item.get("source") == "interchangeable_object_condition"
+    )
+    assert selected["selected_object_alias"] == "ice_cube2"

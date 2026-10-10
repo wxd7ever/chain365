@@ -15,7 +15,13 @@ from .navigation_types import (
 )
 
 
-_RELATIONS = {"inside", "inserted", "on", "object_fixture_relation"}
+_RELATIONS = {
+    "dishwasher_rack_contact",
+    "inside",
+    "inserted",
+    "on",
+    "object_fixture_relation",
+}
 
 
 def _normalise(value: Any) -> str:

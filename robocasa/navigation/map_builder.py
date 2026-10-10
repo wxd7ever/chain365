@@ -367,19 +367,35 @@ class MapBuilder:
     ) -> bool:
         """Check a candidate oriented footprint against raw obstacles."""
 
+        return self.footprint_overlap_count(occupancy_map, center_xy, yaw) == 0
+
+    def footprint_overlap_count(
+        self,
+        occupancy_map: OccupancyMap,
+        center_xy: Sequence[float],
+        yaw: float,
+    ) -> int:
+        """Count raw occupied / out-of-bounds cells under one footprint.
+
+        Unlike the inflated planning grid, this metric preserves the amount of
+        overlap. Start-collision recovery uses it to require every escape step
+        to be no worse than the preceding pose.
+        """
+
         center = occupancy_map.world_to_grid(center_xy)
         structure = self._footprint_structure(yaw)
         half_row = structure.shape[0] // 2
         half_col = structure.shape[1] // 2
+        overlap = 0
         for row_offset, col_offset in np.argwhere(structure) - np.asarray(
             [half_row, half_col]
         ):
             cell = (center[0] + int(row_offset), center[1] + int(col_offset))
             if not occupancy_map.in_bounds(cell):
-                return False
-            if occupancy_map.raw_grid[cell] != 0:
-                return False
-        return True
+                overlap += 1
+            elif occupancy_map.raw_grid[cell] != 0:
+                overlap += 1
+        return overlap
 
     def _geometries(self, raw_env: Any) -> tuple[dict[str, FixtureGeometry], list[str]]:
         geometries: dict[str, FixtureGeometry] = {}

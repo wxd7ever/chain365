@@ -48,6 +48,13 @@ class BaseNavigator:
         )
         self.max_translation_command = float(config.get("max_translation_command", 0.75))
         self.max_rotation_command = float(config.get("max_rotation_command", 0.50))
+        self.align_yaw_to_path = bool(config.get("align_yaw_to_path", True))
+        self.segment_heading_tolerance_deg = float(
+            config.get("segment_heading_tolerance_deg", self.final_yaw_tolerance_deg)
+        )
+        self.segment_heading_max_steps = int(
+            config.get("segment_heading_max_steps", self.final_yaw_max_steps)
+        )
         self.max_waypoint_retries = int(config.get("max_waypoint_retries", 1))
         if min(
             self.waypoint_position_tolerance,
@@ -57,6 +64,8 @@ class BaseNavigator:
             self.waypoint_max_steps,
             self.final_position_max_steps,
             self.final_yaw_max_steps,
+            self.segment_heading_tolerance_deg,
+            self.segment_heading_max_steps,
             self.max_translation_command,
             self.max_rotation_command,
         ) <= 0:
@@ -90,6 +99,33 @@ class BaseNavigator:
     @staticmethod
     def _guard_state(guard: Any | None) -> dict[str, Any] | None:
         return guard.to_dict() if guard is not None else None
+
+    def translate_at_fixed_yaw(
+        self,
+        *,
+        env: Any,
+        target_xy: Sequence[float],
+        yaw: float,
+        guard: Any | None = None,
+        max_steps: int = 80,
+        translation_tolerance_m: float = 0.02,
+        yaw_tolerance_deg: float = 3.0,
+        max_translation_command: float = 0.20,
+    ) -> dict[str, Any]:
+        """Translate to one nearby recovery point without changing heading."""
+
+        current = current_base_pose(env)
+        return move_base_to_pose(
+            env,
+            self._pose(target_xy, float(current["position"][2]), float(yaw)),
+            guard=guard,
+            max_steps=int(max_steps),
+            translation_tolerance_m=float(translation_tolerance_m),
+            yaw_tolerance_deg=float(yaw_tolerance_deg),
+            max_translation_command=float(max_translation_command),
+            max_rotation_command=self.max_rotation_command,
+            settle_steps=0,
+        )
 
     def _failure(
         self,
@@ -126,7 +162,7 @@ class BaseNavigator:
         goal_yaw: float,
         held_object_context: Any | None = None,
     ) -> NavigationExecutionResult:
-        """Execute only smoothed waypoints, then rotate separately at the goal."""
+        """Follow smoothed waypoints with segment yaw, then face the final goal."""
 
         if not path_world:
             raise ValueError("navigation path must contain at least one waypoint")
@@ -144,8 +180,13 @@ class BaseNavigator:
 
         for waypoint_index, waypoint in enumerate(goals, start=1):
             is_final = waypoint_index == total
-            tolerance = (
+            controller_tolerance = (
                 self.controller_final_position_tolerance
+                if is_final
+                else self.waypoint_position_tolerance
+            )
+            acceptance_tolerance = (
+                self.final_position_tolerance
                 if is_final
                 else self.waypoint_position_tolerance
             )
@@ -157,6 +198,95 @@ class BaseNavigator:
                 distance_before = math.hypot(dx, dy)
                 heading = math.atan2(dy, dx) if distance_before > 1e-9 else float(pose_before["yaw_rad"])
                 heading_error = _circular_yaw_error_deg(heading, float(pose_before["yaw_rad"]))
+                if (
+                    self.align_yaw_to_path
+                    and distance_before > acceptance_tolerance
+                    and heading_error > self.segment_heading_tolerance_deg
+                ):
+                    print(
+                        "[NAV-EXEC] waypoint {}/{} heading start attempt={} "
+                        "current={:.1f}deg target={:.1f}deg error={:.1f}deg "
+                        "action=ROTATE_TO_PATH".format(
+                            waypoint_index,
+                            total,
+                            attempt + 1,
+                            math.degrees(float(pose_before["yaw_rad"])),
+                            math.degrees(heading),
+                            heading_error,
+                        )
+                    )
+                    heading_motion = move_base_to_pose(
+                        env,
+                        self._pose(pose_before["position"][:2], z, heading),
+                        guard=guard,
+                        max_steps=self.segment_heading_max_steps,
+                        translation_tolerance_m=self.waypoint_position_tolerance,
+                        yaw_tolerance_deg=self.segment_heading_tolerance_deg,
+                        max_translation_command=self.max_translation_command,
+                        max_rotation_command=self.max_rotation_command,
+                        settle_steps=0,
+                    )
+                    total_steps += int(heading_motion.get("steps", 0))
+                    pose_after_heading = current_base_pose(env)
+                    heading_error_after = _circular_yaw_error_deg(
+                        heading, float(pose_after_heading["yaw_rad"])
+                    )
+                    traces.append(
+                        {
+                            "stage": "segment_heading",
+                            "waypoint_index": waypoint_index,
+                            "total_waypoints": total,
+                            "attempt": attempt + 1,
+                            "target_yaw_deg": math.degrees(heading),
+                            "yaw_error_before_deg": heading_error,
+                            "yaw_error_after_deg": heading_error_after,
+                            "motion": heading_motion,
+                        }
+                    )
+                    if heading_motion.get("guard_failure") is not None:
+                        print(
+                            "[NAV-EXEC] waypoint {}/{} heading failure "
+                            "reason=OBJECT_DROPPED".format(waypoint_index, total)
+                        )
+                        return self._failure(
+                            reason="OBJECT_DROPPED",
+                            reached=reached,
+                            total=total,
+                            steps=total_steps,
+                            traces=traces,
+                            guard=guard,
+                            goal_xy=final_xy,
+                            goal_yaw=goal_yaw,
+                            env=env,
+                        )
+                    if heading_error_after > self.segment_heading_tolerance_deg:
+                        print(
+                            "[NAV-EXEC] waypoint {}/{} heading failure "
+                            "reason=MOTION_STALLED yaw_error={:.1f}deg{}".format(
+                                waypoint_index,
+                                total,
+                                heading_error_after,
+                                " retry=1"
+                                if attempt < self.max_waypoint_retries
+                                else "",
+                            )
+                        )
+                        if attempt < self.max_waypoint_retries:
+                            continue
+                        return self._failure(
+                            reason="MOTION_STALLED",
+                            reached=reached,
+                            total=total,
+                            steps=total_steps,
+                            traces=traces,
+                            guard=guard,
+                            goal_xy=final_xy,
+                            goal_yaw=goal_yaw,
+                            env=env,
+                        )
+                    pose_before = pose_after_heading
+                    distance_before = self._distance(pose_before, waypoint)
+                    heading_error = heading_error_after
                 print(
                     "[NAV-EXEC] waypoint {}/{} start attempt={} "
                     "current=({:.3f},{:.3f},{:.1f}deg) target=({:.3f},{:.3f}) "
@@ -173,15 +303,23 @@ class BaseNavigator:
                         heading_error,
                     )
                 )
-                # The Omron base is holonomic. Preserve current yaw during XY motion;
-                # intermediate waypoints never require yaw convergence.
+                translation_yaw = (
+                    heading
+                    if self.align_yaw_to_path
+                    else float(pose_before["yaw_rad"])
+                )
+                translation_yaw_tolerance = (
+                    self.segment_heading_tolerance_deg
+                    if self.align_yaw_to_path
+                    else 180.0
+                )
                 motion = move_base_to_pose(
                     env,
-                    self._pose(waypoint, z, float(pose_before["yaw_rad"])),
+                    self._pose(waypoint, z, translation_yaw),
                     guard=guard,
                     max_steps=max_steps,
-                    translation_tolerance_m=tolerance,
-                    yaw_tolerance_deg=180.0,
+                    translation_tolerance_m=controller_tolerance,
+                    yaw_tolerance_deg=translation_yaw_tolerance,
                     max_translation_command=self.max_translation_command,
                     max_rotation_command=self.max_rotation_command,
                     settle_steps=0,
@@ -196,9 +334,11 @@ class BaseNavigator:
                     "attempt": attempt + 1,
                     "target": [float(waypoint[0]), float(waypoint[1])],
                     "distance_before_m": distance_before,
+                    "target_yaw_deg": math.degrees(translation_yaw),
                     "heading_error_before_deg": heading_error,
                     "distance_after_m": distance_after,
-                    "tolerance_m": tolerance,
+                    "controller_tolerance_m": controller_tolerance,
+                    "tolerance_m": acceptance_tolerance,
                     "motion": motion,
                 }
                 post_waypoint_guard_failure = (
@@ -228,7 +368,7 @@ class BaseNavigator:
                         goal_yaw=goal_yaw,
                         env=env,
                     )
-                if distance_after <= tolerance:
+                if distance_after <= acceptance_tolerance:
                     reached += 1
                     print(
                         "[NAV-EXEC] waypoint {}/{} complete distance={:.3f}m action=REACHED".format(

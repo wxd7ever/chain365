@@ -56,6 +56,8 @@ def _unpack_array(value: dict[bytes, Any]) -> Any:
 class OpenPIWebsocketClient:
     """Connect once and reuse the same OpenPI socket across tasks and episodes."""
 
+    policy_backend = "pi05"
+
     def __init__(
         self,
         *,

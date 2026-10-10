@@ -109,6 +109,82 @@ _PLACEMENT_RELATION_PREDICATES = {
 }
 
 
+def _interchangeable_object_spec(
+    call: AtomicTaskCall,
+) -> tuple[str | None, list[str]]:
+    metadata = call.metadata if isinstance(call.metadata, Mapping) else {}
+    canonical = str(
+        metadata.get("interchangeable_object_canonical") or ""
+    ).strip()
+    raw_candidates = metadata.get("interchangeable_object_candidates", ())
+    if (
+        not canonical
+        or isinstance(raw_candidates, (str, bytes))
+        or not isinstance(raw_candidates, (list, tuple))
+    ):
+        return None, []
+    candidates = list(
+        dict.fromkeys(str(alias).strip() for alias in raw_candidates if str(alias).strip())
+    )
+    if canonical not in candidates or len(candidates) < 2:
+        return None, []
+    return canonical, candidates
+
+
+def _selected_interchangeable_object(
+    result: Mapping[str, Any], candidates: list[str]
+) -> str | None:
+    verifier = result.get("verifier_result")
+    if not isinstance(verifier, Mapping):
+        rollout = result.get("rollout_logs")
+        verifier = (
+            rollout.get("Final_Verification")
+            if isinstance(rollout, Mapping)
+            else None
+        )
+    evidence = verifier.get("state_evidence", ()) if isinstance(verifier, Mapping) else ()
+    if not isinstance(evidence, (list, tuple)):
+        return None
+    valid = set(candidates)
+    for item in reversed(evidence):
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("source") not in {
+            "interchangeable_object_pick",
+            "interchangeable_object_condition",
+        }:
+            continue
+        selected = str(item.get("selected_object_alias") or "").strip()
+        if selected in valid:
+            return selected
+    return None
+
+
+def _replace_alias(value: Any, source: str, replacement: str) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _replace_alias(item, source, replacement)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_replace_alias(item, source, replacement) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_replace_alias(item, source, replacement) for item in value)
+    return replacement if value == source else value
+
+
+def _bind_interchangeable_object(
+    call: AtomicTaskCall, canonical: str, selected: str
+) -> AtomicTaskCall:
+    value = _replace_alias(call.to_dict(), canonical, selected)
+    metadata = dict(value.get("metadata", {}))
+    metadata["interchangeable_object_canonical"] = selected
+    metadata["interchangeable_object_candidates"] = [selected]
+    metadata["bound_interchangeable_object_alias"] = selected
+    value["metadata"] = metadata
+    return AtomicTaskCall.from_mapping(value)
+
+
 def _held_object_alias(call: AtomicTaskCall) -> str | None:
     """Return the object that a PlaceObject call expects to be holding."""
 
@@ -303,6 +379,9 @@ class TargetAwarePolicyAdapter:
             raise TypeError("post_skill_return_controller must provide prepare(...)")
         self.post_skill_return_controller = post_skill_return_controller
         self.post_skill_return_enabled = post_skill_return_controller is not None
+        self.post_skill_return_defer_until_navigation = bool(
+            return_config.get("defer_until_navigation", False)
+        )
         self.post_skill_return_enforce_result = bool(
             return_config.get("enforce_result", True)
         )
@@ -312,6 +391,7 @@ class TargetAwarePolicyAdapter:
         self._pending_post_grasp: dict[str, Any] | None = None
         self._pending_post_place_retreat: dict[str, Any] | None = None
         self._transport_ready_objects: set[str] = set()
+        self._interchangeable_object_bindings: dict[str, str] = {}
 
     @property
     def log_dir(self) -> Any:
@@ -390,6 +470,20 @@ class TargetAwarePolicyAdapter:
         if not isinstance(scheduler_query, Mapping) or "atomic_task_call" not in scheduler_query:
             raise ValueError("scheduler_query is missing atomic_task_call")
         call = AtomicTaskCall.from_mapping(scheduler_query["atomic_task_call"])
+        interchangeable_canonical, interchangeable_candidates = (
+            _interchangeable_object_spec(call)
+        )
+        bound_alias = (
+            self._interchangeable_object_bindings.get(interchangeable_canonical)
+            if interchangeable_canonical is not None
+            else None
+        )
+        if call.atomic_task == "PlaceObject" and bound_alias is not None:
+            call = _bind_interchangeable_object(
+                call, interchangeable_canonical, bound_alias
+            )
+            scheduler_query = dict(scheduler_query)
+            scheduler_query["atomic_task_call"] = call.to_dict()
         if call.atomic_task == "NavigateKitchen":
             result = dict(
                 self.policy_adapter.execute(
@@ -402,7 +496,11 @@ class TargetAwarePolicyAdapter:
                 result.get("success", False)
                 and _verifier_success(result) is not False
             )
-            if self.post_skill_return_enabled and verified:
+            if (
+                self.post_skill_return_enabled
+                and not self.post_skill_return_defer_until_navigation
+                and verified
+            ):
                 returned = dict(
                     self.post_skill_return_controller.prepare(
                         env=env,
@@ -455,6 +553,8 @@ class TargetAwarePolicyAdapter:
             "navigation_success": None,
             "navigation_reason": "DISABLED" if not self.navigation_enabled else None,
             "navigation_bypassed": False,
+            "navigation_reused": False,
+            "navigation_reuse_source_attempt_index": None,
             "navigation_warning": None,
             "navigation_artifacts": None,
             "post_grasp_transport_enabled": self.post_grasp_transport_enabled,
@@ -485,14 +585,80 @@ class TargetAwarePolicyAdapter:
             "policy_success": None,
             "verifier_success": None,
             "post_skill_return_enabled": self.post_skill_return_enabled,
+            "post_skill_return_defer_until_navigation": (
+                self.post_skill_return_defer_until_navigation
+            ),
             "post_skill_return_enforce_result": self.post_skill_return_enforce_result,
             "post_skill_return_required": False,
             "post_skill_return_success": None,
             "post_skill_return_warning": None,
+            "interchangeable_object_canonical": interchangeable_canonical,
+            "interchangeable_object_candidates": list(interchangeable_candidates),
+            "bound_interchangeable_object_alias": bound_alias,
         }
         navigation_result = None
         navigation_value = None
-        if self.navigation_enabled:
+        retry_value = scheduler_query.get("retry_from_current_pose")
+        retry_from_current_pose = bool(
+            self.navigation_enabled
+            and isinstance(retry_value, Mapping)
+            and retry_value.get("subgoal_id") == call.subgoal_id
+        )
+        reuse_value = scheduler_query.get("reuse_successful_navigation")
+        reuse_successful_navigation = bool(
+            self.navigation_enabled
+            and not retry_from_current_pose
+            and call.atomic_task == "PlaceObject"
+            and isinstance(reuse_value, Mapping)
+            and reuse_value.get("subgoal_id") == call.subgoal_id
+        )
+        if retry_from_current_pose or reuse_successful_navigation:
+            handoff_value = retry_value if retry_from_current_pose else reuse_value
+            cached_navigation = handoff_value.get("navigation_result")
+            cached_navigation = (
+                dict(cached_navigation)
+                if isinstance(cached_navigation, Mapping)
+                else {}
+            )
+            navigation_reason = (
+                "RETRY_FROM_CURRENT_POSE"
+                if retry_from_current_pose
+                else "REUSED_SUCCESSFUL_NAVIGATION"
+            )
+            stage["target"] = cached_navigation.get("target_name")
+            stage["target_type"] = cached_navigation.get("target_type")
+            stage["navigation_required"] = False
+            stage["navigation_success"] = True
+            stage["navigation_reason"] = navigation_reason
+            stage["navigation_reused"] = True
+            stage["navigation_reuse_source_attempt_index"] = handoff_value.get(
+                "source_attempt_index"
+            )
+            stage["coarse_goal"] = cached_navigation.get("selected_goal")
+            stage["navigation_result"] = {
+                **cached_navigation,
+                "success": True,
+                "reason": navigation_reason,
+                "skipped": True,
+                "reused": True,
+                "retry_from_current_pose": retry_from_current_pose,
+                "source_attempt_index": handoff_value.get(
+                    "source_attempt_index"
+                ),
+            }
+            print(
+                "[AtomicSkill] {} navigation={} source_attempt={} "
+                "policy_started=True".format(
+                    call.subgoal_id,
+                    navigation_reason,
+                    handoff_value.get("source_attempt_index"),
+                )
+            )
+        if (
+            self.navigation_enabled
+            and not retry_from_current_pose
+            and not reuse_successful_navigation
+        ):
             navigation_context = dict(self.context)
             grounding_result = scheduler_query.get("grounding_result")
             if isinstance(grounding_result, Mapping):
@@ -533,37 +699,66 @@ class TargetAwarePolicyAdapter:
                 return preparation
 
             def prepare_pending_grasp() -> Mapping[str, Any]:
-                if (
-                    self._pending_post_grasp is None
-                    or self.post_grasp_transport_controller is None
-                ):
+                if self._pending_post_grasp is None:
                     return {
                         "success": False,
                         "transport_ready": False,
+                        "navigation_safe": False,
                         "failure_code": "TRANSPORT_READY_FAILED",
                         "reason": "NO_PENDING_VERIFIED_PICK",
                     }
                 pending = self._pending_post_grasp
-                preparation = dict(
-                    self.post_grasp_transport_controller.prepare(
-                        env=env,
-                        atomic_task_call=pending["call"],
-                        episode_id=episode_id,
-                        pick_verified=bool(pending["pick_verified"]),
+                if (
+                    self.post_skill_return_enabled
+                    and self.post_skill_return_defer_until_navigation
+                ):
+                    preparation = dict(
+                        self.post_skill_return_controller.prepare(
+                            env=env,
+                            atomic_task_call=pending["call"],
+                            episode_id=episode_id,
+                            skill_verified=bool(pending["pick_verified"]),
+                            initial_applied_action=pending.get(
+                                "initial_applied_action"
+                            ),
+                            simulation_step_offset=int(
+                                pending.get("simulation_step_offset", 0)
+                            ),
+                        )
                     )
-                )
-                preparation["navigation_safe"] = bool(
-                    preparation.get("transport_ready", False)
-                )
+                    ready = bool(preparation.get("return_ready", False))
+                    preparation.setdefault("transport_ready", ready)
+                    preparation["navigation_safe"] = ready
+                elif self.post_grasp_transport_controller is not None:
+                    preparation = dict(
+                        self.post_grasp_transport_controller.prepare(
+                            env=env,
+                            atomic_task_call=pending["call"],
+                            episode_id=episode_id,
+                            pick_verified=bool(pending["pick_verified"]),
+                        )
+                    )
+                    preparation["navigation_safe"] = bool(
+                        preparation.get("transport_ready", False)
+                    )
+                else:
+                    return {
+                        "success": False,
+                        "transport_ready": False,
+                        "navigation_safe": False,
+                        "failure_code": "TRANSPORT_READY_FAILED",
+                        "reason": "NO_TRANSPORT_POSE_CONTROLLER",
+                    }
+                preparation.setdefault("object_alias", pending["object_alias"])
                 grasp_preparation_holder.update(preparation)
                 alias = str(preparation.get("object_alias") or "")
-                if preparation.get("transport_ready", False) and alias:
+                if preparation.get("navigation_safe", False) and alias:
                     self._transport_ready_objects.add(alias)
                     self._pending_post_grasp = None
-                elif (
-                    preparation.get("failure_code")
-                    == "OBJECT_DROPPED_DURING_PREP"
-                ):
+                elif preparation.get("failure_code") in {
+                    "OBJECT_DROPPED_DURING_PREP",
+                    "OBJECT_DROPPED_DURING_POST_SKILL_RETURN",
+                }:
                     self._transport_ready_objects.discard(alias)
                     self._pending_post_grasp = None
                 return preparation
@@ -587,8 +782,14 @@ class TargetAwarePolicyAdapter:
                 prepare_for_navigation
                 if (
                     (
-                        self.post_grasp_transport_enabled
-                        and self._pending_post_grasp is not None
+                        self._pending_post_grasp is not None
+                        and (
+                            self.post_grasp_transport_enabled
+                            or (
+                                self.post_skill_return_enabled
+                                and self.post_skill_return_defer_until_navigation
+                            )
+                        )
                     )
                     or (
                         self.post_place_retreat_enabled
@@ -695,7 +896,12 @@ class TargetAwarePolicyAdapter:
         refinement = None
         run_local_refiner = self.local_refiner_enabled
         if run_local_refiner and self.local_refiner_after_navigation_only:
-            if navigation_result is None:
+            if reuse_successful_navigation:
+                run_local_refiner = False
+                stage["local_refinement_skip_reason"] = (
+                    "NAVIGATION_REUSED_ON_PLACE_RETRY"
+                )
+            elif navigation_result is None:
                 run_local_refiner = False
                 stage["local_refinement_skip_reason"] = "NAVIGATION_NOT_AVAILABLE"
             elif not navigation_result.success:
@@ -859,14 +1065,44 @@ class TargetAwarePolicyAdapter:
             policy_result.get("success", False)
             and stage["verifier_success"] is not False
         )
+        handoff_call = call
+        if (
+            call.atomic_task == "PickObject"
+            and skill_verified
+            and interchangeable_canonical is not None
+        ):
+            selected_alias = _selected_interchangeable_object(
+                policy_result, interchangeable_candidates
+            )
+            if selected_alias is not None:
+                self._interchangeable_object_bindings[
+                    interchangeable_canonical
+                ] = selected_alias
+                handoff_call = _bind_interchangeable_object(
+                    call, interchangeable_canonical, selected_alias
+                )
+                stage["bound_interchangeable_object_alias"] = selected_alias
+                policy_result["bound_interchangeable_object_alias"] = selected_alias
         post_skill_return = None
-        if self.post_skill_return_enabled and skill_verified:
+        if (
+            self.post_skill_return_enabled
+            and not self.post_skill_return_defer_until_navigation
+            and skill_verified
+        ):
             post_skill_return = dict(
                 self.post_skill_return_controller.prepare(
                     env=env,
-                    atomic_task_call=call,
+                    atomic_task_call=handoff_call,
                     episode_id=episode_id,
                     skill_verified=True,
+                    initial_applied_action=policy_result.get(
+                        "last_applied_action"
+                    ),
+                    simulation_step_offset=int(
+                        (
+                            policy_result.get("rollout_logs") or {}
+                        ).get("Horizon", 0)
+                    ),
                 )
             )
             return_ready = bool(post_skill_return.get("return_ready", False))
@@ -884,13 +1120,20 @@ class TargetAwarePolicyAdapter:
                     "OBJECT_DROPPED_DURING_POST_SKILL_RETURN",
                 }
                 # A Pick that cannot reach its carry pose must never fall back
+                if dropped:
+                    dropped_alias = post_skill_return.get("object_alias")
+                    if dropped_alias:
+                        self._transport_ready_objects.discard(
+                            str(dropped_alias)
+                        )
+                    stage["transport_ready"] = False
+                    stage["transport_ready_cleared_after_drop"] = True
                 # to immediate base navigation, even if an external config
                 # selects the legacy best-effort warning policy.
-                if (
+                if dropped or (
                     self.post_skill_return_enforce_result
                     and (
                         call.atomic_task == "PickObject"
-                        or dropped
                         or self.post_skill_return_failure_policy == "block"
                     )
                 ):
@@ -908,7 +1151,7 @@ class TargetAwarePolicyAdapter:
                     return failure
         if call.atomic_task == "PickObject":
             object_alias = (
-                resolve_object_alias(env, call)
+                resolve_object_alias(env, handoff_call)
                 if (
                     self.post_grasp_transport_enabled
                     or self.post_skill_return_enabled
@@ -938,14 +1181,25 @@ class TargetAwarePolicyAdapter:
             elif (
                 pick_verified
                 and object_alias is not None
-                and not self.post_skill_return_enabled
+                and (
+                    not self.post_skill_return_enabled
+                    or self.post_skill_return_defer_until_navigation
+                )
             ):
                 self._transport_ready_objects.discard(object_alias)
                 self._pending_post_grasp = {
-                    "call": call,
+                    "call": handoff_call,
                     "object_alias": object_alias,
                     "episode_id": episode_id,
                     "pick_verified": True,
+                    "initial_applied_action": policy_result.get(
+                        "last_applied_action"
+                    ),
+                    "simulation_step_offset": int(
+                        (policy_result.get("rollout_logs") or {}).get(
+                            "Horizon", 0
+                        )
+                    ),
                 }
             elif (
                 self._pending_post_grasp is not None
@@ -957,6 +1211,10 @@ class TargetAwarePolicyAdapter:
             "success", False
         ):
             place_verified = stage["verifier_success"] is not False
+            if place_verified and interchangeable_canonical is not None:
+                self._interchangeable_object_bindings.pop(
+                    interchangeable_canonical, None
+                )
             if (
                 self.post_place_retreat_enabled
                 and place_verified

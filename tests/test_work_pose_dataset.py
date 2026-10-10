@@ -507,3 +507,207 @@ def test_move_eef_to_pose_zero_delta_settle_holds_arm_stationary():
     assert all(np.allclose(action[:6], 0.0) for action in settle_actions)
     assert all(action[6] == pytest.approx(1.0) for action in settle_actions)
     assert all(action[11] == pytest.approx(1.0) for action in settle_actions)
+
+
+class _InertialEefEnv:
+    """Small second-order plant used to exercise simulated handoff dynamics."""
+
+    control_timestep = 0.05
+
+    def __init__(self, *, damping=0.65, action_gain=0.35):
+        self.position = np.zeros(3, dtype=np.float64)
+        self.velocity = np.zeros(3, dtype=np.float64)
+        self.quaternion = np.array([0.0, 0.0, 0.0, 1.0])
+        self.actions = []
+        self.damping = float(damping)
+        self.action_gain = float(action_gain)
+
+    def get_observation(self):
+        return {
+            "robot0_base_to_eef_pos": self.position.copy(),
+            "robot0_base_to_eef_quat": self.quaternion.copy(),
+        }
+
+    def step(self, action):
+        action = np.asarray(action, dtype=np.float64)
+        self.actions.append(action.copy())
+        self.velocity = (
+            self.damping * self.velocity
+            + self.action_gain * action[:3]
+        )
+        self.position += self.velocity * self.control_timestep
+        return self.get_observation(), 0.0, False, {}
+
+
+def _identity_target(position):
+    return {
+        "position": list(position),
+        "quaternion_xyzw": [0.0, 0.0, 0.0, 1.0],
+        "frame": "robot_base",
+    }
+
+
+def test_smooth_handoff_bounds_first_action_from_nonzero_previous_action():
+    env = _InertialEefEnv()
+    previous = np.zeros(12, dtype=np.float64)
+    previous[0] = 0.03
+    previous[6] = 1.0
+    previous[11] = 1.0
+
+    result = move_eef_to_pose_smooth(
+        env,
+        _identity_target([0.025, 0.0, 0.0]),
+        initial_applied_action=previous,
+        max_steps=120,
+        trajectory_steps=30,
+        max_translation_command_delta=0.005,
+        max_rotation_command_delta=0.004,
+        handoff_max_steps=30,
+        handoff_stable_steps=2,
+        handoff_action_tolerance=0.005,
+        linear_velocity_threshold_m_s=0.05,
+        angular_velocity_threshold_deg_s=5.0,
+        stable_steps=3,
+        translation_tolerance_m=0.003,
+        orientation_tolerance_deg=1.0,
+        gripper_action=1.0,
+    )
+
+    first = result["trace"][0]
+    assert first["phase"] == "bounded_action_handoff"
+    assert first["adjacent_action_comparable"] is True
+    assert max(abs(value) for value in first["adjacent_action_delta"][:3]) <= 0.005001
+    assert result["handoff"]["settled"] is True
+    assert result["success"] is True
+    assert all(action[6] == pytest.approx(1.0) for action in env.actions)
+
+
+def test_smooth_handoff_does_not_compare_actions_across_controller_modes():
+    env = _InertialEefEnv()
+    previous = np.zeros(12, dtype=np.float64)
+    previous[0] = 0.5
+    previous[11] = -1.0
+
+    result = move_eef_to_pose_smooth(
+        env,
+        _identity_target([0.0, 0.0, 0.0]),
+        initial_applied_action=previous,
+        max_steps=20,
+        trajectory_steps=2,
+        stable_steps=1,
+        handoff_max_steps=4,
+        handoff_stable_steps=1,
+    )
+
+    assert result["handoff"]["action_modes_compatible"] is False
+    assert result["trace"][0]["adjacent_action_comparable"] is False
+    assert result["trace"][0]["adjacent_action_delta"] is None
+
+
+def test_pose_in_tolerance_but_high_simulated_velocity_is_not_success():
+    env = _InertialEefEnv(damping=1.0, action_gain=0.0)
+    env.velocity[0] = 0.20
+
+    result = move_eef_to_pose_smooth(
+        env,
+        _identity_target([0.0, 0.0, 0.0]),
+        max_steps=3,
+        trajectory_steps=1,
+        stable_steps=1,
+        translation_tolerance_m=0.10,
+        orientation_tolerance_deg=1.0,
+        linear_velocity_threshold_m_s=0.01,
+        angular_velocity_threshold_deg_s=5.0,
+    )
+
+    assert result["success"] is False
+    assert result["final_error"]["translation_m"] <= 0.10
+    assert result["final_velocity"]["linear_m_s"] > 0.01
+    assert result["final_consecutive"] == 0
+
+
+def test_one_stable_step_at_budget_does_not_satisfy_eight_step_window():
+    env = _InertialEefEnv(damping=0.0, action_gain=0.0)
+
+    result = move_eef_to_pose_smooth(
+        env,
+        _identity_target([0.0, 0.0, 0.0]),
+        max_steps=1,
+        trajectory_steps=1,
+        stable_steps=8,
+        translation_tolerance_m=0.01,
+        orientation_tolerance_deg=1.0,
+    )
+
+    assert result["success"] is False
+    assert result["final_consecutive"] == 1
+    assert result["end_reason"] == "STEP_BUDGET_EXHAUSTED"
+
+
+def test_zero_settle_drift_outside_tolerance_is_not_success():
+    class DriftEnv(_InertialEefEnv):
+        def step(self, action):
+            self.actions.append(np.asarray(action, dtype=np.float64).copy())
+            if len(self.actions) == 2:
+                self.position[0] += 0.02
+            return self.get_observation(), 0.0, False, {}
+
+    env = DriftEnv(damping=0.0, action_gain=0.0)
+    result = move_eef_to_pose_smooth(
+        env,
+        _identity_target([0.0, 0.0, 0.0]),
+        max_steps=2,
+        trajectory_steps=1,
+        stable_steps=1,
+        settle_steps=1,
+        settle_mode="zero_delta",
+        translation_tolerance_m=0.005,
+        orientation_tolerance_deg=1.0,
+    )
+
+    assert result["success"] is False
+    assert result["final_error"]["translation_m"] > 0.005
+    assert result["final_consecutive"] == 0
+
+
+def test_confirmed_drop_stops_trajectory_without_normal_settle():
+    class DropGuard:
+        def __init__(self):
+            self.started = 0
+
+        def start(self):
+            self.started += 1
+
+        def apply_action(self, action, *, step_index):
+            return action
+
+        def observe(self, *, step_index):
+            if step_index == 2:
+                return {
+                    "failure_code": "OBJECT_DROPPED",
+                    "state_evidence": [
+                        {"step_index": step_index}, {"holding": False}
+                    ],
+                }
+            return None
+
+        def to_dict(self):
+            return {"started": self.started}
+
+    env = _InertialEefEnv()
+    result = move_eef_to_pose_smooth(
+        env,
+        _identity_target([0.10, 0.0, 0.0]),
+        guard=DropGuard(),
+        max_steps=50,
+        trajectory_steps=20,
+        stable_steps=3,
+        settle_steps=5,
+        gripper_action=1.0,
+    )
+
+    assert result["success"] is False
+    assert result["end_reason"] == "OBJECT_DROPPED"
+    assert result["first_drop_step"] == 2
+    assert len(env.actions) == 2
+    assert not any("settle" in item["phase"] for item in result["trace"])

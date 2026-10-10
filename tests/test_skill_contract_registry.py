@@ -167,3 +167,59 @@ def test_iced_coffee_contract_releases_any_matching_cube_then_retracts_from_cup(
     }
     assert enriched.termination_condition[2]["predicate"] == "gripper_far"
     assert enriched.termination_condition[2]["subject"] == "glass_cup1"
+
+
+def test_place_object_to_dishwasher_uses_rack_contact_and_is_idempotent():
+    call = AtomicTaskCall.from_mapping(
+        {
+            "subgoal_id": "place_plate_in_dishwasher",
+            "atomic_task": "PlaceObject",
+            "policy_prompt": "Place the plate in the dishwasher.",
+            "arguments": {
+                "object_id": "plate",
+                "destination_id": "dishwasher_main_group",
+            },
+            "termination_condition": {
+                "predicate": "inside",
+                "subject": "plate",
+                "object": "dishwasher_main_group",
+                "desired_value": True,
+            },
+        }
+    )
+    context = {
+        "env_name": "LoadDishwasher",
+        "fixtures": [
+            {
+                "alias": "dishwasher_main_group",
+                "type": "Dishwasher",
+                "natural_name": "dishwasher",
+            }
+        ],
+        "objects": [{"alias": "plate"}],
+    }
+
+    enriched, changes = apply_skill_contract(call, context)
+
+    assert [
+        item["predicate"] for item in enriched.termination_condition
+    ] == [
+        "dishwasher_rack_contact",
+        "released",
+        "eef_outside_receptacle",
+    ]
+    assert enriched.metadata["skill_contract"]["goal"]["conditions"] == [
+        {
+            "predicate": "dishwasher_rack_contact",
+            "subject": "plate",
+            "object": "dishwasher_main_group",
+            "desired_value": True,
+        }
+    ]
+    assert changes[0]["rewritten_goal_predicates"][0]["to"] == (
+        "dishwasher_rack_contact"
+    )
+
+    enriched_again, repeated_changes = apply_skill_contract(enriched, context)
+    assert enriched_again.termination_condition == enriched.termination_condition
+    assert repeated_changes == []

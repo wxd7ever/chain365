@@ -4,19 +4,30 @@ from __future__ import annotations
 
 import inspect
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, Mapping
 
 import numpy as np
 
 try:
     from .atomic_task_schemas import AtomicTaskCall
+    from .pick_motion_verification import (
+        capture_pick_motion_baseline,
+        check_two_finger_grasp,
+        evaluate_pick_motion,
+    )
 except ImportError:  # Direct execution from the robocasa script directory.
     from atomic_task_schemas import AtomicTaskCall
+    from pick_motion_verification import (
+        capture_pick_motion_baseline,
+        check_two_finger_grasp,
+        evaluate_pick_motion,
+    )
 
 
 _VALID_PREDICATES = {
     "closed",
+    "dishwasher_rack_contact",
     "eef_outside_fixture",
     "eef_outside_receptacle",
     "fixture_state",
@@ -200,7 +211,13 @@ def _expected_entity_kinds(
 ) -> frozenset[str]:
     """Return the entity kinds accepted by a predicate field."""
 
-    relation_predicates = {"inside", "inserted", "on", "object_fixture_relation"}
+    relation_predicates = {
+        "dishwasher_rack_contact",
+        "inside",
+        "inserted",
+        "on",
+        "object_fixture_relation",
+    }
     fixture_predicates = {
         "closed",
         "eef_outside_fixture",
@@ -214,7 +231,7 @@ def _expected_entity_kinds(
     if field == "reference_object":
         return frozenset({"object"})
     if field in {"object", "destination"}:
-        if predicate == "object_fixture_relation":
+        if predicate in {"dishwasher_rack_contact", "object_fixture_relation"}:
             return frozenset({"fixture"})
         if predicate in relation_predicates:
             return frozenset({"object", "fixture"})
@@ -326,9 +343,34 @@ def _fixture_state(
                 "actual_kind": _entity_kind(raw_env, alias),
             }
         ]
+    def french_door_open_state() -> tuple[bool, dict[str, Any]] | None:
+        joint_names = list(getattr(entity, "_fridge_door_joint_names", ()) or ())
+        if len(joint_names) < 2:
+            return None
+        get_joint_state = getattr(entity, "get_joint_state", None)
+        if not callable(get_joint_state):
+            return None
+        joint_state = get_joint_state(raw_env, joint_names)
+        normalized = {name: float(joint_state[name]) for name in joint_names}
+        threshold = 0.90
+        value = all(position >= threshold for position in normalized.values())
+        return value, {
+            "source": "french_door_joint_state",
+            "entity": alias,
+            "door_joint_names": joint_names,
+            "door_joint_state": normalized,
+            "open_threshold": threshold,
+            "all_doors_open": value,
+        }
+
     if predicate == "fixture_state" and isinstance(desired_state, str):
         state_name = desired_state.strip().lower()
         if state_name in {"open", "closed"}:
+            if state_name == "open":
+                french_door_state = french_door_open_state()
+                if french_door_state is not None:
+                    value, evidence = french_door_state
+                    return value, [evidence]
             method = getattr(entity, f"is_{state_name}", None)
             if callable(method):
                 value = _coerce_boolean_state(
@@ -352,6 +394,11 @@ def _fixture_state(
                     }
                 ]
     if predicate in {"open", "closed"}:
+        if predicate == "open":
+            french_door_state = french_door_open_state()
+            if french_door_state is not None:
+                value, evidence = french_door_state
+                return value, [evidence]
         method = getattr(entity, f"is_{predicate}", None)
         if callable(method):
             value = _coerce_boolean_state(_call_state_method(method, raw_env))
@@ -465,6 +512,16 @@ def _object_relation(
                 else object_utils.check_obj_grasped(
                     raw_env, subject_alias, threshold=receptacle_threshold
                 ), relation_api
+            )
+        elif predicate == "dishwasher_rack_contact" and object_kind == "fixture":
+            relation_api = "check_rack_contact"
+            rack_checker = getattr(object_entity, relation_api, None)
+            if not callable(rack_checker):
+                raise AttributeError(
+                    f"fixture {object_alias!r} has no callable {relation_api}"
+                )
+            value = _require_boolean_state(
+                rack_checker(raw_env, subject_alias), relation_api
             )
         elif predicate in {"inside", "inserted", "on"} and object_kind == "object":
             kwargs = (
@@ -624,6 +681,120 @@ def _receptacle_count(
             "value": value,
         }
     ]
+
+
+def _predicate_subjects(
+    condition: Mapping[str, Any], predicate: str
+) -> list[str]:
+    """Collect subjects for one predicate from a nested condition tree."""
+
+    subjects: list[str] = []
+    for operator in ("all_of", "any_of"):
+        children = condition.get(operator)
+        if isinstance(children, list):
+            for child in children:
+                if isinstance(child, Mapping):
+                    subjects.extend(_predicate_subjects(child, predicate))
+            return subjects
+    current = (
+        str(condition.get("predicate", ""))
+        .strip()
+        .lower()
+        .replace(" ", "_")
+    )
+    subject = str(condition.get("subject", "")).strip()
+    if current == predicate and subject:
+        subjects.append(subject)
+    return subjects
+
+
+def _interchangeable_object_spec(
+    call: AtomicTaskCall, raw_env: Any
+) -> tuple[str | None, list[str]]:
+    """Return a validated canonical alias and its task-defined alternatives."""
+
+    metadata = call.metadata if isinstance(call.metadata, Mapping) else {}
+    canonical = str(
+        metadata.get("interchangeable_object_canonical") or ""
+    ).strip()
+    raw_candidates = metadata.get("interchangeable_object_candidates", ())
+    if (
+        not canonical
+        or isinstance(raw_candidates, (str, bytes))
+        or not isinstance(raw_candidates, Sequence)
+    ):
+        return None, []
+    objects = getattr(raw_env, "objects", {})
+    candidates = list(
+        dict.fromkeys(
+            str(alias).strip()
+            for alias in raw_candidates
+            if str(alias).strip() in objects
+        )
+    )
+    if canonical not in candidates or len(candidates) < 2:
+        return None, []
+    return canonical, candidates
+
+
+def _replace_condition_subject(
+    condition: Mapping[str, Any], source: str, replacement: str
+) -> dict[str, Any]:
+    """Replace one movable-object subject throughout a condition tree."""
+
+    value = dict(condition)
+    for operator in ("all_of", "any_of"):
+        children = value.get(operator)
+        if isinstance(children, list):
+            value[operator] = [
+                _replace_condition_subject(child, source, replacement)
+                if isinstance(child, Mapping)
+                else child
+                for child in children
+            ]
+    if str(value.get("subject", "")).strip() == source:
+        value["subject"] = replacement
+    return value
+
+
+def _object_center_z(
+    chain: list[Any], subject: str
+) -> tuple[float | None, list[dict[str, Any]]]:
+    """Read an object world-frame center height from simulator state."""
+
+    _, alias = _resolve_entity(chain, subject)
+    raw_env = _task_env(chain)
+    if alias is None or alias not in getattr(raw_env, "objects", {}):
+        return None, [
+            {
+                "source": "pick_lift_verification",
+                "subject": subject,
+                "resolved": False,
+                "error": "Pick subject did not resolve to a scene object",
+            }
+        ]
+    try:
+        body_id = raw_env.obj_body_id[alias]
+        position = np.asarray(raw_env.sim.data.body_xpos[body_id], dtype=float)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
+        return None, [
+            {
+                "source": "pick_lift_verification",
+                "subject": alias,
+                "resolved": True,
+                "error": str(exc),
+            }
+        ]
+    if position.shape != (3,) or not np.isfinite(position).all():
+        return None, [
+            {
+                "source": "pick_lift_verification",
+                "subject": alias,
+                "resolved": True,
+                "error": f"invalid object position {position!r}",
+            }
+        ]
+    return float(position[2]), []
 
 
 def _matching_object_aliases(chain: list[Any], object_prefix: str) -> list[str]:
@@ -1055,6 +1226,7 @@ class RuntimeAtomicTaskVerifier:
         default_required_consecutive_successes: int = 1,
         entity_alias_resolver: Callable[..., str | None] | None = None,
         holding_threshold: float | None = None,
+        pick_min_lift_delta_m: float | None = 0.04,
     ):
         if (
             isinstance(default_required_consecutive_successes, bool)
@@ -1075,8 +1247,176 @@ class RuntimeAtomicTaskVerifier:
             if not np.isfinite(holding_threshold) or holding_threshold <= 0:
                 raise ValueError("holding_threshold must be positive when provided")
         self.holding_threshold = holding_threshold
+        if pick_min_lift_delta_m is not None:
+            pick_min_lift_delta_m = float(pick_min_lift_delta_m)
+            if (
+                not np.isfinite(pick_min_lift_delta_m)
+                or pick_min_lift_delta_m <= 0
+            ):
+                raise ValueError(
+                    "pick_min_lift_delta_m must be positive when provided"
+                )
+        self.pick_min_lift_delta_m = pick_min_lift_delta_m
+        self._pick_lift_baselines: dict[tuple[int, str, str], dict[str, Any]] = {}
         self._alias_resolution_cache: dict[tuple[Any, ...], str] = {}
         self._consecutive_state: dict[tuple[int, str, str], dict[str, int]] = {}
+
+    def start_atomic_task(
+        self,
+        *,
+        env: Any,
+        atomic_task_call: AtomicTaskCall | Mapping[str, Any],
+        observation: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Capture the Pick object pose and source at the start of each attempt."""
+
+        del observation
+        call = (
+            atomic_task_call
+            if isinstance(atomic_task_call, AtomicTaskCall)
+            else AtomicTaskCall.from_mapping(atomic_task_call)
+        )
+        if call.atomic_task != "PickObject" or self.pick_min_lift_delta_m is None:
+            return
+        condition: Mapping[str, Any] = (
+            {"all_of": call.termination_condition}
+            if isinstance(call.termination_condition, list)
+            else call.termination_condition
+        )
+        subjects = sorted(set(_predicate_subjects(condition, "holding")))
+        if len(subjects) != 1:
+            return
+        chain = _env_chain(env)
+        _, subject_alias = _resolve_entity(chain, subjects[0])
+        raw_env = _task_env(chain)
+        if subject_alias is None or subject_alias not in raw_env.objects:
+            return
+        _, interchangeable = _interchangeable_object_spec(call, raw_env)
+        candidates = interchangeable or [subject_alias]
+        for candidate_alias in candidates:
+            baseline = capture_pick_motion_baseline(
+                raw_env=raw_env,
+                object_alias=candidate_alias,
+                atomic_task_call=call,
+            )
+            if baseline is None:
+                continue
+            key = (id(env), call.subgoal_id, candidate_alias)
+            previous = self._pick_lift_baselines.get(key)
+            # For ordinary Pick retries, keep the support relation captured before
+            # the first attempt. A retry can begin after the object has already left
+            # the support, so replacing this baseline would erase the event that the
+            # verifier is meant to recognize. Cabinet / drawer retries retain their
+            # existing per-attempt extraction behavior.
+            if (
+                previous is not None
+                and not previous.get("source_is_cabinet_or_drawer")
+                and not baseline.get("source_is_cabinet_or_drawer")
+            ):
+                continue
+            self._pick_lift_baselines[key] = baseline
+
+    def _evaluate_pick_lift(
+        self,
+        *,
+        env: Any,
+        call: AtomicTaskCall,
+        grounded_condition: Mapping[str, Any],
+        step_index: int,
+    ) -> tuple[bool | None, list[dict[str, Any]]]:
+        """Require Pick motion for one target or any declared equivalent target."""
+
+        subjects = sorted(set(_predicate_subjects(grounded_condition, "holding")))
+        if len(subjects) != 1:
+            return None, [
+                {
+                    "source": "pick_lift_verification",
+                    "value": None,
+                    "error": "expected exactly one symbolic holding subject",
+                    "subjects": subjects,
+                    "step_index": step_index,
+                }
+            ]
+        subject = subjects[0]
+        chain = _env_chain(env)
+        _, subject_alias = _resolve_entity(chain, subject)
+        raw_env = _task_env(chain)
+        if subject_alias is None or subject_alias not in raw_env.objects:
+            return None, [
+                {
+                    "source": "pick_motion_verification",
+                    "subject": subject,
+                    "value": None,
+                    "error": "Pick subject did not resolve to a scene object",
+                    "step_index": step_index,
+                }
+            ]
+
+        canonical, interchangeable = _interchangeable_object_spec(call, raw_env)
+        candidates = interchangeable or [subject_alias]
+        results: list[tuple[str, bool | None]] = []
+        evidence: list[dict[str, Any]] = []
+        for candidate_alias in candidates:
+            key = (id(env), call.subgoal_id, candidate_alias)
+            baseline = self._pick_lift_baselines.get(key)
+            captured_late = (
+                baseline is None or baseline.get("subject") != candidate_alias
+            )
+            if captured_late:
+                baseline = capture_pick_motion_baseline(
+                    raw_env=raw_env,
+                    object_alias=candidate_alias,
+                    atomic_task_call=call,
+                )
+                if baseline is None:
+                    results.append((candidate_alias, None))
+                    evidence.append(
+                        {
+                            "source": "pick_motion_verification",
+                            "subject": candidate_alias,
+                            "value": None,
+                            "error": "Pick attempt baseline is unavailable",
+                            "step_index": step_index,
+                        }
+                    )
+                    continue
+                self._pick_lift_baselines[key] = baseline
+            ready, motion_evidence = evaluate_pick_motion(
+                raw_env=raw_env,
+                object_alias=candidate_alias,
+                baseline=baseline,
+                minimum_delta_m=float(self.pick_min_lift_delta_m),
+            )
+            motion_evidence["baseline_captured_late"] = captured_late
+            motion_evidence["step_index"] = step_index
+            motion_evidence["interchangeable_candidate"] = candidate_alias
+            evidence.append(motion_evidence)
+            results.append((candidate_alias, ready))
+
+        selected = next(
+            (alias for alias, ready in results if ready is True), None
+        )
+        if selected is not None:
+            ready_any: bool | None = True
+        elif any(ready is None for _, ready in results):
+            ready_any = None
+        else:
+            ready_any = False
+        if interchangeable:
+            evidence.append(
+                {
+                    "source": "interchangeable_object_pick",
+                    "canonical_object_alias": canonical,
+                    "candidate_object_aliases": list(candidates),
+                    "selected_object_alias": selected,
+                    "candidate_results": {
+                        alias: ready for alias, ready in results
+                    },
+                    "value": ready_any,
+                    "step_index": step_index,
+                }
+            )
+        return ready_any, evidence
 
     def _ground_condition_aliases(
         self,
@@ -1263,6 +1603,8 @@ class RuntimeAtomicTaskVerifier:
         env: Any,
         condition: Mapping[str, Any],
         info: Mapping[str, Any],
+        pick_two_finger_contact: bool = False,
+        bypass_pick_holding: bool = False,
     ) -> tuple[bool | None, list[dict[str, Any]]]:
         operators = [
             operator for operator in ("all_of", "any_of") if operator in condition
@@ -1283,7 +1625,13 @@ class RuntimeAtomicTaskVerifier:
                     "of mappings"
                 )
             evaluated = [
-                self._evaluate_condition(env=env, condition=item, info=info)
+                self._evaluate_condition(
+                    env=env,
+                    condition=item,
+                    info=info,
+                    pick_two_finger_contact=pick_two_finger_contact,
+                    bypass_pick_holding=bypass_pick_holding,
+                )
                 for item in children
             ]
             values = [value for value, _ in evaluated]
@@ -1410,7 +1758,28 @@ class RuntimeAtomicTaskVerifier:
                 chain, subject, margin, only_2d
             )
             evidence.extend(predicate_evidence)
-        elif predicate in {"inside", "inserted", "on", "holding", "object_fixture_relation"}:
+        elif predicate == "holding" and bypass_pick_holding:
+            value = bool(desired)
+            evidence.append(
+                {
+                    "source": "pick_holding_bypassed",
+                    "subject": subject,
+                    "reason": "support_surface_departure_is_the_pick_goal",
+                    "value": value,
+                }
+            )
+        elif predicate == "holding" and pick_two_finger_contact:
+            raw_env = _task_env(chain)
+            value, grasp_evidence = check_two_finger_grasp(raw_env, subject)
+            evidence.append(grasp_evidence)
+        elif predicate in {
+            "dishwasher_rack_contact",
+            "inside",
+            "inserted",
+            "on",
+            "holding",
+            "object_fixture_relation",
+        }:
             if predicate == "holding" and receptacle_threshold is None:
                 receptacle_threshold = self.holding_threshold
             value, relation_evidence = _object_relation(
@@ -1476,6 +1845,13 @@ class RuntimeAtomicTaskVerifier:
             raise ValueError(
                 "skill contract required_consecutive_successes must be a positive integer"
             )
+        if call.atomic_task == "PickObject":
+            # A momentary pair of contacts can occur while the object is
+            # slipping. Pick completion always needs at least two verifier
+            # observations; periodic_early_stop applies the same requirement
+            # at the rollout layer because each verifier call is intentionally
+            # stateless in that mode.
+            required = max(2, required)
         return required
 
     def _record_consecutive_result(
@@ -1549,9 +1925,117 @@ class RuntimeAtomicTaskVerifier:
                 "periodic_early_stop",
             }
             required = 1 if single_check_mode else contract_required
-            satisfied, evidence = self._evaluate_condition(
-                env=env, condition=grounded_condition, info=info
+            pick_motion_ready: bool | None = None
+            pick_motion_evidence: list[dict[str, Any]] = []
+            pick_motion_mode: str | None = None
+            if (
+                call.atomic_task == "PickObject"
+                and self.pick_min_lift_delta_m is not None
+                and _predicate_subjects(grounded_condition, "holding")
+            ):
+                pick_motion_ready, pick_motion_evidence = self._evaluate_pick_lift(
+                    env=env,
+                    call=call,
+                    grounded_condition=grounded_condition,
+                    step_index=int(step_index),
+                )
+                pick_motion_mode = next(
+                    (
+                        item.get("verification_mode")
+                        for item in pick_motion_evidence
+                        if item.get("verification_mode")
+                    ),
+                    None,
+                )
+            support_departure_pick = (
+                pick_motion_mode == "support_surface_departure"
             )
+            raw_env = _task_env(_env_chain(env))
+            canonical, interchangeable = _interchangeable_object_spec(
+                call, raw_env
+            )
+            condition_candidates = interchangeable or [None]
+            candidate_evaluations: list[
+                tuple[str | None, bool | None, list[dict[str, Any]]]
+            ] = []
+            for candidate_alias in condition_candidates:
+                candidate_condition = grounded_condition
+                if canonical is not None and candidate_alias is not None:
+                    candidate_condition = _replace_condition_subject(
+                        grounded_condition, canonical, candidate_alias
+                    )
+                value, candidate_evidence = self._evaluate_condition(
+                    env=env,
+                    condition=candidate_condition,
+                    info=info,
+                    pick_two_finger_contact=(
+                        call.atomic_task == "PickObject"
+                        and not support_departure_pick
+                    ),
+                    bypass_pick_holding=support_departure_pick,
+                )
+                candidate_evaluations.append(
+                    (candidate_alias, value, candidate_evidence)
+                )
+            selected_condition_alias = next(
+                (
+                    alias
+                    for alias, value, _ in candidate_evaluations
+                    if value is True
+                ),
+                None,
+            )
+            if any(
+                value is True for _, value, _ in candidate_evaluations
+            ):
+                satisfied = True
+            elif any(
+                value is None for _, value, _ in candidate_evaluations
+            ):
+                satisfied = None
+            else:
+                satisfied = False
+            evidence = [
+                item
+                for _, _, items in candidate_evaluations
+                for item in items
+            ]
+            if interchangeable:
+                evidence.append(
+                    {
+                        "source": "interchangeable_object_condition",
+                        "canonical_object_alias": canonical,
+                        "candidate_object_aliases": list(interchangeable),
+                        "selected_object_alias": selected_condition_alias,
+                        "candidate_results": {
+                            str(alias): value
+                            for alias, value, _ in candidate_evaluations
+                        },
+                        "value": satisfied,
+                    }
+                )
+            base_condition_satisfied = satisfied
+            pick_lift_failure_code = None
+            if pick_motion_evidence:
+                evidence.extend(pick_motion_evidence)
+                if pick_motion_ready is None:
+                    satisfied = None
+                elif support_departure_pick:
+                    satisfied = bool(pick_motion_ready)
+                    if not pick_motion_ready:
+                        pick_lift_failure_code = "OBJECT_NOT_CLEAR_OF_SUPPORT"
+                else:
+                    satisfied = (
+                        base_condition_satisfied is True and pick_motion_ready
+                    )
+                    if base_condition_satisfied is True and not pick_motion_ready:
+                        pick_lift_failure_code = "OBJECT_NOT_EXTRACTED"
+            if (
+                call.atomic_task == "PickObject"
+                and not support_departure_pick
+                and base_condition_satisfied is False
+            ):
+                pick_lift_failure_code = "OBJECT_NOT_GRASPED"
             evidence = grounding_evidence + evidence
         except (TypeError, ValueError) as exc:
             return _result(
@@ -1647,5 +2131,9 @@ class RuntimeAtomicTaskVerifier:
                 "success", goal_satisfied=True, evidence=evidence, retryable=False
             )
         return _result(
-            "uncertain", goal_satisfied=False, evidence=evidence, retryable=True
+            "uncertain",
+            goal_satisfied=False,
+            evidence=evidence,
+            failure_code=pick_lift_failure_code,
+            retryable=True,
         )

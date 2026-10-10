@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import imageio.v2 as imageio
 import numpy as np
@@ -51,6 +51,9 @@ class RawRoboCasaPi05Env:
     def __init__(self, env: Any):
         self.env = env
         self._observation: dict[str, Any] | None = None
+        self._observation_listeners: list[
+            Callable[[Mapping[str, Any]], None]
+        ] = []
         self._episode_video_writer: Any | None = None
         self._episode_video_step = 0
         self._episode_video_metadata: dict[str, Any] = {
@@ -85,12 +88,46 @@ class RawRoboCasaPi05Env:
             raise RuntimeError("RoboCasa environment must be reset before reading observation")
         return self._observation
 
+    def add_observation_listener(
+        self, listener: Callable[[Mapping[str, Any]], None]
+    ) -> None:
+        """Register one callback invoked exactly once after every env.step()."""
+        if listener not in self._observation_listeners:
+            self._observation_listeners.append(listener)
+
     def step(self, action: np.ndarray):
-        result = self.env.step(np.asarray(action, dtype=np.float32))
+        if isinstance(action, Mapping):
+            required = (
+                "action.end_effector_position",
+                "action.end_effector_rotation",
+                "action.gripper_close",
+                "action.base_motion",
+                "action.control_mode",
+            )
+            missing = [key for key in required if key not in action]
+            if missing:
+                raise KeyError(
+                    f"RoboCasa365 action dictionary is missing keys {missing}"
+                )
+            action = np.concatenate(
+                [
+                    np.asarray(action["action.end_effector_position"]).reshape(-1),
+                    np.asarray(action["action.end_effector_rotation"]).reshape(-1),
+                    np.asarray(action["action.gripper_close"]).reshape(-1),
+                    np.asarray(action["action.base_motion"]).reshape(-1),
+                    np.asarray(action["action.control_mode"]).reshape(-1),
+                ]
+            )
+        flat_action = np.asarray(action, dtype=np.float32).reshape(-1)
+        if flat_action.shape != (12,):
+            raise ValueError(f"PandaOmron policy action must resolve to 12 values, got {flat_action.shape}")
+        result = self.env.step(flat_action)
         if not isinstance(result, (tuple, list)) or len(result) != 4:
             raise RuntimeError("raw RoboCasa env.step must return (obs, reward, done, info)")
         observation, reward, done, info = result
         self._observation = _process_observation(observation)
+        for listener in tuple(self._observation_listeners):
+            listener(self._observation)
         self._episode_video_step += 1
         self._episode_video_metadata["env_steps_seen"] = self._episode_video_step
         frame_stride = self._episode_video_metadata.get("frame_stride")

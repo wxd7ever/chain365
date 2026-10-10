@@ -8,7 +8,10 @@ from robocasa.atomic_task_schemas import AtomicTaskCall
 from robocasa.local_pose_policy_adapter import LocalPoseRefiningPolicyAdapter
 from robocasa.local_work_pose_refiner import (
     LocalWorkPoseRefiner,
+    OpenAICompatibleLocalPoseVLM,
     _extract_response_text,
+    _summarize_vlm_usage,
+    _vlm_usage_breakdown,
 )
 from robocasa.pi05_env import POLICY_CAMERA_NAMES, RawRoboCasaPi05Env
 from robocasa.utils.camera_utils import get_robot_cam_configs
@@ -102,6 +105,36 @@ class _FakeRefinerEnv:
             dtype=np.float32,
         )
         return self.observation, 0.0, False, {}
+
+
+def test_held_mode_uses_normal_adaptive_step_profiles(tmp_path: Path):
+    refiner = LocalWorkPoseRefiner(
+        decision_maker=_DecisionMaker([]),
+        log_dir=tmp_path,
+        camera_names=("robot0_topview",),
+        translation_distance_m=0.30,
+        medium_translation_distance_m=0.12,
+        fine_translation_distance_m=0.05,
+        rotation_angle_deg=25.0,
+        medium_rotation_angle_deg=10.0,
+        fine_rotation_angle_deg=5.0,
+        held_translation_distance_m=0.01,
+        held_rotation_angle_deg=1.0,
+        held_object_guard=False,
+    )
+
+    for axis in ("distance", "lateral", "yaw"):
+        for level in range(3):
+            assert refiner._step_profile(
+                axis, level, held_mode=True
+            ) == refiner._step_profile(axis, level, held_mode=False)
+
+    assert refiner._step_profile("distance", 0, True)["translation_m"] == 0.30
+    assert refiner._step_profile("distance", 1, True)["translation_m"] == 0.12
+    assert refiner._step_profile("distance", 2, True)["translation_m"] == 0.05
+    assert refiner._step_profile("yaw", 0, True)["rotation_deg"] == 25.0
+    assert refiner._step_profile("yaw", 1, True)["rotation_deg"] == 10.0
+    assert refiner._step_profile("yaw", 2, True)["rotation_deg"] == 5.0
 
 
 def test_top_camera_is_registered_but_not_added_to_pi05_policy_contract():
@@ -444,7 +477,7 @@ def test_closed_loop_motion_reports_stall(tmp_path: Path):
 
     assert result["success"] is False
     assert result["failure_code"] == "LOCAL_POSE_MOTION_STALLED"
-    assert len(env.actions) == 100
+    assert len(env.actions) == 50
 
 
 def test_translation_deadzone_is_logged_as_partial_convergence(tmp_path: Path):
@@ -707,3 +740,186 @@ def test_refiner_exposes_task_conditioned_camera_selection(tmp_path: Path):
         "robot0_frontview",
         "robot0_eye_in_hand",
     )
+
+def test_vlm_usage_breakdown_separates_server_reasoning_tokens():
+    raw = """{"choices":[{"finish_reason":"stop","message":{"content":"{\\"action\\":\\"STOP\\"}","reasoning_content":"brief analysis"}}]}"""
+    breakdown = _vlm_usage_breakdown(
+        {
+            "prompt_tokens": 120,
+            "completion_tokens": 80,
+            "total_tokens": 200,
+            "completion_tokens_details": {"reasoning_tokens": 60},
+        },
+        raw_http_response=raw,
+        finish_reason="stop",
+    )
+
+    assert breakdown["input_tokens"] == 120
+    assert breakdown["completion_tokens"] == 80
+    assert breakdown["reasoning_tokens"] == 60
+    assert breakdown["visible_output_tokens"] == 20
+    assert breakdown["server_reported_reasoning_tokens"] is True
+    assert breakdown["dominant_usage"] == "reasoning"
+    summary = _summarize_vlm_usage(
+        [{"decision_index": 3, "vlm_usage_breakdown": breakdown}]
+    )
+    assert summary["finish_reason_counts"] == {"stop": 1}
+    assert summary["totals"]["reasoning_tokens"] == 60
+    assert summary["rounds"][0]["decision_index"] == 3
+
+
+def test_refiner_prompt_keeps_only_recent_compact_history(tmp_path: Path):
+    env = _FakeRefinerEnv()
+    decision_maker = _DecisionMaker(
+        [
+            {
+                "action": "FORWARD_SMALL",
+                "confidence": 0.9,
+                "target_visible": True,
+                "operation_ready": False,
+                "reason": "first reason that must not be copied into history",
+            },
+            {
+                "action": "STRAFE_LEFT_SMALL",
+                "confidence": 0.9,
+                "target_visible": True,
+                "operation_ready": False,
+                "reason": "second reason that must not be copied into history",
+            },
+            {
+                "action": "TURN_LEFT_SMALL",
+                "confidence": 0.9,
+                "target_visible": True,
+                "operation_ready": False,
+                "reason": "third reason that must not be copied into history",
+            },
+            {
+                "action": "STOP",
+                "confidence": 0.9,
+                "target_visible": True,
+                "operation_ready": True,
+                "reason": "ready",
+            },
+        ]
+    )
+    refiner = LocalWorkPoseRefiner(
+        decision_maker=decision_maker,
+        log_dir=tmp_path,
+        camera_names=("robot0_topview",),
+        image_size=8,
+        max_decisions=4,
+        held_object_guard=False,
+    )
+
+    result = refiner.refine(
+        env=env,
+        atomic_task_call=_operation_call(),
+        grounding_result={},
+        episode_id=0,
+    )
+
+    assert result["success"] is True
+    final_context = decision_maker.context_history[-1]
+    assert final_context["recent_actions"] == [
+        "FORWARD_SMALL",
+        "STRAFE_LEFT_SMALL",
+        "TURN_LEFT_SMALL",
+    ]
+    assert len(final_context["previous_corrections"]) == 2
+    assert all("reason" not in item for item in final_context["previous_corrections"])
+    assert final_context["cumulative_state"]["executed_action_count"] == 3
+    assert Path(result["artifact_dir"], "vlm_usage_summary.json").is_file()
+
+
+def test_primary_error_stall_detects_motion_in_wrong_direction(tmp_path: Path):
+    class _WrongDirectionEnv(_FakeRefinerEnv):
+        def step(self, action):
+            action = np.asarray(action, dtype=np.float32)
+            self.actions.append(action.copy())
+            self.observation = dict(self.observation)
+            position = np.asarray(self.observation["robot0_base_pos"]).copy()
+            position[1] += 0.002
+            self.observation["robot0_base_pos"] = position
+            return self.observation, 0.0, False, {}
+
+    env = _WrongDirectionEnv()
+    refiner = LocalWorkPoseRefiner(
+        decision_maker=_DecisionMaker(
+            [
+                {
+                    "action": "FORWARD_SMALL",
+                    "confidence": 0.9,
+                    "target_visible": True,
+                    "operation_ready": False,
+                    "reason": "too far",
+                }
+            ]
+        ),
+        log_dir=tmp_path,
+        camera_names=("robot0_topview",),
+        image_size=8,
+        max_decisions=1,
+        motion_max_steps=200,
+        stall_window_steps=25,
+        held_object_guard=False,
+    )
+
+    result = refiner.refine(
+        env=env,
+        atomic_task_call=_operation_call(),
+        grounding_result={},
+        episode_id=0,
+    )
+
+    motion = result["decisions"][0]["motion"]
+    assert result["failure_code"] == "LOCAL_POSE_MOTION_STALLED"
+    assert motion["steps"] == 25
+    assert motion["stall_trigger"] == "primary_error_not_improving"
+    assert motion["last_window_primary_improvement"] < 0.0
+
+
+
+def test_local_pose_prompt_is_scoped_to_one_current_visual_decision():
+    class _PromptClient:
+        endpoint = "http://example.invalid/v1/chat/completions"
+        last_response_text = None
+        last_raw_http_response = None
+        last_http_status = 200
+        last_finish_reason = "stop"
+        last_usage = {"prompt_tokens": 100, "completion_tokens": 20}
+
+        def query_json(self, **kwargs):
+            self.kwargs = kwargs
+            return {
+                "distance_alignment": "ALIGNED",
+                "lateral_alignment": "ALIGNED",
+                "yaw_alignment": "ALIGNED",
+                "action": "STOP",
+                "confidence": 0.9,
+                "target_visible": True,
+                "operation_ready": True,
+                "reason": "Target is visibly reachable.",
+            }
+
+    model = OpenAICompatibleLocalPoseVLM(
+        base_url="http://example.invalid/v1",
+        model="test-model",
+        api_key=None,
+        max_tokens=12288,
+        enable_thinking=True,
+    )
+    client = _PromptClient()
+    model._vision_client = client
+
+    decision = model.decide(
+        images={"robot0_topview": np.zeros((8, 8, 3), dtype=np.uint8)},
+        context={"atomic_task": "PlaceObject"},
+    )
+
+    assert decision["action"] == "STOP"
+    assert client.kwargs["max_tokens"] == 12288
+    assert "current atomic operation" in client.kwargs["user_prompt"]
+    assert "Do not analyze the complete task" in client.kwargs["user_prompt"]
+    assert "hypothetical action sequences" in client.kwargs["user_prompt"]
+    assert "one-step RoboCasa" in client.kwargs["system_prompt"]
+    assert "operation_ready=false" in client.kwargs["system_prompt"]

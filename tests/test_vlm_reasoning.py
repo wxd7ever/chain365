@@ -990,36 +990,48 @@ def test_steam_in_microwave_4_mapped_navigation_profile_is_isolated(monkeypatch)
     assert args.pi05_verify_interval == 5
     assert args.pi05_min_steps_before_verify == 10
     assert args.pi05_atomic_task_horizon == 600
-    assert args.pi05_success_handoff_steps == 30
+    assert args.pi05_success_handoff_steps == 5
     assert args.pi05_task_retries == 3
     assert args.retry_recovery_mode == "same_skill_no_drop_retry"
     assert args.pi05_base_action_mode == "full"
     assert args.atomic_prompt_style == "legacy_handoff"
     assert args.target_aware_navigation is True
     assert args.enable_local_refiner is True
-    assert args.local_pose_enable_thinking is False
-    assert args.simulator_grounding_position_threshold_m == 0.7
+    assert args.local_pose_enable_thinking is True
+    assert args.simulator_grounding_position_threshold_m == 0.6
     assert args.simulator_grounding_orientation_cosine_threshold == 0.5
     assert args.simulator_verifier_holding_threshold == 0.035
+    assert args.simulator_verifier_pick_min_lift_m == 0.04
     assert args.pi05_held_object_guard_grasp_threshold == 0.05
-    assert args.pi05_held_object_drop_stops_rollout is True
+    assert args.pi05_held_object_drop_stops_rollout is False
     assert navigation["map"]["resolution"] == 0.025
-    assert navigation["robot"]["half_length"] == 0.16
-    assert navigation["robot"]["half_width"] == 0.115
-    assert navigation["robot"]["radius"] == 0.2150581317
-    assert navigation["robot"]["safety_margin"] == 0.0025
+    assert navigation["robot"]["half_length"] == 0.35
+    assert navigation["robot"]["half_width"] == 0.25
+    assert navigation["robot"]["radius"] == 0.4301162634
+    assert navigation["robot"]["safety_margin"] == 0.01
     assert navigation["navigation"]["enabled"] is True
+    assert navigation["navigation"]["align_yaw_to_path"] is True
+    assert navigation["navigation"]["segment_heading_tolerance_deg"] == 10.0
+    assert navigation["navigation"]["segment_heading_max_steps"] == 240
     assert navigation["navigation"]["enable_local_refiner"] is True
     assert navigation["navigation"]["local_refiner_after_navigation_only"] is True
     assert (
         navigation["navigation"][
             "local_refiner_require_transport_ready_when_holding"
         ]
+        is False
+    )
+    assert navigation["post_grasp_transport"]["enabled"] is True
+    assert (
+        navigation["post_grasp_transport"]["enforce_before_navigation"]
         is True
     )
-    assert navigation["post_grasp_transport"]["enabled"] is False
     assert navigation["post_place_retreat"]["enabled"] is False
     assert navigation["post_skill_return"]["enabled"] is False
+    assert (
+        navigation["post_skill_return"]["defer_until_navigation"] is False
+    )
+    assert navigation["navigation"]["start_collision_recovery"]["enabled"] is True
 
 
 def test_periodic_verification_mode_remains_available(monkeypatch):

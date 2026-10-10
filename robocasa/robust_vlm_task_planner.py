@@ -209,7 +209,7 @@ def _validate_execution_plan(
         for entity in scene_context.get("fixtures", [])
         if isinstance(entity, Mapping) and entity.get("alias")
     }
-    relation_predicates = {"inside", "on", "inserted", "object_fixture_relation"}
+    relation_predicates = {"dishwasher_rack_contact", "inside", "on", "inserted", "object_fixture_relation"}
     task_text = str(scene_context.get("long_horizon_task", "")).lower()
     fixture_terms = {
         "Microwave": {"microwave"},
@@ -221,6 +221,8 @@ def _validate_execution_plan(
         for family, terms in fixture_terms.items()
         if any(term in task_text for term in terms)
     }
+    held_object: str | None = None
+    held_object_producer: str | None = None
     for call in calls:
         for family in fixture_terms:
             if (
@@ -287,6 +289,74 @@ def _validate_execution_plan(
                             f"{call.subgoal_id} condition {key}={identifier!r} is not an "
                             f"exact scene alias; available aliases are {sorted(aliases)}"
                         )
+
+        # Validate the causal handoff between object-manipulation skills. A
+        # PlaceObject call is executable only when an unmatched PickObject for
+        # the same object has already established the symbolic holding state.
+        # Fixture operations between the pair deliberately leave that state
+        # unchanged.
+        if call.atomic_task == "PickObject":
+            picked_object = next(
+                (
+                    str(condition.get("subject") or "").strip()
+                    for condition in conditions
+                    if str(condition.get("predicate", "")).strip().lower()
+                    == "holding"
+                    and condition.get("desired_value") is True
+                    and str(condition.get("subject") or "").strip()
+                ),
+                "",
+            )
+            if not picked_object:
+                raise ValueError(
+                    f"{call.subgoal_id} PickObject must establish "
+                    "holding(<object>)"
+                )
+            if held_object is not None and held_object != picked_object:
+                raise ValueError(
+                    f"{call.subgoal_id} PickObject({picked_object}) cannot run while "
+                    f"the plan still holds {held_object} from "
+                    f"{held_object_producer}"
+                )
+            held_object = picked_object
+            held_object_producer = call.subgoal_id
+        elif call.atomic_task == "PlaceObject":
+            placed_object = next(
+                (
+                    str(condition.get("subject") or "").strip()
+                    for condition in conditions
+                    if str(condition.get("predicate", "")).strip().lower()
+                    in relation_predicates
+                    and condition.get("desired_value") is True
+                    and str(condition.get("subject") or "").strip()
+                ),
+                "",
+            )
+            if not placed_object:
+                placed_object = str(
+                    call.arguments.get("held_object_id")
+                    or call.arguments.get("object_id")
+                    or call.arguments.get("object_name")
+                    or ""
+                ).strip()
+            if not placed_object:
+                raise ValueError(
+                    f"{call.subgoal_id} PlaceObject must identify the object "
+                    "being placed"
+                )
+            if held_object is None:
+                raise ValueError(
+                    f"{call.subgoal_id} PlaceObject({placed_object}) requires a "
+                    f"preceding unmatched PickObject({placed_object})"
+                )
+            if held_object != placed_object:
+                raise ValueError(
+                    f"{call.subgoal_id} PlaceObject({placed_object}) requires holding "
+                    f"{placed_object}, but the preceding unmatched PickObject from "
+                    f"{held_object_producer} establishes holding({held_object})"
+                )
+            held_object = None
+            held_object_producer = None
 
     names = [call.atomic_task for call in calls]
     for turn_index, name in enumerate(names):
@@ -569,6 +639,70 @@ def _apply_standard_pick_work_poses(
     return prepared, changes
 
 
+def _annotate_interchangeable_object_groups(
+    calls: Sequence[AtomicTaskCall],
+    scene_context: Mapping[str, Any],
+) -> tuple[list[AtomicTaskCall], list[dict[str, Any]]]:
+    """Mark task-defined object instances that are semantically interchangeable.
+
+    MakeIceLemonade follows the upstream task success definition: either ice cube
+    may be placed in the glass. The VLM plan nevertheless has to name one exact
+    scene alias, and historically chose ``ice_cube1``. Preserve that alias as
+    the symbolic Pick-to-Place dependency while exposing both valid physical
+    instances to the runtime verifier and handoff code.
+    """
+
+    if str(scene_context.get("env_name", "")) != "MakeIceLemonade":
+        return list(calls), []
+    object_aliases = {
+        str(entity.get("alias"))
+        for entity in scene_context.get("objects", [])
+        if isinstance(entity, Mapping) and entity.get("alias")
+    }
+    candidates = [
+        alias for alias in ("ice_cube1", "ice_cube2") if alias in object_aliases
+    ]
+    if len(candidates) < 2:
+        return list(calls), []
+
+    prepared: list[AtomicTaskCall] = []
+    changes: list[dict[str, Any]] = []
+    for call in calls:
+        value = call.to_dict()
+        serialized = str(
+            {
+                "arguments": value.get("arguments", {}),
+                "termination_condition": value.get("termination_condition"),
+            }
+        )
+        if (
+            call.atomic_task not in {"PickObject", "PlaceObject"}
+            or not any(alias in serialized for alias in candidates)
+        ):
+            prepared.append(call)
+            continue
+        canonical = next(alias for alias in candidates if alias in serialized)
+        metadata = dict(value.get("metadata", {}))
+        metadata.update(
+            {
+                "interchangeable_object_group": "ice_cube",
+                "interchangeable_object_canonical": canonical,
+                "interchangeable_object_candidates": list(candidates),
+            }
+        )
+        value["metadata"] = metadata
+        prepared.append(AtomicTaskCall.from_mapping(value))
+        changes.append(
+            {
+                "type": "annotate_interchangeable_object_group",
+                "subgoal_id": call.subgoal_id,
+                "canonical": canonical,
+                "candidates": list(candidates),
+            }
+        )
+    return prepared, changes
+
+
 def _normalize_execution_plan(
     calls: Sequence[AtomicTaskCall],
     scene_context: Mapping[str, Any],
@@ -589,6 +723,13 @@ def _normalize_execution_plan(
         str(entity.get("alias"))
         for entity in scene_context.get("fixtures", [])
         if isinstance(entity, Mapping) and entity.get("alias")
+    }
+    french_door_fridge_aliases = {
+        str(entity.get("alias"))
+        for entity in scene_context.get("fixtures", [])
+        if isinstance(entity, Mapping)
+        and entity.get("alias")
+        and str(entity.get("type", "")) == "FridgeFrenchDoor"
     }
     movable_aliases = {
         str(entity.get("alias"))
@@ -697,6 +838,60 @@ def _normalize_execution_plan(
         conditions = value["termination_condition"]
         condition_items = conditions if isinstance(conditions, list) else [conditions]
         for condition in condition_items:
+            predicate = str(condition.get("predicate", "")).strip().lower()
+            if call.atomic_task == "PickObject" and predicate == "holding":
+                original_subject = condition.get("subject")
+                original_desired_value = condition.get("desired_value")
+                subject_key = (
+                    str(original_subject or "")
+                    .strip()
+                    .lower()
+                    .replace(" ", "_")
+                )
+                target_candidates: set[str] = set()
+                resolved_subject = resolve_scene_identifier(original_subject)
+                if resolved_subject in movable_aliases:
+                    target_candidates.add(resolved_subject)
+                if not isinstance(original_desired_value, bool):
+                    resolved_desired = resolve_scene_identifier(
+                        original_desired_value
+                    )
+                    if resolved_desired in movable_aliases:
+                        target_candidates.add(resolved_desired)
+                for key in (
+                    "object_id",
+                    "object_name",
+                    "target_object_id",
+                    "target_object_name",
+                ):
+                    resolved_argument = resolve_scene_identifier(
+                        value["arguments"].get(key)
+                    )
+                    if resolved_argument in movable_aliases:
+                        target_candidates.add(resolved_argument)
+                agent_subject = subject_key in {
+                    "robot",
+                    "gripper",
+                    "robot_gripper",
+                    "end_effector",
+                    "eef",
+                }
+                if agent_subject and len(target_candidates) == 1:
+                    target_alias = next(iter(target_candidates))
+                    condition["subject"] = target_alias
+                    condition["desired_value"] = True
+                    changes.append(
+                        {
+                            "type": "normalize_pick_holding_condition",
+                            "subgoal_id": call.subgoal_id,
+                            "from": {
+                                "subject": original_subject,
+                                "desired_value": original_desired_value,
+                            },
+                            "subject": target_alias,
+                            "desired_value": True,
+                        }
+                    )
             if "desired_value" not in condition:
                 condition["desired_value"] = True
                 changes.append(
@@ -738,6 +933,7 @@ def _normalize_execution_plan(
                     )
             predicate = str(condition.get("predicate", "")).strip().lower()
             relation_predicates = {
+                "dishwasher_rack_contact",
                 "inside",
                 "inserted",
                 "on",
@@ -935,11 +1131,38 @@ def _normalize_execution_plan(
         normalized
     )
     changes.extend(work_pose_changes)
+    normalized, interchangeable_changes = _annotate_interchangeable_object_groups(
+        normalized, scene_context
+    )
+    changes.extend(interchangeable_changes)
     contracted: list[AtomicTaskCall] = []
     for call in normalized:
         enriched_call, contract_changes = apply_skill_contract(
             call, scene_context=scene_context
         )
+        if enriched_call.atomic_task == "OpenFridge":
+            conditions = enriched_call.termination_condition
+            items = conditions if isinstance(conditions, list) else [conditions]
+            french_door_subjects = [
+                str(condition.get("subject"))
+                for condition in items
+                if str(condition.get("predicate", "")).lower() == "open"
+                and str(condition.get("subject", ""))
+                in french_door_fridge_aliases
+            ]
+            prompt = "Open both doors of the fridge."
+            if french_door_subjects and enriched_call.policy_prompt != prompt:
+                value = enriched_call.to_dict()
+                value["policy_prompt"] = prompt
+                enriched_call = AtomicTaskCall.from_mapping(value)
+                changes.append(
+                    {
+                        "type": "require_both_french_fridge_doors",
+                        "subgoal_id": enriched_call.subgoal_id,
+                        "fixture_id": french_door_subjects[0],
+                        "policy_prompt": prompt,
+                    }
+                )
         if enriched_call.atomic_task in {"PickObject", "PlaceObject"}:
             simplified_prompt = build_atomic_task_prompt(
                 enriched_call, prompt_style=prompt_style
@@ -1029,6 +1252,10 @@ class RobustOpenAICompatibleVLMPlanner(OpenAICompatibleVLMPlanner):
             "- subgoal_id MUST be a unique non-empty JSON string, never a number.\n"
             "- Each condition object MUST contain predicate, subject, and desired_value. "
             "Use object for a destination relation such as inside/on.\n"
+            "- PickObject MUST use a holding condition shaped exactly like "
+            '{"predicate":"holding","subject":"<held object alias>",'
+            '"desired_value":true}. The subject is never robot or gripper, and '
+            "desired_value is always the boolean true.\n"
             "- arguments MUST be a JSON object even when empty.\n"
             "- NEVER output NavigateKitchen or navigation_pose. The scheduler performs "
             "runtime grounding and inserts navigation only when needed.\n"

@@ -298,6 +298,56 @@ def _as_conditions(
     return [dict(item) for item in condition]
 
 
+def _dishwasher_fixture_aliases(
+    scene_context: Mapping[str, Any],
+) -> set[str]:
+    aliases: set[str] = set()
+    fixtures = scene_context.get("fixtures", [])
+    if not isinstance(fixtures, Sequence) or isinstance(fixtures, (str, bytes)):
+        return aliases
+    for fixture in fixtures:
+        if not isinstance(fixture, Mapping):
+            continue
+        labels = " ".join(
+            str(fixture.get(key, "")).lower()
+            for key in ("alias", "name", "natural_name", "type")
+        )
+        if "dishwasher" in labels:
+            alias = str(fixture.get("alias", "")).strip()
+            if alias:
+                aliases.add(alias)
+    return aliases
+
+
+def _rewrite_dishwasher_rack_conditions(
+    conditions: Sequence[Mapping[str, Any]],
+    scene_context: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    aliases = _dishwasher_fixture_aliases(scene_context)
+    rewritten: list[dict[str, Any]] = []
+    changes: list[dict[str, Any]] = []
+    source_predicates = {"inside", "inserted", "on", "object_fixture_relation"}
+    for condition in conditions:
+        value = dict(condition)
+        predicate = str(value.get("predicate", "")).strip().lower()
+        destination = str(
+            value.get("object", value.get("destination", ""))
+        ).strip()
+        is_dishwasher = destination in aliases or "dishwasher" in destination.lower()
+        if predicate in source_predicates and is_dishwasher:
+            value["predicate"] = "dishwasher_rack_contact"
+            changes.append(
+                {
+                    "from": predicate,
+                    "to": "dishwasher_rack_contact",
+                    "subject": value.get("subject"),
+                    "object": destination,
+                }
+            )
+        rewritten.append(value)
+    return rewritten, changes
+
+
 def _resolved_handoff_conditions(
     contract: SkillContract,
     goal_conditions: Sequence[Mapping[str, Any]],
@@ -307,7 +357,13 @@ def _resolved_handoff_conditions(
 
     if contract.family != "object_transfer":
         return []
-    relation_predicates = {"inside", "inserted", "on", "object_fixture_relation"}
+    relation_predicates = {
+        "dishwasher_rack_contact",
+        "inside",
+        "inserted",
+        "on",
+        "object_fixture_relation",
+    }
     relation = next(
         (
             condition
@@ -403,9 +459,19 @@ def apply_skill_contract(
         else _as_conditions(value["termination_condition"])
     )
     all_conditions = _as_conditions(value["termination_condition"])
+    dishwasher_rewrites: list[dict[str, Any]] = []
+    if call.atomic_task == "PlaceObject":
+        goal_conditions, goal_rewrites = _rewrite_dishwasher_rack_conditions(
+            goal_conditions, dict(scene_context or {})
+        )
+        all_conditions, all_rewrites = _rewrite_dishwasher_rack_conditions(
+            all_conditions, dict(scene_context or {})
+        )
+        dishwasher_rewrites = goal_rewrites or all_rewrites
     removed: list[dict[str, Any]] = []
     if contract.family == "object_transfer":
         relation_predicates = {
+            "dishwasher_rack_contact",
             "inside",
             "inserted",
             "on",
@@ -473,7 +539,12 @@ def apply_skill_contract(
         },
     }
     changes = []
-    if added or removed or not isinstance(existing_contract, Mapping):
+    if (
+        added
+        or removed
+        or dishwasher_rewrites
+        or not isinstance(existing_contract, Mapping)
+    ):
         changes.append(
             {
                 "type": "apply_skill_contract",
@@ -484,6 +555,7 @@ def apply_skill_contract(
                 "removed_handoff_predicates": [
                     item["predicate"] for item in removed
                 ],
+                "rewritten_goal_predicates": deepcopy(dishwasher_rewrites),
                 "required_consecutive_successes": (
                     contract.required_consecutive_successes
                 ),

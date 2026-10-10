@@ -64,6 +64,19 @@ class OracleLoggingVerifier:
         self.log_dir = Path(log_dir)
         self._count = 0
 
+    def start_atomic_task(self, **kwargs: Any) -> None:
+        """Forward optional attempt lifecycle hooks without affecting decisions."""
+
+        primary_start = getattr(self.primary, "start_atomic_task", None)
+        if callable(primary_start):
+            primary_start(**kwargs)
+        oracle_start = getattr(self.oracle, "start_atomic_task", None)
+        if callable(oracle_start):
+            try:
+                oracle_start(**kwargs)
+            except Exception:
+                pass
+
     def __call__(self, **kwargs: Any) -> dict[str, Any]:
         vlm_result = self.primary(**kwargs)
         self._count += 1

@@ -1148,8 +1148,26 @@ def move_eef_to_pose_smooth(
     settle_steps: int = 0,
     settle_mode: str = "closed_loop",
     gripper_action: float = 0.0,
+    initial_applied_action: Sequence[float] | None = None,
+    action_mode: float = 1.0,
+    handoff_max_steps: int = 30,
+    handoff_stable_steps: int = 2,
+    handoff_action_tolerance: float = 0.006,
+    linear_velocity_threshold_m_s: float = 0.05,
+    angular_velocity_threshold_deg_s: float = 20.0,
+    near_target_slowdown_radius_m: float = 0.08,
+    near_target_slowdown_radius_deg: float = 30.0,
+    simulation_timestep_s: float | None = None,
+    simulation_step_offset: int = 0,
+    start_guard: bool = True,
 ) -> dict[str, Any]:
-    """Move the EEF along a quintic Cartesian path with bounded action slew."""
+    """Move the EEF along a quintic Cartesian path with bounded handoffs.
+
+    Stability requires pose tolerance and low simulated EEF velocity. When the
+    preceding environment action is supplied, a bounded braking handoff runs
+    before the new Cartesian reference starts. Numeric action continuity is
+    enforced only when both stages use the same controller mode.
+    """
 
     positive = (
         max_steps,
@@ -1163,15 +1181,23 @@ def move_eef_to_pose_smooth(
         translation_gain,
         rotation_gain,
         stable_steps,
+        handoff_max_steps,
+        handoff_stable_steps,
+        handoff_action_tolerance,
+        linear_velocity_threshold_m_s,
+        angular_velocity_threshold_deg_s,
+        near_target_slowdown_radius_m,
+        near_target_slowdown_radius_deg,
     )
     if any(value <= 0 for value in positive) or settle_steps < 0:
         raise ValueError("smooth EEF trajectory limits must be positive")
     if trajectory_steps > max_steps:
         raise ValueError("trajectory_steps must not exceed max_steps")
     if settle_mode not in {"closed_loop", "zero_delta"}:
-        raise ValueError(
-            "settle_mode must be either closed_loop or zero_delta"
-        )
+        raise ValueError("settle_mode must be either closed_loop or zero_delta")
+    if simulation_step_offset < 0:
+        raise ValueError("simulation_step_offset must be non-negative")
+
     target_position = np.asarray(target_pose["position"], dtype=np.float64)
     target_quaternion = _normalized_quaternion_xyzw(
         target_pose["quaternion_xyzw"]
@@ -1180,19 +1206,84 @@ def move_eef_to_pose_smooth(
         raise ValueError("target EEF position must contain three finite values")
     if not np.isfinite(gripper_action) or not -1.0 <= gripper_action <= 1.0:
         raise ValueError("gripper_action must be finite and within [-1, 1]")
+    if not np.isfinite(action_mode):
+        raise ValueError("action_mode must be finite")
 
-    if guard is not None:
+    def resolve_simulation_timestep() -> tuple[float, str]:
+        if simulation_timestep_s is not None:
+            value = float(simulation_timestep_s)
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError("simulation_timestep_s must be positive")
+            return value, "configured"
+        current = env
+        seen: set[int] = set()
+        for _ in range(12):
+            if current is None or id(current) in seen:
+                break
+            seen.add(id(current))
+            value = getattr(current, "control_timestep", None)
+            if value is not None:
+                value = float(value)
+                if np.isfinite(value) and value > 0:
+                    return value, "env.control_timestep"
+            next_env = getattr(current, "env", None)
+            if next_env is None:
+                next_env = getattr(current, "unwrapped", None)
+            if next_env is current:
+                break
+            current = next_env
+        # RoboCasa evaluation runs at 20 Hz. This remains simulation-step time,
+        # never wall-clock or HTTP request duration.
+        return 0.05, "robocasa_20hz_fallback"
+
+    simulation_dt, simulation_dt_source = resolve_simulation_timestep()
+    if guard is not None and start_guard:
         guard.start()
-    initial_pose = current_eef_pose(env)
-    initial_position = np.asarray(initial_pose["position"], dtype=np.float64)
-    initial_quaternion = _normalized_quaternion_xyzw(
-        initial_pose["quaternion_xyzw"]
-    )
+
     trace: list[dict[str, Any]] = []
+    phase_events: list[dict[str, Any]] = []
     previous_arm_action = np.zeros(6, dtype=np.float64)
+    previous_full_action: np.ndarray | None = None
+    source_action_mode = None
+    action_modes_compatible = None
+    if initial_applied_action is not None:
+        previous_full_action = np.asarray(
+            initial_applied_action, dtype=np.float64
+        ).reshape(-1)
+        if (
+            previous_full_action.size != 12
+            or not np.isfinite(previous_full_action).all()
+        ):
+            raise ValueError(
+                "initial_applied_action must contain 12 finite values"
+            )
+        source_action_mode = float(previous_full_action[RAW_ACTION_MODE])
+        action_modes_compatible = bool(
+            np.isclose(source_action_mode, float(action_mode), atol=1e-6)
+        )
+        if action_modes_compatible:
+            previous_arm_action = previous_full_action[:6].copy()
+        else:
+            # The numeric values have different controller semantics. Start
+            # the new mode at zero and use measured EEF velocity for handoff.
+            previous_full_action = None
+
     consecutive = 0
     guard_failure = None
     environment_done = False
+    trajectory_completed = False
+    handoff_settled = initial_applied_action is None
+    handoff_quiet_count = 0
+    last_velocity = {
+        "linear_m_s": float("inf"),
+        "angular_deg_s": float("inf"),
+    }
+
+    delta_limits = np.asarray(
+        [max_translation_command_delta] * 3
+        + [max_rotation_command_delta] * 3,
+        dtype=np.float64,
+    )
 
     def step_toward(
         reference_position: np.ndarray,
@@ -1201,55 +1292,102 @@ def move_eef_to_pose_smooth(
         phase: str,
         progress: float,
         force_zero: bool = False,
-    ) -> None:
+        track_target_stability: bool = True,
+    ) -> dict[str, Any]:
         nonlocal previous_arm_action
+        nonlocal previous_full_action
         nonlocal consecutive
         nonlocal guard_failure
         nonlocal environment_done
+        nonlocal last_velocity
 
-        pose = current_eef_pose(env)
+        pose_before = current_eef_pose(env)
+        before_position = np.asarray(pose_before["position"], dtype=np.float64)
         if force_zero:
             desired = np.zeros(6, dtype=np.float64)
         else:
-            position_error = reference_position - np.asarray(
-                pose["position"], dtype=np.float64
-            )
+            position_error = reference_position - before_position
             orientation_error = _orientation_error_axis_angle(
-                pose["quaternion_xyzw"], reference_quaternion
+                pose_before["quaternion_xyzw"], reference_quaternion
+            )
+            desired_translation = np.clip(
+                translation_gain * position_error,
+                -max_translation_command,
+                max_translation_command,
+            )
+            desired_rotation = np.clip(
+                rotation_gain * orientation_error,
+                -max_rotation_command,
+                max_rotation_command,
+            )
+            target_position_error = float(
+                np.linalg.norm(target_position - before_position)
+            )
+            target_orientation_error_deg = float(
+                np.degrees(
+                    np.linalg.norm(
+                        _orientation_error_axis_angle(
+                            pose_before["quaternion_xyzw"], target_quaternion
+                        )
+                    )
+                )
+            )
+            translation_scale = float(
+                np.clip(
+                    target_position_error / near_target_slowdown_radius_m,
+                    0.10,
+                    1.0,
+                )
+            )
+            rotation_scale = float(
+                np.clip(
+                    target_orientation_error_deg
+                    / near_target_slowdown_radius_deg,
+                    0.10,
+                    1.0,
+                )
             )
             desired = np.concatenate(
                 [
-                    np.clip(
-                        translation_gain * position_error,
-                        -max_translation_command,
-                        max_translation_command,
-                    ),
-                    np.clip(
-                        rotation_gain * orientation_error,
-                        -max_rotation_command,
-                        max_rotation_command,
-                    ),
+                    desired_translation * translation_scale,
+                    desired_rotation * rotation_scale,
                 ]
             )
-        delta_limits = np.asarray(
-            [max_translation_command_delta] * 3
-            + [max_rotation_command_delta] * 3,
-            dtype=np.float64,
-        )
+
         arm_action = previous_arm_action + np.clip(
             desired - previous_arm_action, -delta_limits, delta_limits
         )
-        action = np.zeros(12, dtype=np.float32)
-        action[:6] = arm_action.astype(np.float32)
-        action[RAW_ACTION_GRIPPER] = float(gripper_action)
-        action[RAW_ACTION_MODE] = 1.0
-        step_index = len(trace) + 1
+        requested_action = np.zeros(12, dtype=np.float32)
+        requested_action[:6] = arm_action.astype(np.float32)
+        requested_action[RAW_ACTION_GRIPPER] = float(gripper_action)
+        requested_action[RAW_ACTION_MODE] = float(action_mode)
+        local_step = len(trace) + 1
+        simulation_step = simulation_step_offset + local_step
         applied = (
-            guard.apply_action(action, step_index=step_index)
+            guard.apply_action(requested_action, step_index=simulation_step)
             if guard is not None
-            else action
+            else requested_action
         )
-        step_result = env.step(applied)
+        applied = np.asarray(applied, dtype=np.float64).reshape(-1)
+        if applied.size != 12 or not np.isfinite(applied).all():
+            raise RuntimeError(
+                "guard/environment action must contain 12 finite values"
+            )
+        comparable_to_previous = bool(
+            previous_full_action is not None
+            and np.isclose(
+                previous_full_action[RAW_ACTION_MODE],
+                applied[RAW_ACTION_MODE],
+                atol=1e-6,
+            )
+        )
+        action_delta = (
+            applied[:6] - previous_full_action[:6]
+            if comparable_to_previous
+            else None
+        )
+
+        step_result = env.step(applied.astype(np.float32))
         if len(step_result) == 4:
             _, _, environment_done, _ = step_result
         elif len(step_result) == 5:
@@ -1257,54 +1395,177 @@ def move_eef_to_pose_smooth(
             environment_done = bool(terminated or truncated)
         else:
             raise RuntimeError("unexpected env.step result during EEF trajectory")
-        previous_arm_action = np.asarray(applied[:6], dtype=np.float64)
+
+        previous_arm_action = applied[:6].copy()
+        previous_full_action = applied.copy()
         if guard is not None:
-            observed = guard.observe(step_index=step_index)
+            observed = guard.observe(step_index=simulation_step)
             if guard_failure is None and observed is not None:
-                guard_failure = observed
+                guard_failure = dict(observed)
+
         observed_pose = current_eef_pose(env)
+        observed_position = np.asarray(
+            observed_pose["position"], dtype=np.float64
+        )
+        linear_velocity = float(
+            np.linalg.norm(observed_position - before_position) / simulation_dt
+        )
+        angular_velocity = float(
+            np.degrees(
+                np.linalg.norm(
+                    _orientation_error_axis_angle(
+                        pose_before["quaternion_xyzw"],
+                        observed_pose["quaternion_xyzw"],
+                    )
+                )
+            )
+            / simulation_dt
+        )
+        last_velocity = {
+            "linear_m_s": linear_velocity,
+            "angular_deg_s": angular_velocity,
+        }
         final_error = eef_pose_error(observed_pose, target_pose)
-        within = (
+        pose_within = bool(
             final_error["translation_m"] <= translation_tolerance_m
             and final_error["orientation_deg"] <= orientation_tolerance_deg
         )
-        trajectory_complete = progress >= 1.0
-        consecutive = consecutive + 1 if within and trajectory_complete else 0
+        velocity_within = bool(
+            linear_velocity <= linear_velocity_threshold_m_s
+            and angular_velocity <= angular_velocity_threshold_deg_s
+        )
+        stable_now = bool(
+            track_target_stability
+            and progress >= 1.0
+            and pose_within
+            and velocity_within
+        )
+        consecutive = consecutive + 1 if stable_now else 0
         trace.append(
             {
-                "step": step_index,
+                "step": local_step,
+                "simulation_step": simulation_step,
                 "phase": phase,
                 "trajectory_progress": float(progress),
-                "translation_error_m": final_error["translation_m"],
-                "orientation_error_deg": final_error["orientation_deg"],
-                "consecutive_successes": consecutive,
                 "reference_position": reference_position.tolist(),
                 "reference_quaternion_xyzw": reference_quaternion.tolist(),
-                "applied_arm_action": np.asarray(applied[:6], dtype=float).tolist(),
+                "actual_position": observed_position.tolist(),
+                "actual_quaternion_xyzw": list(
+                    observed_pose["quaternion_xyzw"]
+                ),
+                "translation_error_m": final_error["translation_m"],
+                "orientation_error_deg": final_error["orientation_deg"],
+                "linear_velocity_m_s": linear_velocity,
+                "angular_velocity_deg_s": angular_velocity,
+                "pose_within_tolerance": pose_within,
+                "velocity_within_threshold": velocity_within,
+                "desired_arm_action": desired.astype(float).tolist(),
+                "requested_arm_action": arm_action.astype(float).tolist(),
+                "applied_arm_action": applied[:6].astype(float).tolist(),
+                "adjacent_action_delta": (
+                    action_delta.astype(float).tolist()
+                    if action_delta is not None
+                    else None
+                ),
+                "adjacent_action_comparable": comparable_to_previous,
+                "consecutive_successes": consecutive,
+                "guard_failure": (
+                    dict(guard_failure) if guard_failure is not None else None
+                ),
+            }
+        )
+        return trace[-1]
+
+    initial_pose_before_handoff = current_eef_pose(env)
+    if initial_applied_action is not None:
+        handoff_reference_position = np.asarray(
+            initial_pose_before_handoff["position"], dtype=np.float64
+        )
+        handoff_reference_quaternion = _normalized_quaternion_xyzw(
+            initial_pose_before_handoff["quaternion_xyzw"]
+        )
+        for _ in range(handoff_max_steps):
+            if environment_done or guard_failure is not None or len(trace) >= max_steps:
+                break
+            sample = step_toward(
+                handoff_reference_position,
+                handoff_reference_quaternion,
+                phase="bounded_action_handoff",
+                progress=0.0,
+                force_zero=True,
+                track_target_stability=False,
+            )
+            quiet = bool(
+                np.max(np.abs(sample["applied_arm_action"]))
+                <= handoff_action_tolerance
+                and sample["linear_velocity_m_s"]
+                <= linear_velocity_threshold_m_s
+                and sample["angular_velocity_deg_s"]
+                <= angular_velocity_threshold_deg_s
+            )
+            handoff_quiet_count = handoff_quiet_count + 1 if quiet else 0
+            if handoff_quiet_count >= handoff_stable_steps:
+                handoff_settled = True
+                break
+        phase_events.append(
+            {
+                "phase": "bounded_action_handoff",
+                "end_simulation_step": simulation_step_offset + len(trace),
+                "steps": len(trace),
+                "success": handoff_settled,
+                "source_action_mode": source_action_mode,
+                "target_action_mode": float(action_mode),
+                "action_modes_compatible": action_modes_compatible,
+                "quiet_consecutive": handoff_quiet_count,
             }
         )
 
-    for trajectory_index in range(1, trajectory_steps + 1):
-        if environment_done:
-            break
-        fraction = trajectory_index / trajectory_steps
-        progress = _quintic_smoothstep(fraction)
-        reference_position = initial_position + progress * (
-            target_position - initial_position
-        )
-        reference_quaternion = _quaternion_slerp_xyzw(
-            initial_quaternion, target_quaternion, progress
-        )
-        step_toward(
-            reference_position,
-            reference_quaternion,
-            phase="smooth_trajectory",
-            progress=progress,
+    initial_pose = current_eef_pose(env)
+    initial_position = np.asarray(initial_pose["position"], dtype=np.float64)
+    initial_quaternion = _normalized_quaternion_xyzw(
+        initial_pose["quaternion_xyzw"]
+    )
+
+    if handoff_settled and guard_failure is None and not environment_done:
+        trajectory_trace_start = len(trace)
+        for trajectory_index in range(1, trajectory_steps + 1):
+            if (
+                environment_done
+                or guard_failure is not None
+                or len(trace) >= max_steps
+            ):
+                break
+            fraction = trajectory_index / trajectory_steps
+            progress = _quintic_smoothstep(fraction)
+            reference_position = initial_position + progress * (
+                target_position - initial_position
+            )
+            reference_quaternion = _quaternion_slerp_xyzw(
+                initial_quaternion, target_quaternion, progress
+            )
+            step_toward(
+                reference_position,
+                reference_quaternion,
+                phase="smooth_trajectory",
+                progress=progress,
+            )
+            trajectory_completed = trajectory_index == trajectory_steps
+        phase_events.append(
+            {
+                "phase": "smooth_trajectory",
+                "end_simulation_step": simulation_step_offset + len(trace),
+                "steps": len(trace) - trajectory_trace_start,
+                "success": trajectory_completed,
+            }
         )
 
+    convergence_limit = max(0, max_steps - settle_steps)
     while (
-        not environment_done
-        and len(trace) < max_steps
+        handoff_settled
+        and trajectory_completed
+        and guard_failure is None
+        and not environment_done
+        and len(trace) < convergence_limit
         and consecutive < stable_steps
     ):
         step_toward(
@@ -1314,55 +1575,147 @@ def move_eef_to_pose_smooth(
             progress=1.0,
         )
 
-    for _ in range(settle_steps):
-        if environment_done:
-            break
-        force_zero = settle_mode == "zero_delta"
+    settle_executed = 0
+    if consecutive >= stable_steps:
+        for _ in range(settle_steps):
+            if (
+                environment_done
+                or guard_failure is not None
+                or len(trace) >= max_steps
+            ):
+                break
+            step_toward(
+                target_position,
+                target_quaternion,
+                phase=(
+                    "rate_limited_zero_delta_settle"
+                    if settle_mode == "zero_delta"
+                    else "closed_loop_settle"
+                ),
+                progress=1.0,
+                force_zero=settle_mode == "zero_delta",
+            )
+            settle_executed += 1
+
+    # A zero-command settle can expose inertial drift. Re-enter closed-loop
+    # convergence within the original bounded budget instead of treating zero
+    # command as proof that the EEF is at rest.
+    while (
+        handoff_settled
+        and trajectory_completed
+        and guard_failure is None
+        and not environment_done
+        and len(trace) < max_steps
+        and consecutive < stable_steps
+    ):
         step_toward(
             target_position,
             target_quaternion,
-            phase=(
-                "rate_limited_zero_delta_settle"
-                if force_zero
-                else "closed_loop_settle"
-            ),
+            phase="post_settle_reconvergence",
             progress=1.0,
-            force_zero=force_zero,
         )
 
     final_pose = current_eef_pose(env)
     final_error = eef_pose_error(final_pose, target_pose)
     success = bool(
-        guard_failure is None
+        handoff_settled
+        and trajectory_completed
+        and guard_failure is None
         and not environment_done
+        and consecutive >= stable_steps
         and final_error["translation_m"] <= translation_tolerance_m
         and final_error["orientation_deg"] <= orientation_tolerance_deg
+        and last_velocity["linear_m_s"] <= linear_velocity_threshold_m_s
+        and last_velocity["angular_deg_s"]
+        <= angular_velocity_threshold_deg_s
+    )
+    if success:
+        end_reason = "STABLE_SUCCESS"
+        failure_code = None
+    elif guard_failure is not None:
+        end_reason = "OBJECT_DROPPED"
+        failure_code = "OBJECT_DROPPED_DURING_EXPERT_HANDOFF"
+    elif environment_done:
+        end_reason = "ENVIRONMENT_ENDED"
+        failure_code = "EXPERT_EEF_ENVIRONMENT_ENDED"
+    elif not handoff_settled:
+        end_reason = "HANDOFF_NOT_SETTLED"
+        failure_code = "EXPERT_EEF_HANDOFF_NOT_SETTLED"
+    else:
+        end_reason = "STEP_BUDGET_EXHAUSTED"
+        failure_code = "EXPERT_EEF_POSE_NOT_CONVERGED"
+
+    final_applied_action = (
+        previous_full_action.astype(float).tolist()
+        if previous_full_action is not None
+        else None
+    )
+    first_drop_step = None
+    if guard_failure is not None:
+        for key in ("step_index", "dropped_step", "first_drop_step"):
+            if guard_failure.get(key) is not None:
+                first_drop_step = int(guard_failure[key])
+                break
+        if first_drop_step is None:
+            for evidence in guard_failure.get("state_evidence", ()):
+                if not isinstance(evidence, Mapping):
+                    continue
+                for key in ("step_index", "drop_step", "dropped_step"):
+                    if evidence.get(key) is not None:
+                        first_drop_step = int(evidence[key])
+                        break
+                if first_drop_step is not None:
+                    break
+    phase_events.append(
+        {
+            "phase": "motion_complete",
+            "end_simulation_step": simulation_step_offset + len(trace),
+            "steps": len(trace),
+            "success": success,
+            "reason": end_reason,
+        }
     )
     return {
         "success": success,
-        "failure_code": (
-            None
-            if success
-            else (
-                "OBJECT_DROPPED_DURING_EXPERT_HANDOFF"
-                if guard_failure is not None
-                else "EXPERT_EEF_POSE_NOT_CONVERGED"
-            )
-        ),
+        "failure_code": failure_code,
+        "end_reason": end_reason,
         "trajectory_type": "quintic_scurve_slerp",
         "target_pose": dict(target_pose),
+        "initial_pose_before_handoff": initial_pose_before_handoff,
         "initial_pose": initial_pose,
         "final_pose": final_pose,
         "final_error": final_error,
         "steps": len(trace),
         "requested_max_steps": int(max_steps),
         "trajectory_steps": int(trajectory_steps),
+        "trajectory_completed": trajectory_completed,
         "stable_steps": int(stable_steps),
         "settle_steps": int(settle_steps),
+        "settle_steps_executed": int(settle_executed),
         "settle_mode": settle_mode,
         "final_consecutive": int(consecutive),
+        "final_velocity": dict(last_velocity),
+        "velocity_thresholds": {
+            "linear_m_s": float(linear_velocity_threshold_m_s),
+            "angular_deg_s": float(angular_velocity_threshold_deg_s),
+        },
+        "simulation_timestep_s": simulation_dt,
+        "simulation_timestep_source": simulation_dt_source,
+        "simulation_step_offset": int(simulation_step_offset),
+        "handoff": {
+            "requested": initial_applied_action is not None,
+            "settled": handoff_settled,
+            "max_steps": int(handoff_max_steps),
+            "stable_steps": int(handoff_stable_steps),
+            "source_action_mode": source_action_mode,
+            "target_action_mode": float(action_mode),
+            "action_modes_compatible": action_modes_compatible,
+        },
+        "last_applied_action": final_applied_action,
+        "first_drop_step": first_drop_step,
         "guard_failure": guard_failure,
         "guard": guard.to_dict() if guard is not None else None,
+        "phase_events": phase_events,
         "trace": trace,
     }
 

@@ -10,7 +10,7 @@ import numpy as np
 import yaml
 
 from robocasa.held_object_guard import HeldObjectGuard
-from robocasa.utils import object_utils
+from robocasa.pick_motion_verification import check_two_finger_grasp
 from robocasa.work_pose_dataset import current_base_pose
 
 from .base_navigator import BaseNavigator
@@ -117,11 +117,322 @@ class TargetAwareNavigationPipeline:
         self.base_navigator = base_navigator or BaseNavigator(self.config["navigation"])
         self.last_debug: dict[str, Any] = {}
 
+        recovery_cfg = dict(
+            self.config["navigation"].get("start_collision_recovery", {})
+        )
+        self.start_collision_recovery_enabled = bool(
+            recovery_cfg.get("enabled", False)
+        )
+        self.start_collision_search_step_m = float(
+            recovery_cfg.get("search_step_m", map_cfg["resolution"])
+        )
+        self.start_collision_execution_step_m = float(
+            recovery_cfg.get("execution_step_m", 0.05)
+        )
+        self.start_collision_max_distance_m = float(
+            recovery_cfg.get("max_distance_m", 0.30)
+        )
+        self.start_collision_max_steps_per_move = int(
+            recovery_cfg.get("max_steps_per_move", 80)
+        )
+        self.start_collision_translation_tolerance_m = float(
+            recovery_cfg.get("translation_tolerance_m", 0.02)
+        )
+        self.start_collision_yaw_tolerance_deg = float(
+            recovery_cfg.get("yaw_tolerance_deg", 3.0)
+        )
+        self.start_collision_max_translation_command = float(
+            recovery_cfg.get("max_translation_command", 0.20)
+        )
+        self.start_collision_require_monotonic = bool(
+            recovery_cfg.get("require_monotonic_overlap_decrease", True)
+        )
+        directions = recovery_cfg.get(
+            "direction_order", ("backward", "left", "right", "forward")
+        )
+        if isinstance(directions, (str, bytes)):
+            raise ValueError(
+                "navigation.start_collision_recovery.direction_order must be a list"
+            )
+        self.start_collision_direction_order = tuple(str(value) for value in directions)
+        allowed_directions = {"backward", "left", "right", "forward"}
+        if (
+            not self.start_collision_direction_order
+            or not set(self.start_collision_direction_order).issubset(
+                allowed_directions
+            )
+        ):
+            raise ValueError(
+                "start-collision recovery directions must be backward/left/right/forward"
+            )
+        positive_recovery_values = (
+            self.start_collision_search_step_m,
+            self.start_collision_execution_step_m,
+            self.start_collision_max_distance_m,
+            self.start_collision_max_steps_per_move,
+            self.start_collision_translation_tolerance_m,
+            self.start_collision_yaw_tolerance_deg,
+            self.start_collision_max_translation_command,
+        )
+        if min(positive_recovery_values) <= 0:
+            raise ValueError("start-collision recovery limits must be positive")
     def _footprint_center(self, base_xy: Any, yaw: float) -> np.ndarray:
         cosine, sine = math.cos(yaw), math.sin(yaw)
         rotation = np.asarray([[cosine, -sine], [sine, cosine]], dtype=float)
         return np.asarray(base_xy, dtype=float) + rotation @ self.footprint_center_offset_xy
 
+    def _plan_start_collision_recovery(
+        self,
+        occupancy_map: Any,
+        *,
+        base_xy: Any,
+        yaw: float,
+    ) -> dict[str, Any] | None:
+        """Find a fixed-yaw translation whose overlap never increases."""
+
+        center_xy = self._footprint_center(base_xy, yaw)
+        initial_overlap = self.map_builder.footprint_overlap_count(
+            occupancy_map, center_xy, yaw
+        )
+        if initial_overlap <= 0:
+            return {
+                "direction": "none",
+                "direction_vector": [0.0, 0.0],
+                "distance_m": 0.0,
+                "initial_overlap_cells": 0,
+                "search_samples": [],
+                "execution_points": [],
+            }
+
+        cosine, sine = math.cos(yaw), math.sin(yaw)
+        directions = {
+            "forward": np.asarray([cosine, sine], dtype=float),
+            "backward": np.asarray([-cosine, -sine], dtype=float),
+            "left": np.asarray([-sine, cosine], dtype=float),
+            "right": np.asarray([sine, -cosine], dtype=float),
+        }
+        candidates: list[dict[str, Any]] = []
+        for priority, name in enumerate(self.start_collision_direction_order):
+            unit = directions[name]
+            previous_overlap = initial_overlap
+            samples: list[dict[str, Any]] = []
+            distance = self.start_collision_search_step_m
+            while distance <= self.start_collision_max_distance_m + 1e-9:
+                candidate_base = np.asarray(base_xy, dtype=float) + unit * distance
+                candidate_center = self._footprint_center(candidate_base, yaw)
+                overlap = self.map_builder.footprint_overlap_count(
+                    occupancy_map, candidate_center, yaw
+                )
+                samples.append(
+                    {
+                        "distance_m": float(distance),
+                        "base_xy": candidate_base.tolist(),
+                        "footprint_center_xy": candidate_center.tolist(),
+                        "overlap_cells": int(overlap),
+                    }
+                )
+                if (
+                    self.start_collision_require_monotonic
+                    and overlap > previous_overlap
+                ):
+                    break
+                previous_overlap = overlap
+                if overlap == 0:
+                    candidates.append(
+                        {
+                            "direction": name,
+                            "direction_priority": priority,
+                            "direction_vector": unit.tolist(),
+                            "distance_m": float(distance),
+                            "initial_overlap_cells": int(initial_overlap),
+                            "search_samples": samples,
+                        }
+                    )
+                    break
+                distance += self.start_collision_search_step_m
+
+        if not candidates:
+            return None
+        selected = min(
+            candidates,
+            key=lambda value: (
+                float(value["distance_m"]),
+                int(value["direction_priority"]),
+            ),
+        )
+        unit = np.asarray(selected["direction_vector"], dtype=float)
+        distance = float(selected["distance_m"])
+        execution_distances = list(
+            np.arange(
+                self.start_collision_execution_step_m,
+                distance,
+                self.start_collision_execution_step_m,
+            )
+        )
+        execution_distances.append(distance)
+        selected["execution_points"] = [
+            (
+                np.asarray(base_xy, dtype=float) + unit * step_distance
+            ).tolist()
+            for step_distance in execution_distances
+        ]
+        return selected
+
+    def _recover_start_collision(
+        self,
+        *,
+        env: Any,
+        occupancy_map: Any,
+        base_pose: Mapping[str, Any],
+        layout_id: int,
+        debug_articulated_map: bool,
+        guard: Any | None,
+    ) -> tuple[bool, str, Any, Mapping[str, Any], dict[str, Any]]:
+        """Move out of a shallow start overlap while preserving base yaw."""
+
+        yaw = float(base_pose["yaw_rad"])
+        plan = self._plan_start_collision_recovery(
+            occupancy_map,
+            base_xy=base_pose["position"][:2],
+            yaw=yaw,
+        )
+        diagnostics: dict[str, Any] = {
+            "enabled": self.start_collision_recovery_enabled,
+            "fixed_yaw_deg": math.degrees(yaw),
+            "plan": plan,
+            "steps": [],
+        }
+        if plan is None:
+            diagnostics["reason"] = "NO_MONOTONIC_ESCAPE"
+            return (
+                False,
+                "START_IN_COLLISION",
+                occupancy_map,
+                base_pose,
+                diagnostics,
+            )
+
+        current_map = occupancy_map
+        current_pose = base_pose
+        previous_overlap = int(plan["initial_overlap_cells"])
+        total_motion_steps = 0
+        for index, target_xy in enumerate(plan["execution_points"], start=1):
+            print(
+                "[NAV-RECOVERY] step {}/{} direction={} target=({:.3f},{:.3f}) "
+                "overlap_before={} action=TRANSLATE_FIXED_YAW".format(
+                    index,
+                    len(plan["execution_points"]),
+                    plan["direction"],
+                    float(target_xy[0]),
+                    float(target_xy[1]),
+                    previous_overlap,
+                )
+            )
+            motion = self.base_navigator.translate_at_fixed_yaw(
+                env=env,
+                target_xy=target_xy,
+                yaw=yaw,
+                guard=guard,
+                max_steps=self.start_collision_max_steps_per_move,
+                translation_tolerance_m=(
+                    self.start_collision_translation_tolerance_m
+                ),
+                yaw_tolerance_deg=self.start_collision_yaw_tolerance_deg,
+                max_translation_command=(
+                    self.start_collision_max_translation_command
+                ),
+            )
+            total_motion_steps += int(motion.get("steps", 0))
+            current_pose = current_base_pose(env)
+            current_xy = np.asarray(current_pose["position"][:2], dtype=float)
+            current_map = self.map_builder.build(
+                env,
+                layout_id=layout_id,
+                robot_xy=current_xy,
+                robot_yaw=float(current_pose["yaw_rad"]),
+                debug_articulated_map=debug_articulated_map,
+            )
+            current_center = self._footprint_center(
+                current_xy, float(current_pose["yaw_rad"])
+            )
+            overlap = self.map_builder.footprint_overlap_count(
+                current_map,
+                current_center,
+                float(current_pose["yaw_rad"]),
+            )
+            step_trace = {
+                "step": index,
+                "target_xy": [float(target_xy[0]), float(target_xy[1])],
+                "actual_base_pose": current_pose,
+                "overlap_before_cells": previous_overlap,
+                "overlap_after_cells": int(overlap),
+                "motion": motion,
+            }
+            diagnostics["steps"].append(step_trace)
+            guard_failure = motion.get("guard_failure")
+            if guard_failure is not None:
+                diagnostics["reason"] = "OBJECT_DROPPED"
+                diagnostics["total_motion_steps"] = total_motion_steps
+                return (
+                    False,
+                    "OBJECT_DROPPED",
+                    current_map,
+                    current_pose,
+                    diagnostics,
+                )
+            if not motion.get("success", False):
+                diagnostics["reason"] = "RECOVERY_MOTION_STALLED"
+                diagnostics["total_motion_steps"] = total_motion_steps
+                return (
+                    False,
+                    "MOTION_STALLED",
+                    current_map,
+                    current_pose,
+                    diagnostics,
+                )
+            if (
+                self.start_collision_require_monotonic
+                and overlap > previous_overlap
+            ):
+                diagnostics["reason"] = "OVERLAP_INCREASED"
+                diagnostics["total_motion_steps"] = total_motion_steps
+                return (
+                    False,
+                    "START_IN_COLLISION",
+                    current_map,
+                    current_pose,
+                    diagnostics,
+                )
+            previous_overlap = int(overlap)
+
+        diagnostics["total_motion_steps"] = total_motion_steps
+        diagnostics["final_overlap_cells"] = previous_overlap
+        diagnostics["success"] = previous_overlap == 0
+        diagnostics["reason"] = (
+            "START_COLLISION_RECOVERED"
+            if previous_overlap == 0
+            else "RECOVERY_INCOMPLETE"
+        )
+        print(
+            "[NAV-RECOVERY] complete success={} direction={} distance={:.3f}m "
+            "overlap={}".format(
+                diagnostics["success"],
+                plan["direction"],
+                float(plan["distance_m"]),
+                previous_overlap,
+            )
+        )
+        return (
+            bool(diagnostics["success"]),
+            (
+                "START_COLLISION_RECOVERED"
+                if diagnostics["success"]
+                else "START_IN_COLLISION"
+            ),
+            current_map,
+            current_pose,
+            diagnostics,
+        )
     def _base_waypoints_from_center_path(
         self, center_path: Any, *, current_yaw: float, goal: CandidatePose
     ) -> list[tuple[float, float]]:
@@ -326,20 +637,20 @@ class TargetAwareNavigationPipeline:
             return None
         raw_env = raw_task_env(env)
         for alias in raw_env.objects:
-            try:
-                holding = bool(object_utils.check_obj_grasped(raw_env, alias))
-            except (AssertionError, AttributeError, KeyError, TypeError, ValueError):
-                holding = False
-            if not holding:
+            holding, _ = check_two_finger_grasp(raw_env, str(alias))
+            if holding is not True:
                 continue
+
+            def holding_checker(alias: str = str(alias)) -> bool | None:
+                value, _ = check_two_finger_grasp(raw_env, alias)
+                return value
+
             guard = HeldObjectGuard(
                 enabled=True,
                 object_alias=str(alias),
-                holding_checker=lambda alias=str(alias): bool(
-                    object_utils.check_obj_grasped(raw_env, alias)
-                ),
+                holding_checker=holding_checker,
                 hold_confirmation_steps=int(cfg.get("hold_confirmation_steps", 2)),
-                drop_confirmation_steps=int(cfg.get("drop_confirmation_steps", 2)),
+                drop_confirmation_steps=int(cfg.get("drop_confirmation_steps", 30)),
                 action_override_enabled=bool(
                     cfg.get("held_object_guard_action_override", True)
                 ),
@@ -444,8 +755,115 @@ class TargetAwareNavigationPipeline:
                 plan_only=plan_only,
                 diagnostics={"should_navigate": skip_evidence},
             )
+        preparation_result: dict[str, Any] | None = None
+        pre_navigation_diagnostics: dict[str, Any] = {}
+        guard = context.get("held_object_guard") or self._held_object_guard(env)
         start_cell = occupancy_map.world_to_grid(start_collision_xy)
-        if not occupancy_map.in_bounds(start_cell) or occupancy_map.grid[start_cell] != 0:
+        start_overlap_cells = (
+            self.map_builder.footprint_overlap_count(
+                occupancy_map, start_collision_xy, start_yaw
+            )
+            if hasattr(self.map_builder, "footprint_overlap_count")
+            else int(
+                not occupancy_map.in_bounds(start_cell)
+                or occupancy_map.grid[start_cell] != 0
+            )
+        )
+        start_in_collision = start_overlap_cells > 0
+        if (
+            start_in_collision
+            and not plan_only
+            and self.start_collision_recovery_enabled
+        ):
+            # Arm motion changes the carried object's swept volume. Put it in
+            # the standard transport pose before any base escape translation.
+            if before_navigation is not None:
+                preparation_result = dict(before_navigation())
+                pre_navigation_diagnostics["navigation_preparation"] = (
+                    preparation_result
+                )
+                navigation_safe = preparation_result.get("navigation_safe")
+                if navigation_safe is None:
+                    navigation_safe = preparation_result.get(
+                        "transport_ready",
+                        preparation_result.get("return_ready", False),
+                    )
+                if not navigation_safe:
+                    return NavigationResult(
+                        False,
+                        str(
+                            preparation_result.get("failure_code")
+                            or "PRE_NAVIGATION_PREPARATION_FAILED"
+                        ),
+                        target_name=resolved_target.target_name,
+                        target_type=resolved_target.target_type.value,
+                        target_position=list(resolved_target.world_position),
+                        plan_only=False,
+                        diagnostics={
+                            "should_navigate": skip_evidence,
+                            **pre_navigation_diagnostics,
+                        },
+                    )
+
+                # The carry-pose motion advances simulation. Always rebuild
+                # the articulated map before selecting an escape direction.
+                current = current_base_pose(env)
+                start_xy = np.asarray(current["position"][:2], dtype=float)
+                start_yaw = float(current["yaw_rad"])
+                start_collision_xy = self._footprint_center(start_xy, start_yaw)
+                occupancy_map = self.map_builder.build(
+                    env,
+                    layout_id=layout_id,
+                    robot_xy=start_xy,
+                    robot_yaw=start_yaw,
+                    debug_articulated_map=debug_articulated_map,
+                )
+                guard = (
+                    context.get("held_object_guard")
+                    or self._held_object_guard(env)
+                )
+
+            recovered, recovery_reason, occupancy_map, current, recovery = (
+                self._recover_start_collision(
+                    env=env,
+                    occupancy_map=occupancy_map,
+                    base_pose=current,
+                    layout_id=layout_id,
+                    debug_articulated_map=debug_articulated_map,
+                    guard=guard,
+                )
+            )
+            pre_navigation_diagnostics["start_collision_recovery"] = recovery
+            if not recovered:
+                return NavigationResult(
+                    False,
+                    recovery_reason,
+                    target_name=resolved_target.target_name,
+                    target_type=resolved_target.target_type.value,
+                    target_position=list(resolved_target.world_position),
+                    plan_only=False,
+                    diagnostics={
+                        "should_navigate": skip_evidence,
+                        **pre_navigation_diagnostics,
+                    },
+                )
+            start_xy = np.asarray(current["position"][:2], dtype=float)
+            start_yaw = float(current["yaw_rad"])
+            start_collision_xy = self._footprint_center(start_xy, start_yaw)
+            start_cell = occupancy_map.world_to_grid(start_collision_xy)
+            start_overlap_cells = (
+                self.map_builder.footprint_overlap_count(
+                    occupancy_map, start_collision_xy, start_yaw
+                )
+                if hasattr(self.map_builder, "footprint_overlap_count")
+                else int(
+                    not occupancy_map.in_bounds(start_cell)
+                    or occupancy_map.grid[start_cell] != 0
+                )
+            )
+            start_in_collision = start_overlap_cells > 0
+
+        if start_in_collision:
             return NavigationResult(
                 False,
                 "START_IN_COLLISION",
@@ -457,9 +875,19 @@ class TargetAwareNavigationPipeline:
                     "start_xy": start_xy.tolist(),
                     "footprint_center_xy": start_collision_xy.tolist(),
                     "start_cell": list(start_cell),
+                    "start_overlap_cells": int(start_overlap_cells),
                     "should_navigate": skip_evidence,
+                    **pre_navigation_diagnostics,
                 },
             )
+
+        self.last_debug.update(
+            {
+                "map": occupancy_map,
+                "start_xy": start_xy,
+                "start_collision_xy": start_collision_xy,
+            }
+        )
 
         try:
             raw_candidates = self.candidate_generator.generate(
@@ -555,17 +983,22 @@ class TargetAwareNavigationPipeline:
             diagnostics={
                 "should_navigate": skip_evidence,
                 "map": occupancy_map.to_dict(),
+                **pre_navigation_diagnostics,
             },
         )
         if plan_only:
             return result
 
-        preparation_result = None
-        if before_navigation is not None:
+        if before_navigation is not None and preparation_result is None:
             preparation_result = dict(before_navigation())
             result.diagnostics["navigation_preparation"] = preparation_result
             module = preparation_result.get("module")
             if (
+                module == "POST_SKILL_RETURN"
+                or "return_ready" in preparation_result
+            ):
+                result.diagnostics["post_skill_return"] = preparation_result
+            elif (
                 module == "POST_GRASP_TRANSPORT"
                 or "transport_ready" in preparation_result
             ):
@@ -575,7 +1008,8 @@ class TargetAwareNavigationPipeline:
             navigation_safe = preparation_result.get("navigation_safe")
             if navigation_safe is None:
                 navigation_safe = preparation_result.get(
-                    "transport_ready", False
+                    "transport_ready",
+                    preparation_result.get("return_ready", False),
                 )
             if not navigation_safe:
                 result.success = False
@@ -607,7 +1041,10 @@ class TargetAwareNavigationPipeline:
             )
             prepared_now = bool(
                 preparation_result is not None
-                and preparation_result.get("transport_ready", False)
+                and (
+                    preparation_result.get("transport_ready", False)
+                    or preparation_result.get("return_ready", False)
+                )
                 and prepared_alias == guarded_alias
             )
             if guarded_alias not in ready_aliases and not prepared_now:

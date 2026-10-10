@@ -315,12 +315,85 @@ def test_place_uses_pick_handoff_and_grounding_only_controls_navigation():
         for item in place_groundings
     )
 
+def test_place_retry_receives_successful_navigation_handoff():
+    class TargetAwareRetryAdapter:
+        handles_target_aware_navigation = True
+
+        def __init__(self):
+            self.scheduler_queries = []
+            self.place_attempts = 0
+
+        def execute(self, *, env, scheduler_query, episode_id):
+            del env, episode_id
+            self.scheduler_queries.append(dict(scheduler_query))
+            atomic_call = scheduler_query["atomic_task_call"]
+            if atomic_call["atomic_task"] == "PickObject":
+                return {
+                    "subgoal_id": atomic_call["subgoal_id"],
+                    "atomic_task": "PickObject",
+                    "status": "success",
+                    "success": True,
+                    "verifier_result": {"retryable": False},
+                }
+            self.place_attempts += 1
+            success = self.place_attempts == 2
+            return {
+                "subgoal_id": atomic_call["subgoal_id"],
+                "atomic_task": "PlaceObject",
+                "status": "success" if success else "uncertain",
+                "success": success,
+                "verifier_result": {"retryable": not success},
+                "target_aware_stage": {
+                    "navigation_required": self.place_attempts == 1,
+                    "navigation_success": True,
+                    "navigation_result": {
+                        "success": True,
+                        "reason": "SUCCESS",
+                        "target_name": "bowl",
+                        "target_type": "EXPOSED_OBJECT",
+                    },
+                },
+            }
+
+    adapter = TargetAwareRetryAdapter()
+    grounder = Grounder(
+        [
+            grounding(True),
+            grounding(
+                False,
+                fixture="counter_right_main_group",
+                status="navigation_required",
+                target_entity_alias="bowl",
+            ),
+        ]
+    )
+    result = RoboCasaOrchestrator(
+        atomic_task_policy_adapter=adapter, grounder=grounder
+    ).run_task_plan(
+        env=object(),
+        task_plan=[pick_object_call(), place_object_call()],
+        episode_id=0,
+        max_task_retries=1,
+    )
+
+    assert result["success"] is True
+    first_place_query = adapter.scheduler_queries[1]
+    retry_place_query = adapter.scheduler_queries[2]
+    assert "reuse_successful_navigation" not in first_place_query
+    handoff = retry_place_query["reuse_successful_navigation"]
+    assert handoff["subgoal_id"] == "place_vegetable_in_bowl"
+    assert handoff["source_attempt_index"] == 0
+    assert handoff["navigation_result"]["reason"] == "SUCCESS"
+
+
 class ScriptedAdapter:
     def __init__(self, outcomes):
         self.outcomes = iter(outcomes)
         self.atomic_tasks = []
+        self.scheduler_queries = []
 
     def execute(self, *, env, scheduler_query, episode_id):
+        self.scheduler_queries.append(dict(scheduler_query))
         atomic_call = scheduler_query["atomic_task_call"]
         self.atomic_tasks.append(atomic_call["atomic_task"])
         outcome_value = dict(next(self.outcomes))
@@ -429,6 +502,10 @@ def test_same_skill_no_drop_retry_never_rolls_back_missing_precondition():
 
     assert result["success"] is False
     assert adapter.atomic_tasks == ["PickObject", "PickObject"]
+    assert "retry_from_current_pose" not in adapter.scheduler_queries[0]
+    retry_handoff = adapter.scheduler_queries[1]["retry_from_current_pose"]
+    assert retry_handoff["subgoal_id"] == "pick_vegetable"
+    assert retry_handoff["source_attempt_index"] == 0
     place_result = result["step_results"][1]
     assert place_result["failure_code"] == "PRECONDITION_NOT_SATISFIED"
     assert place_result["rollback_subgoal_id"] is None

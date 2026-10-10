@@ -245,10 +245,20 @@ def _success_from_info(info: Mapping[str, Any]) -> bool:
     return bool(value)
 
 
-def _step_env(env: Any, action: np.ndarray) -> tuple[Mapping[str, Any], float, bool, Mapping[str, Any]]:
+def _step_env(
+    env: Any,
+    action: np.ndarray,
+    *,
+    convert_robocasa365_action: bool = False,
+) -> tuple[Mapping[str, Any], float, bool, Mapping[str, Any]]:
     """Support both current RoboMimic four-tuple and Gymnasium five-tuple steps."""
 
-    result = env.step(action)
+    step_action: Any = action
+    if convert_robocasa365_action:
+        from robocasa.utils.env_utils import convert_action
+
+        step_action = convert_action(np.asarray(action, dtype=np.float32))
+    result = env.step(step_action)
     if not isinstance(result, (tuple, list)):
         raise RuntimeError(
             f"env.step must return a tuple/list, got {type(result).__name__}"
@@ -358,12 +368,13 @@ def execute_pi05_atomic_task_policy(
     held_object_guard: bool = True,
     held_object_guard_action_override: bool = True,
     held_object_hold_confirmation_steps: int = 2,
-    held_object_drop_confirmation_steps: int = 2,
+    held_object_drop_confirmation_steps: int = 30,
     success_handoff_steps: int = 0,
     verification_mode: str | None = None,
     prompt_style: str = "concise",
     held_object_drop_stops_rollout: bool = False,
     held_object_guard_grasp_threshold: float | None = None,
+    held_object_guard_pick_min_lift_m: float | None = 0.04,
 ) -> tuple[bool, dict[str, Any]]:
     """Execute one atomic subgoal without resetting the RoboCasa environment.
 
@@ -407,6 +418,17 @@ def execute_pi05_atomic_task_policy(
         raise ValueError("held_object_hold_confirmation_steps must be positive")
     if held_object_drop_confirmation_steps <= 0:
         raise ValueError("held_object_drop_confirmation_steps must be positive")
+    if held_object_guard_pick_min_lift_m is not None:
+        held_object_guard_pick_min_lift_m = float(
+            held_object_guard_pick_min_lift_m
+        )
+        if (
+            not np.isfinite(held_object_guard_pick_min_lift_m)
+            or held_object_guard_pick_min_lift_m <= 0
+        ):
+            raise ValueError(
+                "held_object_guard_pick_min_lift_m must be positive when provided"
+            )
     if success_handoff_steps < 0:
         raise ValueError("success_handoff_steps must be non-negative")
     if not callable(getattr(client, "infer", None)):
@@ -452,21 +474,60 @@ def execute_pi05_atomic_task_policy(
 
     action_contract_validated = _validate_action_contract(env)
     observation = _current_observation(env)
-    if hasattr(client, "reset"):
+    temporal_policy = bool(
+        getattr(client, "manages_temporal_observations", False)
+    )
+    if temporal_policy:
+        if not bool(getattr(client, "episode_initialized", False)):
+            client.reset(observation)
+        set_instruction = getattr(client, "set_instruction", None)
+        if not callable(set_instruction):
+            raise TypeError("temporal policy client must provide set_instruction()")
+        set_instruction(prompt)
+    elif hasattr(client, "reset"):
         client.reset()
+    # Manipulation-time gripper protection is only valid for PickObject. A
+    # PlaceObject policy must be able to open the gripper before the simulator
+    # can report that the object is inside / on its destination; guarding the
+    # gripper until that relation is already true creates a release deadlock.
+    # Held-object navigation uses the navigation pipeline's separate guard and
+    # is intentionally unaffected by this task-level scope.
+    effective_guard_action_override = bool(
+        held_object_guard_action_override and call.atomic_task == "PickObject"
+    )
     object_guard = build_held_object_guard(
         env=env,
         atomic_task_call=call,
         enabled=held_object_guard,
-        action_override_enabled=held_object_guard_action_override,
+        action_override_enabled=effective_guard_action_override,
         hold_confirmation_steps=held_object_hold_confirmation_steps,
         drop_confirmation_steps=held_object_drop_confirmation_steps,
         grasp_threshold=held_object_guard_grasp_threshold,
+        pick_min_lift_delta_m=held_object_guard_pick_min_lift_m,
     )
     object_guard.start()
 
+    def confirm_pick_guard(
+        result: Mapping[str, Any], *, step_index: int
+    ) -> bool:
+        if call.atomic_task != "PickObject":
+            return False
+        confirm = getattr(object_guard, "confirm_verifier_result", None)
+        if not callable(confirm):
+            return False
+        return bool(confirm(result, step_index=int(step_index)))
+
+    verifier_start = getattr(verifier, "start_atomic_task", None)
+    if callable(verifier_start):
+        verifier_start(
+            env=env,
+            atomic_task_call=call,
+            observation=observation,
+        )
+
     action_plan: deque[np.ndarray] = deque()
     rewards: list[float] = []
+    last_applied_action: np.ndarray | None = None
     action_chunk_lengths: list[int] = []
     server_infer_ms: list[float] = []
     policy_infer_ms: list[float] = []
@@ -485,6 +546,7 @@ def execute_pi05_atomic_task_policy(
     initial_verification: dict[str, Any] | None = None
     first_success_step: int | None = None
     handoff_target_step: int | None = None
+    pick_stability_resets: list[dict[str, Any]] = []
     periodic_early_stop_consecutive_successes = 0
     periodic_early_stop_last_success_step: int | None = None
     periodic_early_stop_success_steps: list[int] = []
@@ -494,6 +556,39 @@ def execute_pi05_atomic_task_policy(
         if periodic_verification
         else horizon
     )
+    pick_stability_enabled = bool(
+        call.atomic_task == "PickObject"
+        and verification_mode == "periodic"
+        and effective_success_handoff_steps > 0
+    )
+
+    def reset_pick_stability(
+        *, step: int, source: str, result: Mapping[str, Any]
+    ) -> None:
+        """Invalidate an in-progress Pick success until it is stable again."""
+
+        nonlocal atomic_task_success
+        nonlocal first_success_step
+        nonlocal handoff_target_step
+        if not pick_stability_enabled or first_success_step is None:
+            return
+        pick_stability_resets.append(
+            {
+                "step": int(step),
+                "source": source,
+                "previous_first_success_step": int(first_success_step),
+                "previous_handoff_target_step": (
+                    int(handoff_target_step)
+                    if handoff_target_step is not None
+                    else None
+                ),
+                "status": result.get("status"),
+                "failure_code": result.get("failure_code"),
+            }
+        )
+        atomic_task_success = False
+        first_success_step = None
+        handoff_target_step = None
 
     def record_periodic_early_stop_result(
         result: dict[str, Any], *, step: int
@@ -576,28 +671,33 @@ def execute_pi05_atomic_task_policy(
         final_verification = initial_verification
         last_verified_step = 0
         if initial_verification["status"] == "success":
+            confirm_pick_guard(initial_verification, step_index=0)
             atomic_task_success = True
             first_success_step = 0
             handoff_target_step = 0
 
     for step_index in range(0 if atomic_task_success else maximum_total_steps):
         if not action_plan:
-            payload = build_pi05_observation(
-                observation, prompt, resize_size=resize_size
+            payload = (
+                {}
+                if temporal_policy
+                else build_pi05_observation(
+                    observation, prompt, resize_size=resize_size
+                )
             )
             response = client.infer(payload)
             if not isinstance(response, Mapping):
                 raise RuntimeError(
-                    f"pi0.5 client returned {type(response).__name__}, expected a mapping"
+                    f"policy client returned {type(response).__name__}, expected a mapping"
                 )
             if "actions" not in response:
                 raise RuntimeError(
-                    f"pi0.5 response is missing 'actions'; keys={sorted(response.keys())}"
+                    f"policy response is missing 'actions'; keys={sorted(response.keys())}"
                 )
             action_chunk = np.asarray(response["actions"])
             if action_chunk.ndim != 2:
                 raise RuntimeError(
-                    f"pi0.5 action chunk must be two-dimensional, got {action_chunk.shape}"
+                    f"policy action chunk must be two-dimensional, got {action_chunk.shape}"
                 )
             if action_chunk.shape[1] != _ACTION_DIM:
                 raise RuntimeError(
@@ -624,13 +724,30 @@ def execute_pi05_atomic_task_policy(
                     target.append(float(timing["infer_ms"]))
 
         raw_action = action_plan.popleft()
+        if temporal_policy:
+            print(f"[XR1] remaining queued actions: {len(action_plan)}")
         action_min = min(action_min, float(raw_action.min()))
         action_max = max(action_max, float(raw_action.max()))
         action = _apply_base_action_mode(
             raw_action, base_action_mode, base_residual_limit
         )
         action = object_guard.apply_action(action, step_index=step_index + 1)
-        observation, reward, done, info = _step_env(env, action)
+        # Normalized 12-D action after base-mode processing and guard. XR-1
+        # converts this losslessly to the dict action API in _step_env; pi0.5
+        # sends it as-is.
+        last_applied_action = np.asarray(action, dtype=np.float32).copy()
+
+        observation, reward, done, info = _step_env(
+            env,
+            action,
+            convert_robocasa365_action=bool(
+                getattr(client, "requires_robocasa_action_conversion", False)
+            ),
+        )
+        if temporal_policy and not bool(
+            getattr(client, "environment_observer_attached", False)
+        ):
+            client.observe(observation)
         rewards.append(reward)
         completed_steps = step_index + 1
 
@@ -643,6 +760,11 @@ def execute_pi05_atomic_task_policy(
         if guard_failure is not None:
             validated_guard_failure = _validate_verifier_result(guard_failure)
             guard_failures.append(validated_guard_failure)
+            reset_pick_stability(
+                step=completed_steps,
+                source="held_object_guard",
+                result=validated_guard_failure,
+            )
             if held_object_drop_stops_rollout:
                 final_verification = validated_guard_failure
                 verification_history.append(validated_guard_failure)
@@ -702,6 +824,12 @@ def execute_pi05_atomic_task_policy(
             )
             verification_history.append(final_verification)
             last_verified_step = completed_steps
+            if final_verification["status"] != "success":
+                reset_pick_stability(
+                    step=completed_steps,
+                    source="verifier_not_success",
+                    result=final_verification,
+                )
             if verification_mode == "periodic_early_stop":
                 stable_success = record_periodic_early_stop_result(
                     final_verification, step=completed_steps
@@ -711,10 +839,16 @@ def execute_pi05_atomic_task_policy(
                 elif periodic_early_stop_consecutive_successes == 0:
                     first_success_step = None
                 if stable_success:
+                    confirm_pick_guard(
+                        final_verification, step_index=completed_steps
+                    )
                     handoff_target_step = completed_steps
                     atomic_task_success = True
                     break
             elif final_verification["status"] == "success":
+                confirm_pick_guard(
+                    final_verification, step_index=completed_steps
+                )
                 if first_success_step is None:
                     first_success_step = completed_steps
                     handoff_target_step = (
@@ -750,6 +884,9 @@ def execute_pi05_atomic_task_policy(
         verification_history.append(final_verification)
         last_verified_step = completed_steps
         if final_verification["status"] == "success":
+            confirm_pick_guard(
+                final_verification, step_index=completed_steps
+            )
             atomic_task_success = True
             first_success_step = completed_steps
             handoff_target_step = completed_steps
@@ -773,6 +910,12 @@ def execute_pi05_atomic_task_policy(
             )
         )
         verification_history.append(final_verification)
+        if final_verification["status"] != "success":
+            reset_pick_stability(
+                step=completed_steps,
+                source="verifier_not_success",
+                result=final_verification,
+            )
         if verification_mode == "periodic_early_stop":
             stable_success = record_periodic_early_stop_result(
                 final_verification, step=completed_steps
@@ -782,9 +925,15 @@ def execute_pi05_atomic_task_policy(
             elif periodic_early_stop_consecutive_successes == 0:
                 first_success_step = None
             if stable_success:
+                confirm_pick_guard(
+                    final_verification, step_index=completed_steps
+                )
                 handoff_target_step = completed_steps
                 atomic_task_success = True
         elif final_verification["status"] == "success":
+            confirm_pick_guard(
+                final_verification, step_index=completed_steps
+            )
             if first_success_step is None:
                 first_success_step = completed_steps
                 handoff_target_step = (
@@ -794,6 +943,14 @@ def execute_pi05_atomic_task_policy(
         elif final_verification["status"] == "failed":
             terminal_failure = not bool(final_verification.get("retryable", False))
 
+    queued_actions_discarded = len(action_plan)
+    action_plan.clear()
+    cancel_current_chunk = getattr(client, "cancel_current_chunk", None)
+    if temporal_policy and queued_actions_discarded:
+        print(f"[XR1] cancelled {queued_actions_discarded} queued action(s)")
+    if callable(cancel_current_chunk):
+        cancel_current_chunk()
+
     video_path = None
     if render and video_frames:
         output_dir = Path(log_dir)
@@ -801,7 +958,14 @@ def execute_pi05_atomic_task_policy(
         video_path = output_dir / f"ep{episode_id}_{call.subgoal_id}_pi05.mp4"
         save_video(video_path, video_frames, fps=20)
 
+    diagnostics = getattr(client, "diagnostics", None)
+    policy_diagnostics = diagnostics() if callable(diagnostics) else None
+    policy_backend = str(getattr(client, "policy_backend", "pi05"))
+
     logs: dict[str, Any] = {
+        "Policy_Backend": policy_backend,
+        "Policy_Diagnostics": policy_diagnostics,
+        "Queued_Actions_Discarded_At_Skill_End": queued_actions_discarded,
         "Atomic_Task_Call": call.to_dict(),
         "Atomic_Task": call.atomic_task,
         "Prompt": prompt,
@@ -849,10 +1013,29 @@ def execute_pi05_atomic_task_policy(
             and completed_steps >= handoff_target_step
             and atomic_task_success
         ),
+        "Pick_Stability_Enabled": pick_stability_enabled,
+        "Pick_Stability_Required_Steps": (
+            int(effective_success_handoff_steps)
+            if pick_stability_enabled
+            else 0
+        ),
+        "Pick_Stability_Reset_Count": len(pick_stability_resets),
+        "Pick_Stability_Resets": pick_stability_resets,
         "Num_Policy_Queries": len(action_chunk_lengths),
         "Action_Chunk_Lengths": action_chunk_lengths,
         "Replan_Steps": int(replan_steps),
         "Base_Action_Mode": base_action_mode,
+        "Last_Applied_Action": (
+            last_applied_action.astype(float).tolist()
+            if last_applied_action is not None
+            else None
+        ),
+        "Last_Applied_Action_Mode": (
+            float(last_applied_action[11])
+            if last_applied_action is not None
+            else None
+        ),
+        "Last_Applied_Action_Semantics": "normalized_robocasa365_after_base_mode_and_guard",
         "Base_Residual_Limit": float(base_residual_limit),
         "Input_Image_Size": int(resize_size),
         "Action_Interface_Validated": action_contract_validated,
@@ -865,6 +1048,10 @@ def execute_pi05_atomic_task_policy(
             getattr(object_guard, "enabled", False)
             and getattr(object_guard, "action_override_enabled", False)
         ),
+        "Held_Object_Guard_Action_Override_Configured": bool(
+            held_object_guard_action_override
+        ),
+        "Held_Object_Guard_Action_Override_Scope": "PickObject_only",
         "Guard_Failures": guard_failures,
         "First_Guard_Failure": guard_failures[0] if guard_failures else None,
         "Action_Raw_Min": float(action_min) if rewards else None,
@@ -889,6 +1076,7 @@ def execute_pi05_manipulation_policy(
     render: bool = True,
     video_skip: int = 2,
     terminate_on_success: bool = True,
+    prompt_override: str | None = None,
 ) -> tuple[float, dict[str, Any]]:
     """Run remote π0.5 action chunks in the current post-navigation environment.
 
@@ -905,10 +1093,18 @@ def execute_pi05_manipulation_policy(
         raise ValueError(f"video_skip must be positive, got {video_skip}")
     if not callable(getattr(client, "infer", None)):
         raise TypeError("client must provide infer(observation) -> mapping")
+    if prompt_override is not None and (
+        not isinstance(prompt_override, str) or not prompt_override.strip()
+    ):
+        raise ValueError("prompt_override must be non-empty when provided")
 
     action_contract_validated = _validate_action_contract(env)
     observation = env.reset() if reset_before_rollout else _current_observation(env)
-    prompt = _task_prompt(env)
+    prompt = (
+        prompt_override.strip()
+        if prompt_override is not None
+        else _task_prompt(env)
+    )
     if hasattr(client, "reset"):
         client.reset()
 
@@ -922,6 +1118,8 @@ def execute_pi05_manipulation_policy(
     action_max = -math.inf
     success = False
     done = False
+    first_success_step: int | None = None
+    success_source: str | None = None
 
     for step_index in range(horizon):
         if not action_plan:
@@ -956,7 +1154,16 @@ def execute_pi05_manipulation_policy(
         action_max = max(action_max, float(action.max()))
         observation, reward, done, info = _step_env(env, action)
         rewards.append(reward)
-        success = success or _success_from_info(info)
+        info_success = _success_from_info(info)
+        # Native RoboCasa returns an empty info dict and exposes its official
+        # task predicate as the sparse reward: Kitchen.reward() is exactly
+        # float(self._check_success()). Check both interfaces so direct
+        # end-to-end rollouts stop on the first successful simulator step.
+        reward_success = bool(reward > 0.0)
+        if not success and (info_success or reward_success):
+            success = True
+            first_success_step = step_index + 1
+            success_source = "info" if info_success else "robocasa_sparse_reward"
 
         if render and step_index % video_skip == 0:
             frame = _capture_video_frame(env, observation)
@@ -975,6 +1182,9 @@ def execute_pi05_manipulation_policy(
         "Return": float(np.sum(rewards)),
         "Horizon": len(rewards),
         "Success_Rate": float(success),
+        "First_Success_Step": first_success_step,
+        "Success_Source": success_source,
+        "Terminate_On_Success": bool(terminate_on_success),
         "Num_Policy_Queries": len(action_chunk_lengths),
         "Action_Chunk_Lengths": action_chunk_lengths,
         "Replan_Steps": int(replan_steps),

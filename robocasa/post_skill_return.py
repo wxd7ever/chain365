@@ -48,6 +48,9 @@ class PostSkillReturnController:
         self.failure_policy = str(cfg.get("failure_policy", "block"))
         if self.failure_policy not in {"warn", "block"}:
             raise ValueError("post_skill_return.failure_policy must be warn or block")
+        self.motion_stability = dict(
+            cfg.get("motion_stability", {})
+        )
         self.task_presets = {
             str(key): str(value)
             for key, value in dict(cfg.get("task_presets", {})).items()
@@ -125,9 +128,8 @@ class PostSkillReturnController:
             "frame": "robot_base",
         }
 
-    @staticmethod
     def _motion_kwargs(
-        cfg: Mapping[str, Any],
+        self, cfg: Mapping[str, Any],
         *,
         max_steps: int,
         trajectory_steps: int,
@@ -154,6 +156,24 @@ class PostSkillReturnController:
             "translation_gain": float(cfg.get("translation_gain", 3.0)),
             "rotation_gain": float(cfg.get("rotation_gain", 1.5)),
             "stable_steps": int(cfg.get("stable_steps", 5)),
+            "linear_velocity_threshold_m_s": float(
+                self.motion_stability.get("linear_velocity_threshold_m_s", 0.05)
+            ),
+            "angular_velocity_threshold_deg_s": float(
+                self.motion_stability.get("angular_velocity_threshold_deg_s", 20.0)
+            ),
+            "near_target_slowdown_radius_m": float(
+                self.motion_stability.get("near_target_slowdown_radius_m", 0.08)
+            ),
+            "near_target_slowdown_radius_deg": float(
+                self.motion_stability.get("near_target_slowdown_radius_deg", 30.0)
+            ),
+            "handoff_max_steps": int(self.motion_stability.get("handoff_max_steps", 30)),
+            "handoff_stable_steps": int(self.motion_stability.get("handoff_stable_steps", 2)),
+            "handoff_action_tolerance": float(
+                self.motion_stability.get("handoff_action_tolerance", 0.006)
+            ),
+            "simulation_timestep_s": self.motion_stability.get("simulation_timestep_s"),
         }
 
     def _fixed_return(
@@ -163,6 +183,8 @@ class PostSkillReturnController:
         call: AtomicTaskCall,
         preset_name: str,
         cfg: Mapping[str, Any],
+        initial_applied_action: Sequence[float] | None,
+        simulation_step_offset: int,
     ) -> dict[str, Any]:
         is_carry = preset_name == "carry" and call.atomic_task == "PickObject"
         gripper_action = 1.0 if is_carry else float(cfg.get("gripper_action", -1.0))
@@ -183,7 +205,7 @@ class PostSkillReturnController:
                 atomic_task_call=call,
                 enabled=True,
                 hold_confirmation_steps=int(cfg.get("hold_confirmation_steps", 2)),
-                drop_confirmation_steps=int(cfg.get("drop_confirmation_steps", 2)),
+                drop_confirmation_steps=int(cfg.get("drop_confirmation_steps", 30)),
             )
 
         # Clear the work surface vertically before moving to the exact fixed
@@ -203,6 +225,8 @@ class PostSkillReturnController:
             env,
             pre_lift_target,
             guard=guard,
+            initial_applied_action=initial_applied_action,
+            simulation_step_offset=simulation_step_offset,
             settle_steps=0,
             gripper_action=gripper_action,
             **self._motion_kwargs(
@@ -253,6 +277,12 @@ class PostSkillReturnController:
             return_translation = move_eef_to_pose(
                 env,
                 translation_target,
+                start_guard=False,
+                initial_applied_action=pre_lift.get("last_applied_action"),
+                simulation_step_offset=(
+                    simulation_step_offset + int(pre_lift.get("steps", 0))
+                ),
+
                 guard=guard,
                 settle_steps=(
                     0 if split_orientation else int(cfg.get("hold_steps", 10))
@@ -278,6 +308,16 @@ class PostSkillReturnController:
                 return_orientation = move_eef_to_pose(
                     env,
                     target,
+                    start_guard=False,
+                    initial_applied_action=return_translation.get(
+                        "last_applied_action"
+                    ),
+                    simulation_step_offset=(
+                        simulation_step_offset
+                        + int(pre_lift.get("steps", 0))
+                        + int(return_translation.get("steps", 0))
+                    ),
+
                     guard=guard,
                     settle_steps=int(cfg.get("hold_steps", 10)),
                     settle_mode=str(cfg.get("hold_mode", "zero_delta")),
@@ -381,6 +421,17 @@ class PostSkillReturnController:
             "return_orientation": return_orientation,
             "handoff": handoff,
             "after": {"eef_pose": after, "object_pose": object_after},
+            "initial_applied_action": (
+                list(initial_applied_action)
+                if initial_applied_action is not None
+                else None
+            ),
+            "simulation_step_offset": int(simulation_step_offset),
+            "total_motion_steps": (
+                int(pre_lift.get("steps", 0))
+                + int((return_translation or {}).get("steps", 0))
+                + int((return_orientation or {}).get("steps", 0))
+            ),
             "gripper_action": gripper_action,
             "held_before": held_before,
             "held_after": held_after,
@@ -400,6 +451,8 @@ class PostSkillReturnController:
         atomic_task_call: AtomicTaskCall | Mapping[str, Any],
         episode_id: int | str | None = None,
         skill_verified: bool = True,
+        initial_applied_action: Sequence[float] | None = None,
+        simulation_step_offset: int = 0,
     ) -> dict[str, Any]:
         call = (
             atomic_task_call
@@ -423,7 +476,12 @@ class PostSkillReturnController:
             }
         else:
             result = self._fixed_return(
-                env=env, call=call, preset_name=preset_name, cfg=cfg
+                env=env,
+                call=call,
+                preset_name=preset_name,
+                cfg=cfg,
+                initial_applied_action=initial_applied_action,
+                simulation_step_offset=int(simulation_step_offset),
             )
             result["episode_id"] = episode_id
         result["artifact_path"] = self._save(result)
@@ -446,4 +504,5 @@ class PostSkillReturnController:
             "default_preset": self.default_preset,
             "task_presets": dict(self.task_presets),
             "presets": {key: dict(value) for key, value in self.presets.items()},
+            "motion_stability": dict(self.motion_stability),
         }

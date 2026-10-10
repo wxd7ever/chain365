@@ -30,7 +30,13 @@ except ImportError:  # Direct execution from the robocasa script directory.
     from skill_contract_registry import apply_skill_contract
 
 
-_RELATION_PREDICATES = {"inside", "inserted", "on", "object_fixture_relation"}
+_RELATION_PREDICATES = {
+    "dishwasher_rack_contact",
+    "inside",
+    "inserted",
+    "on",
+    "object_fixture_relation",
+}
 
 
 @dataclass(frozen=True)
